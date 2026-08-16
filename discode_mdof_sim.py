@@ -23,11 +23,14 @@ fitted coefficient, so ``['add', 'x1', 'x2', 'x3', 'end']`` is
 ``c1*q1 + c2*qd1 + c3*q2``.  ``intpower`` supplies (coefficient, integer
 exponent), so ``q1^3`` is ``['intpower', 'x1']``.
 
-Watch out for cubic COUPLING: ``(q1 - q2)^3`` expands into four monomials
-(``q1^3, q1^2*q2, q1*q2^2, q2^3``), which is a long tau and, with more than two
-fitted exponent slots, can fall off the closed-form VARPRO path.  The systems
-below put the cubic on the grounded springs and keep the coupling linear, so
-every truth stays short and exactly representable.
+Cubic COUPLING: ``(q1 - q2)^3`` expands into four monomials (``q1^3,
+q1^2*q2, q1*q2^2, q2^3``), so its truth tau is long and carries four fitted
+exponent slots.  That used to fall off the closed-form path; it no longer does
+— :func:`discode_core._fit_consts_linear` sends >``MAX_GRID_COMBOS`` cases to
+cyclic coordinate descent, which was added for exactly this structure and fits
+it essentially exactly.  ``coupled_duffing`` and ``duffing_chain3`` still keep
+the coupling linear and the cubic on the grounded springs, which keeps their
+truths short; ``cubic_coupled`` is the deliberate opposite (see its docstring).
 """
 
 from __future__ import annotations
@@ -120,9 +123,65 @@ def _duffing_chain3():
     )
 
 
+def _cubic_coupled():
+    """Two oscillators joined by a **cubic** coupling spring (unit masses)::
+
+        q1'' = -c1*q1' - k1*q1 - a*(q1 - q2)^3
+        q2'' = -c2*q2' - k2*q2 + a*(q1 - q2)^3      (equal and opposite)
+
+    This system exists to make cross-DOF structure sharing visible.  A *linear*
+    coupling is a single leaf token (``x3`` in DOF 0, ``x1`` in DOF 1) — found
+    immediately, and far too small to be worth copying, so a joint policy can
+    show no advantage on it.  The cubic coupling expands to four monomials
+    (``q1^3, q1^2*q2, q1*q2^2, q2^3``) that appear in BOTH equations, so the
+    shared subtree is genuinely multi-token.
+
+    The sign flip costs a joint policy nothing: VARPRO fits each monomial's
+    leading coefficient, so only the *structure* has to cross between DOFs.
+    """
+    c1, c2 = 0.12, 0.10
+    k1, k2 = 3.00, 2.00
+    a      = 1.20
+
+    def a0(s):
+        q1, v1, q2, _v2 = s
+        return -c1 * v1 - k1 * q1 - a * (q1 - q2) ** 3
+
+    def a1_(s):
+        q1, _v1, q2, v2 = s
+        return -c2 * v2 - k2 * q2 + a * (q1 - q2) ** 3
+
+    # (q1 - q2)^3 = q1^3 - 3 q1^2 q2 + 3 q1 q2^2 - q2^3.  Every leaf carries an
+    # implicit fitted coefficient and every intpower fits its own exponent, so
+    # the four monomials are written structurally and the signs come out of the
+    # fit.
+    _cube = ['intpower', 'x1',                    # q1^3
+             'mul', 'intpower', 'x1', 'x3', 'end',   # q1^2 * q2
+             'mul', 'x1', 'intpower', 'x3', 'end',   # q1 * q2^2
+             'intpower', 'x3']                    # q2^3
+
+    return TruthSystem(
+        name='mdof_cubic_coupled',
+        accel_fns=[a0, a1_],
+        truth_strs=[
+            f"xddot = {-k1:.4g}*x {-c1:+.4g}*xdot {-a:+.4g}*(x - y)^3",
+            f"yddot = {-k2:.4g}*y {-c2:+.4g}*ydot {+a:+.4g}*(x - y)^3",
+        ],
+        truth_taus=[
+            ['add', 'x1', 'x2'] + _cube + ['end'],   # q1, qd1, + the cube
+            ['add', 'x3', 'x4'] + _cube + ['end'],   # q2, qd2, + the same cube
+        ],
+        var_names=['x', 'y'],
+        t_end=25.0, n_pts=2500, n_traj=4,
+        ic_scale=[1.2, 1.2, 1.2, 1.2],
+        seed=0,
+    )
+
+
 _REGISTRY = {
     'coupled_duffing': _coupled_duffing,
     'duffing_chain3':  _duffing_chain3,
+    'cubic_coupled':   _cubic_coupled,
 }
 
 
@@ -163,6 +222,14 @@ def DISCODE_MDOF_SIM(
     max_traj         = None,
     w_acc            = 0.5,
     use_pool         = True,
+    # policy architecture (see DISCODE_TRAIN)
+    architecture          = 'joint',
+    cross_slice_attention = True,
+    n_layers              = 4,
+    d_model               = 128,
+    slice_order           = 'random',
+    sample_order          = 'reward',
+    seed_policy           = None,
 ):
     """Generate an N-DOF system from the library and try to rediscover it."""
     spec = get_mdof_system(system_key)
@@ -198,6 +265,13 @@ def DISCODE_MDOF_SIM(
         max_traj         = max_traj,
         w_acc            = w_acc,
         use_pool         = use_pool,
+        architecture          = architecture,
+        cross_slice_attention = cross_slice_attention,
+        n_layers              = n_layers,
+        d_model               = d_model,
+        slice_order           = slice_order,
+        sample_order          = sample_order,
+        seed                  = seed_policy,
     )
 
 

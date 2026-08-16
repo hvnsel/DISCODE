@@ -66,6 +66,14 @@ def DISCODE_MDOF_EXP(
     max_traj         = None,
     w_acc            = 0.5,
     use_pool         = True,
+    # policy architecture (see DISCODE_TRAIN)
+    architecture          = 'joint',
+    cross_slice_attention = True,
+    n_layers              = 4,
+    d_model               = 128,
+    slice_order           = 'random',
+    sample_order          = 'reward',
+    seed_policy           = None,
     center_features  = False,
     system_data      = None,     # pass a preloaded SystemData to skip loading
 ):
@@ -109,6 +117,13 @@ def DISCODE_MDOF_EXP(
         max_traj         = max_traj,
         w_acc            = w_acc,
         use_pool         = use_pool,
+        architecture          = architecture,
+        cross_slice_attention = cross_slice_attention,
+        n_layers              = n_layers,
+        d_model               = d_model,
+        slice_order           = slice_order,
+        sample_order          = sample_order,
+        seed                  = seed_policy,
         center_features  = center_features,
     )
 
