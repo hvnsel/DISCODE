@@ -1,0 +1,127 @@
+"""
+discode_mdof_exp.py
+===================
+
+DISCODE on **multi-DOF experimental data** — the real target.  Every channel of
+the MATLAB record becomes a grammar variable, and one policy per DOF searches
+for that DOF's acceleration, so coupling terms are expressible.
+
+Read the ceiling before reading the reward
+------------------------------------------
+On processed experimental data the channels rarely satisfy ``a = dv/dt`` and
+``v = dq/dt`` exactly.  Anything applied per integration stage — a high-pass to
+kill drift, a band-pass on the accelerometer — breaks the identity the reward
+is built on, and the MEASURED acceleration then scores well below 1.0 on its
+own energy balance.  That number is the ceiling: no expression can beat it, and
+the ranking among expressions can invert near it.  ``show_ceiling`` prints it
+per trial and per DOF, and it should be read first, every run.
+
+If the ceiling is low, the fix is in the data conditioning, not the search:
+every channel must be filtered with the SAME number of passes, or the
+derivative relations between them no longer hold.  Use
+:mod:`discode_mdof_sim` to confirm the pipeline itself is healthy before
+spending epochs on a record with a bad ceiling.
+
+``w_acc``
+---------
+The pure work-energy reward is weak on stiffness and strong on damping; pure
+acceleration NRMSE is the reverse — dropping a small damping term costs only a
+few percent of acceleration error but a large share of the energy residual.
+The blend ``residual = (1-w_acc)*energy + w_acc*accel_NRMSE`` is a single
+stacked least-squares solve, so it keeps the closed-form constant fit.
+"""
+
+from __future__ import annotations
+
+from discode_data import load_mat_data, identity_ceiling, plot_system_data
+from discode_train import DISCODE_TRAIN
+
+
+def DISCODE_MDOF_EXP(
+    mat_path         = "AllData_ProcessedNOhit.mat",
+    var_names        = None,     # None -> ['q1', 'q2', ...]
+    # data conditioning
+    trim_timesteps_front = 1000,
+    trim_timesteps_back  = 70_000,
+    desired_timesteps    = 600,
+    plot_data        = False,
+    show_ceiling     = True,
+    # search
+    n_epochs         = 300,
+    batch_size       = 200,
+    max_len          = 24,
+    lr               = 1e-4,
+    alpha            = 0.20,
+    C                = 5,
+    G                = 5,
+    lam_start        = 0.02,
+    lam_end          = 0.001,
+    eps              = 0.2,
+    beta             = 0.01,
+    max_buffer       = 500,
+    beam_interval    = 10,
+    beam_width       = 20,
+    novelty_weight   = 0.15,
+    energy_normalize = True,
+    max_traj         = None,
+    w_acc            = 0.5,
+    use_pool         = True,
+    center_features  = False,
+    system_data      = None,     # pass a preloaded SystemData to skip loading
+):
+    """Identify every DOF of an experimental record with the DISCODE pipeline."""
+    system = system_data
+    if system is None:
+        system = load_mat_data(mat_path,
+                               trim_timesteps_front=trim_timesteps_front,
+                               trim_timesteps_back=trim_timesteps_back,
+                               desired_timesteps=desired_timesteps,
+                               var_names=var_names,
+                               plot_data=False)
+    print(f"[data] {system!r}")
+
+    if plot_data:
+        plot_system_data(system)
+
+    if show_ceiling:
+        worst, _ = identity_ceiling(system, verbose=True)
+        print(f"[ceiling] worst per-DOF/per-trial ceiling: {worst:.4f} "
+              f"— no expression can score above this\n", flush=True)
+
+    return DISCODE_TRAIN(
+        system_data      = system,
+        n_epochs         = n_epochs,
+        batch_size       = batch_size,
+        max_len          = max_len,
+        lr               = lr,
+        alpha            = alpha,
+        C                = C,
+        G                = G,
+        lam_start        = lam_start,
+        lam_end          = lam_end,
+        eps              = eps,
+        beta             = beta,
+        max_buffer       = max_buffer,
+        beam_interval    = beam_interval,
+        beam_width       = beam_width,
+        novelty_weight   = novelty_weight,
+        energy_normalize = energy_normalize,
+        max_traj         = max_traj,
+        w_acc            = w_acc,
+        use_pool         = use_pool,
+        center_features  = center_features,
+    )
+
+
+if __name__ == '__main__':
+    DISCODE_MDOF_EXP(
+        mat_path             = "AllData_ProcessedNOhit.mat",
+        var_names            = ['q1', 'q2'],
+        n_epochs             = 500,
+        batch_size           = 150,
+        max_len              = 40,
+        trim_timesteps_front = 600,
+        trim_timesteps_back  = 120_000,
+        desired_timesteps    = 1000,
+        plot_data            = True,
+    )
