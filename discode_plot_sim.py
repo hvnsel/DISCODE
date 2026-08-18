@@ -48,6 +48,8 @@ TRIAL         = 0                   # which trial supplies the IC + comparison
 
 # One discovered expression per DOF (RHS only, or with "<var>ddot = " prefix).
 DISCOVERED_EXPRS = [
+    "xddot = -5.874*x - 5.068e-6*xdot**7 - 0.1496*xdot + 1.504*y + 0.007891*ydot - 0.006921",
+    "yddot = -6.287e-5*x*y + 1.5*x + 4.478e-5*xdot*y - 0.5002*y**3 + 0.0001182*y**2 - 4.0*y - 0.1*ydot - 3.128e-6"
 ]
 
 # Simulation

@@ -106,7 +106,7 @@ MIN_EXPR_LEN   = 6
 # Exponent limits: continuous exponents (abspower/sgnpower) live in
 # [MIN_EXP, MAX_EXP]; intpower exponents are snapped to a nonzero integer in
 # [-INTPOWER_MAX, INTPOWER_MAX].
-INTPOWER_MAX = 9
+INTPOWER_MAX = 3
 MIN_EXP      = 0.5
 MAX_EXP      = 7.0
 
@@ -217,7 +217,7 @@ def configure_grammar(n_dof: int, var_names=None):
 
 
 def set_problem_data(norm_stats, raw_trajectories, energy_normalize=True,
-                     max_traj=None, w_acc=None):
+                     max_traj=5, w_acc=None):
     """Register the training data + energy-reward options (also used in workers).
 
     ``max_traj=None`` means "use every registered trajectory".
@@ -959,7 +959,7 @@ def _predicted_accel(fn, feats, y_mean_d, y_std_d):
     return y_mean_d + y_std_d * pred_n
 
 
-def energy_reward(exprs, max_traj=None, horizon=None, w_acc=None):
+def energy_reward(exprs, max_traj=5, horizon=None, w_acc=None):
     """Global work-energy reward for a full set of per-DOF expressions.
 
     ``exprs`` is a length-``N_DOF`` list whose entry ``d`` is ``(tau, consts)``
@@ -1451,7 +1451,7 @@ def _fit_consts_linear(tau, contexts, ym_t, ys_t, n_consts):
 
 
 def optimise_consts_energy(tau, target_dof, other_exprs=None,
-                           max_traj=None, horizon=None,
+                           max_traj=5, horizon=None,
                            n_inits=3, max_nfev=150):
     """Fit ``tau``'s constants to minimise the target DOF's **own** running
     energy residual ``| integral(vel_t * a_target) - 1/2 (vel_t^2 - vel_t0^2) |``.
@@ -1611,7 +1611,7 @@ def structural_novelty(tau, buffer, n=3):
 
 # ── Energy worker (ProcessPool) ─────────────────────────────────────────────
 def init_energy_worker(n_dof, var_names, norm_stats, raw_trajs,
-                       energy_normalize=True, max_traj=None, w_acc=None):
+                       energy_normalize=True, max_traj=5, w_acc=None):
     configure_grammar(n_dof, var_names)
     set_problem_data(norm_stats, raw_trajs, energy_normalize, max_traj, w_acc)
 

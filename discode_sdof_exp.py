@@ -31,7 +31,7 @@ from discode_train import DISCODE_TRAIN
 
 
 def DISCODE_SDOF_EXP(
-    mat_path         = "AllData_ProcessedNOhit.mat",
+    mat_path         = "SN_data.mat",
     dof_index        = 0,        # which channel of the record to identify
     var_name         = 'x',
     # data conditioning
@@ -60,6 +60,14 @@ def DISCODE_SDOF_EXP(
     max_traj         = None,
     w_acc            = 0.5,
     use_pool         = True,
+    # policy architecture (see DISCODE_TRAIN)
+    architecture          = 'joint',
+    cross_slice_attention = True,
+    n_layers              = 4,
+    d_model               = 128,
+    slice_order           = 'random',
+    sample_order          = 'reward',
+    seed_policy           = None,
     center_features  = False,
     system_data      = None,     # pass a preloaded SystemData to skip loading
 ):
@@ -104,17 +112,24 @@ def DISCODE_SDOF_EXP(
         max_traj         = max_traj,
         w_acc            = w_acc,
         use_pool         = use_pool,
+        architecture          = architecture,
+        cross_slice_attention = cross_slice_attention,
+        n_layers              = n_layers,
+        d_model               = d_model,
+        slice_order           = slice_order,
+        sample_order          = sample_order,
+        seed                  = seed_policy,
         center_features  = center_features,
     )
 
 
 if __name__ == '__main__':
     DISCODE_SDOF_EXP(
-        mat_path             = "AllData_ProcessedNOhit.mat",
+        mat_path             = "SH_data.mat",
         dof_index            = 0,
-        n_epochs             = 400,
-        batch_size           = 200,
-        max_len              = 32,
+        n_epochs             = 300,
+        batch_size           = 150,
+        max_len              = 40,
         trim_timesteps_front = 600,
         trim_timesteps_back  = 120_000,
         desired_timesteps    = 2000,

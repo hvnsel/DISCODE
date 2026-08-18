@@ -175,18 +175,39 @@ def forward_simulate(cleans, var_names, t_eval, ic, solver='LSODA',
         except ImportError:
             pbar = None
 
-    sol = solve_ivp(integrand, (t0, t1), list(ic), t_eval=t_eval,
-                    method=solver, rtol=1e-6, atol=1e-9,
-                    max_step=mxst, dense_output=False, events=events)
+    try:
+        sol = solve_ivp(integrand, (t0, t1), list(ic), t_eval=t_eval,
+                        method=solver, rtol=1e-6, atol=1e-9,
+                        max_step=mxst, dense_output=False, events=events)
+    except ValueError:
+        # A rapidly diverging RHS can jump past blow_up_limit within a single
+        # step, so the event's root search brackets two same-sign values and
+        # brentq raises.  Re-integrate without the event and truncate below.
+        sol = solve_ivp(integrand, (t0, t1), list(ic), t_eval=t_eval,
+                        method=solver, rtol=1e-6, atol=1e-9,
+                        max_step=mxst, dense_output=False)
     if pbar is not None:
         pbar.n = pbar.total
         pbar.refresh()
         pbar.close()
 
-    blew_up = bool(blow_up_limit is not None and sol.t_events
-                   and sol.t_events[0].size > 0)
+    blow_t = None
+    if blow_up_limit is not None and getattr(sol, 't_events', None) \
+            and sol.t_events[0].size > 0:
+        blow_t = float(sol.t_events[0][0])
+    elif blow_up_limit is not None and sol.y.size:
+        # Truncate at the first non-finite or over-limit sample (event fallback).
+        mag = np.max(np.abs(sol.y), axis=0)
+        over = ~np.isfinite(mag) | (mag > blow_up_limit)
+        if over.any():
+            cut = int(np.argmax(over))
+            blow_t = float(sol.t[cut]) if cut < sol.t.size else float(sol.t[-1])
+            sol.t = sol.t[:cut]
+            sol.y = sol.y[:, :cut]
+
+    blew_up = blow_t is not None
     if blew_up:
-        print(f"[sim] BLOW-UP at t={sol.t_events[0][0]:.4f}s  "
+        print(f"[sim] BLOW-UP at t={blow_t:.4f}s  "
               f"(|state| > {blow_up_limit:.3g}) — integration stopped early.",
               flush=True)
     elif not sol.success:
@@ -282,6 +303,12 @@ def plot_discovered(system, exprs, trial=0, t_end=None, solver='LSODA',
     N = system.n_dof
     var_names = system.var_names
     cleans = clean_exprs(exprs, var_names)
+    if len(cleans) != N or len(var_names) != N:
+        raise ValueError(
+            f"System has {N} DOF but got {len(cleans)} expression(s) and "
+            f"{len(var_names)} var_name(s) — one per DOF is required.  Either "
+            f"provide an expression and var_name for every channel, or set "
+            f"DOF_INDEX to analyse a single channel.")
     for d, (name, expr) in enumerate(zip(var_names, cleans)):
         print(f"[expr DOF {d}]  {name}ddot = {expr}", flush=True)
 

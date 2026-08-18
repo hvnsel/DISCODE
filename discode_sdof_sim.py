@@ -141,6 +141,14 @@ def DISCODE_SDOF_SIM(
     max_traj         = None,
     w_acc            = 0.5,
     use_pool         = True,
+    # policy architecture (see DISCODE_TRAIN)
+    architecture          = 'joint',
+    cross_slice_attention = True,
+    n_layers              = 4,
+    d_model               = 128,
+    slice_order           = 'random',
+    sample_order          = 'reward',
+    seed_policy           = None,
 ):
     """Generate a 1-DOF system from the library and try to rediscover it."""
     spec = get_sdof_system(system_key)
@@ -176,6 +184,13 @@ def DISCODE_SDOF_SIM(
         max_traj         = max_traj,
         w_acc            = w_acc,
         use_pool         = use_pool,
+        architecture          = architecture,
+        cross_slice_attention = cross_slice_attention,
+        n_layers              = n_layers,
+        d_model               = d_model,
+        slice_order           = slice_order,
+        sample_order          = sample_order,
+        seed                  = seed_policy,
     )
 
 

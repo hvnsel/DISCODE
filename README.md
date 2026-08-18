@@ -1,9 +1,14 @@
 # DISCODE — DIScover Coupled Ordinary Differential Equations
 
-Diffusion-model deep symbolic regression (GRPO-trained, after Bastiani et al. 2025)
-that recovers equations of motion from measured or simulated response data, using a
+Deep symbolic regression (GRPO-trained, after Bastiani et al. 2025) that recovers
+equations of motion from measured or simulated response data, using a
 **work-energy reward** instead of pointwise acceleration NRMSE or forward-simulation
 error.
+
+The default policy is a single **autoregressive transformer** that writes every
+DOF's expression as one sequence, so each DOF conditions on the ones already
+written. The original per-DOF masked-diffusion policies are still available as
+`architecture='independent'`. See [Policy architecture](#policy-architecture).
 
 ## File map
 
@@ -11,7 +16,9 @@ error.
 
 | file | what it is |
 |---|---|
-| `discode_core.py` | the engine: grammar, expression evaluation, VARPRO constant fitting, the reward, J-GRPO, the scoring worker |
+| `discode_core.py` | the engine: grammar, expression evaluation, VARPRO constant fitting, the reward, J-GRPO, the scoring worker, the masked-diffusion policy |
+| `discode_policy.py` | the joint autoregressive policy: model, attention masks, sampling, beam search, `jgrpo_ar` |
+| `discode_policy_test.py` | correctness invariants for the above — run it before anything long |
 | `discode_data.py` | everything that produces a `SystemData`: `.mat` loading, truth simulation, dataset prep, ceiling + truth-reward diagnostics |
 | `discode_train.py` | `DISCODE_TRAIN(system_data, ...)` — the one N-DOF training loop |
 | `discode_analysis.py` | post-hoc: expression parsing, forward simulation, energy residual, comparison plots |
@@ -21,7 +28,7 @@ error.
 | file | what it does |
 |---|---|
 | `discode_sdof_sim.py` | 1-DOF demo on a synthetic system (Duffing / linear / Van der Pol) |
-| `discode_mdof_sim.py` | N-DOF demo on a synthetic system (coupled Duffing, 3-mass chain) |
+| `discode_mdof_sim.py` | N-DOF demo on a synthetic system (coupled Duffing, 3-mass chain, cubic-coupled) |
 | `discode_sdof_exp.py` | one channel of an experimental `.mat` record |
 | `discode_mdof_exp.py` | the full experimental record — the real target |
 
@@ -80,6 +87,52 @@ reverse. Pure energy therefore cannot rank stiffness well, and pure NRMSE
 effectively never selects a small dissipative term. Both are linear in the
 coefficients, so the blend is one stacked least-squares solve and the closed-form
 constant fit is preserved. Default `0.5`.
+
+## Policy architecture
+
+Every driver takes `architecture=`, plus the knobs below. Defaults are the joint
+autoregressive policy.
+
+| config | flags | what it isolates |
+|---|---|---|
+| **V0** | `architecture='independent'` | the original: N one-shot masked-diffusion policies |
+| **V0+AR** | `architecture='joint', cross_slice_attention=False` | autoregression alone |
+| **B** | `architecture='joint', cross_slice_attention=True` | + cross-DOF structure sharing |
+
+Two separate defects motivate this, and they are worth tracking separately.
+
+**Position factorisation.** The masked-diffusion policy is called *once* on an
+all-`MASK` input, and every token is drawn from the resulting position-wise
+marginals. It can learn "position 4 is often `intpower`" but never "*given*
+position 3 is `intpower`, position 4 should be `x1`" — all structural coherence
+comes from the grammar mask and from whatever VARPRO fits. Autoregression fixes
+this, and the fix applies to a 1-DOF run too, which is the cleanest place to
+measure it (`discode_sdof_sim.py`, no jointness to confound it).
+
+**Cross-DOF structure.** An internal coupling force appears in two equations at
+once with opposite sign. Independent policies must discover the shared subtree
+twice; a joint policy can copy it, and the sign is free because VARPRO fits the
+leading coefficient. This only shows up when the shared subtree is more than one
+token — use `system_key='cubic_coupled'`, whose `(q1-q2)^3` expands to four
+monomials in both equations. Linear coupling is a single leaf and proves nothing.
+
+If **B** beats V0 but **V0+AR** does not, the gain is cross-DOF sharing. If V0+AR
+already captures it, the joint trunk is unnecessary and this should revert to N
+independent AR models.
+
+V0 has N policies and the joint variants have one, so parameter counts do not
+match by construction; both are printed at startup, and `n_layers` / `d_model`
+are exposed so a capacity-matched run can be configured rather than assumed.
+
+Other knobs: `slice_order` (`'random'` mixes permuted and base slice orders
+across the batch, so the model learns to condition in either direction — with a
+fixed order DOF 0 would never see DOF 1) and `sample_order` (`'reward'` puts the
+most-converged DOF first so the others condition on it).
+
+Buffer entries are `(reward, tau, consts, context)`. The context records the
+slice order, the slice's slot, and the slices that preceded it — exactly what the
+sample could see under the causal mask — so an entry stays reproducible in
+isolation and comparable across epochs. It is `None` under `'independent'`.
 
 ## DOFs are scored independently
 
