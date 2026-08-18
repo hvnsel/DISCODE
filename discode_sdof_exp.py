@@ -31,7 +31,7 @@ from discode_train import DISCODE_TRAIN
 
 
 def DISCODE_SDOF_EXP(
-    mat_path         = "AllData_ProcessedNOhit.mat",
+    mat_path         = "SN_data.mat",
     dof_index        = 0,        # which channel of the record to identify
     var_name         = 'x',
     # data conditioning
@@ -125,11 +125,11 @@ def DISCODE_SDOF_EXP(
 
 if __name__ == '__main__':
     DISCODE_SDOF_EXP(
-        mat_path             = "AllData_ProcessedNOhit.mat",
+        mat_path             = "SH_data.mat",
         dof_index            = 0,
-        n_epochs             = 400,
-        batch_size           = 200,
-        max_len              = 32,
+        n_epochs             = 300,
+        batch_size           = 150,
+        max_len              = 40,
         trim_timesteps_front = 600,
         trim_timesteps_back  = 120_000,
         desired_timesteps    = 2000,

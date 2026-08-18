@@ -63,8 +63,8 @@ def DISCODE_MDOF_EXP(
     beam_width       = 20,
     novelty_weight   = 0.15,
     energy_normalize = True,
-    max_traj         = None,
-    w_acc            = 0.5,
+    max_traj         = 10,
+    w_acc            = 0.9,
     use_pool         = True,
     # policy architecture (see DISCODE_TRAIN)
     architecture          = 'joint',
@@ -130,13 +130,16 @@ def DISCODE_MDOF_EXP(
 
 if __name__ == '__main__':
     DISCODE_MDOF_EXP(
-        mat_path             = "AllData_ProcessedNOhit.mat",
+        mat_path             = "LONO_combined.mat",
         var_names            = ['q1', 'q2'],
         n_epochs             = 500,
         batch_size           = 150,
         max_len              = 40,
-        trim_timesteps_front = 600,
-        trim_timesteps_back  = 120_000,
-        desired_timesteps    = 1000,
+        trim_timesteps_front = 1000,
+        trim_timesteps_back  = 125_000,
+        desired_timesteps    = 500,
         plot_data            = True,
     )
+
+    # 1000, 125000 for NOhit
+    # 1000, 128000 for LOhit

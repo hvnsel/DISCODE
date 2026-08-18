@@ -65,7 +65,7 @@ import discode_core as dc
 import discode_policy as dp
 from discode_data import generate_dataset
 
-N_WORKERS = max(1, min(os.cpu_count() or 4, 16))
+N_WORKERS = max(1, min(os.cpu_count() or 4, 8))
 HOF_SIZE = 10
 
 
