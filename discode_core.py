@@ -100,8 +100,13 @@ BINARY_OPS   = ['add', 'mul']            # ['add', 'sub', 'mul']
 UNARY_OPS    = list(POWER_OPS)
 N_ARY_OPS    = ['add', 'sub', 'mul']
 CONSTANTS    = ['const']
-MAX_TREE_DEPTH = 4
-MIN_EXPR_LEN   = 6
+# Depth 5 (not 4): the root ``add`` of a sum-of-terms costs a whole level, and
+# van der Pol's ``mu*(1 - x^2)*xdot`` needs four levels *below* it.  At 4 the
+# search provably could not write that truth.  MIN_EXPR_LEN 2 (not 6): at 6 the
+# linear oscillator ``add(x1, x2, end)`` (4 tokens) was unreachable too.  The
+# term-structured policy applies its own per-term floor via ``min_len``.
+MAX_TREE_DEPTH = 5
+MIN_EXPR_LEN   = 2
 
 # Exponent limits: continuous exponents (abspower/sgnpower) live in
 # [MIN_EXP, MAX_EXP]; intpower exponents are snapped to a nonzero integer in
@@ -535,10 +540,37 @@ def _parse_stack(tau):
     return stack, open_slots, nary_depth, current_depth, parent_op
 
 
-def get_valid_tokens(tau, position, max_len, max_consts=20):
+def get_valid_tokens(tau, position, max_len, max_consts=20,
+                     depth_offset=0, min_len=None, allow_leaf_at_zero=False,
+                     forbid_at_root=(), power_child_vars_only=False):
+    """Validity mask over ``ALL_TOKENS`` for the next token of prefix ``tau``.
+
+    The keyword arguments exist for **term-mode** generation, where ``tau`` is
+    one term of a sum that will later be assembled under a root ``add`` (see
+    :func:`assemble_terms`).  They are all no-ops at their defaults, so the
+    flat whole-expression path is unchanged.
+
+    depth_offset          : depth the term's root will sit at in the assembled
+                            tree, minus one.  A term under a root ``add`` passes
+                            1, so its nesting budget matches what the flat
+                            grammar would allow for the same assembled tau.
+    min_len               : per-term length floor; ``None`` -> ``MIN_EXPR_LEN``.
+    allow_leaf_at_zero    : let a term be a bare variable / const.
+    forbid_at_root        : tokens not allowed at position 0.  Term mode passes
+                            ``('add',)``: an ``add``-rooted term would assemble to
+                            ``add(add(...), ...)``, which ``is_complete`` accepts
+                            but ``_FORBIDDEN_NESTING`` forbids — a candidate the
+                            rest of the system would never generate.
+    power_child_vars_only : restrict a power op's child to a bare variable, which
+                            is exactly the closed-form/VARPRO applicability
+                            boundary (``_expand_monomials`` returns ``None`` for
+                            a power of anything else).
+    """
     remaining = max_len - position
     stack, open_slots, nary_depth, current_depth, parent_op = _parse_stack(tau)
     if stack is None: return np.zeros(N_TOKENS, dtype=np.float32)
+    min_len = MIN_EXPR_LEN if min_len is None else int(min_len)
+    depth   = current_depth + int(depth_offset)
 
     n_consts = tau.count('const')
     top_kind = stack[-1][0] if stack else None
@@ -551,7 +583,7 @@ def get_valid_tokens(tau, position, max_len, max_consts=20):
             if top_kind == 'nary' and top_val >= 2:
                 new_open = open_slots - 1
                 if new_open <= remaining - 1:
-                    if not (new_open == 0 and nary_depth == 1 and position + 1 < MIN_EXPR_LEN):
+                    if not (new_open == 0 and nary_depth == 1 and position + 1 < min_len):
                         mask[idx] = 1.0
             continue
 
@@ -573,28 +605,107 @@ def get_valid_tokens(tau, position, max_len, max_consts=20):
             new_open = open_slots - consume + a
             if new_open < 0 or new_open > remaining - 1: continue
 
-        if position == 0 and a == 0: continue
+        if position == 0 and a == 0 and not allow_leaf_at_zero: continue
+        if position == 0 and tok in forbid_at_root: continue
         if (a == 0 and open_slots == 1 and nary_depth == 0
-                and position + 1 < MIN_EXPR_LEN): continue
+                and position + 1 < min_len): continue
         if tok == 'const' and n_consts >= max_consts: continue
-        if tok in _OP_TOKENS and current_depth >= MAX_TREE_DEPTH: continue
+        if tok in _OP_TOKENS and depth >= MAX_TREE_DEPTH: continue
         if tok in forbidden_child_ops: continue
+        if (power_child_vars_only and parent_op in POWER_OPS
+                and tok not in VAR_SET): continue
 
         if tok in _OP_TOKENS:
             child_pos   = position + 1
-            child_depth = current_depth + 1
+            child_depth = depth + 1
             if tok in N_ARY_OPS:
                 child_leaf_valid = True
             elif top_kind == 'nary':
                 child_leaf_valid = True
             else:
                 child_would_complete = (open_slots == 1 and nary_depth == 0)
-                child_leaf_valid = (not child_would_complete) or (child_pos + 1 >= MIN_EXPR_LEN)
+                child_leaf_valid = (not child_would_complete) or (child_pos + 1 >= min_len)
             if not child_leaf_valid and not (child_depth < MAX_TREE_DEPTH): continue
 
         mask[idx] = 1.0
 
     return mask
+
+
+# ── Sum-of-terms helpers (term-structured policy) ────────────────────────────
+def _subtree_end(tau, start):
+    """Index one past the complete subtree that begins at ``tau[start]``.
+
+    Same stack walk as :func:`is_complete`, started mid-sequence.  If the
+    subtree is not closed by the end of ``tau`` (a partial term), returns
+    ``len(tau)``.
+    """
+    stack = [('fixed', 1)]
+    pos = start
+    while pos < len(tau) and stack:
+        tok = tau[pos]; pos += 1
+        kind, val = stack[-1]
+        if tok == 'end':
+            if kind != 'nary': return pos
+            stack.pop()
+            if stack:
+                pk, pv = stack[-1]
+                if pk == 'fixed':
+                    stack[-1] = ('fixed', pv - 1)
+                    if pv - 1 == 0: stack.pop()
+        elif tok in N_ARY_OPS:
+            if kind == 'fixed':
+                stack[-1] = ('fixed', val - 1)
+                if val - 1 == 0: stack.pop()
+            elif kind == 'nary':
+                stack[-1] = ('nary', val + 1)
+            stack.append(('nary', 0))
+        else:
+            a = ARITY[tok]
+            if kind == 'fixed':
+                stack[-1] = ('fixed', val - 1)
+                if val - 1 == 0: stack.pop()
+            elif kind == 'nary':
+                stack[-1] = ('nary', val + 1)
+            if a > 0: stack.append(('fixed', a))
+    return pos
+
+
+def split_terms(tau):
+    """Inverse of :func:`assemble_terms`: the top-level summands of ``tau``.
+
+    An ``add``-rooted tau yields the token span of each child, in the order
+    they appear (a trailing partial child is returned as-is).  Anything else is
+    a single term.  Deterministic, so the term-structured policy can rebuild
+    its teacher-forcing input from the flat tau a buffer entry stores.
+    """
+    tau = list(tau)
+    if not tau:
+        return []
+    if tau[0] != 'add':
+        return [tau]
+    terms, pos = [], 1
+    while pos < len(tau) and tau[pos] != 'end':
+        end = _subtree_end(tau, pos)
+        terms.append(tau[pos:end])
+        pos = end
+    return terms
+
+
+def assemble_terms(terms):
+    """``['add'] + t1 + ... + tm + ['end']``, or the bare term when ``m == 1``.
+
+    ``add`` requires >= 2 children, so a single term is emitted unwrapped;
+    that is still a valid expression because the sampler never lets a
+    one-term bag be a bare leaf (see the STOP rule in
+    :func:`discode_policy.sample_term_batch`).
+    """
+    terms = [list(t) for t in terms if t]
+    if not terms:
+        return []
+    if len(terms) == 1:
+        return terms[0]
+    return ['add'] + [tok for t in terms for tok in t] + ['end']
 
 
 def is_complete(tau):

@@ -17,7 +17,7 @@ written. The original per-DOF masked-diffusion policies are still available as
 | file | what it is |
 |---|---|
 | `discode_core.py` | the engine: grammar, expression evaluation, VARPRO constant fitting, the reward, J-GRPO, the scoring worker, the masked-diffusion policy |
-| `discode_policy.py` | the joint autoregressive policy: model, attention masks, sampling, beam search, `jgrpo_ar` |
+| `discode_policy.py` | the joint autoregressive policy and the terms-in-a-bag policy: models, attention masks, sampling, beam search, `jgrpo_ar` / `jgrpo_terms` |
 | `discode_policy_test.py` | correctness invariants for the above — run it before anything long |
 | `discode_data.py` | everything that produces a `SystemData`: `.mat` loading, truth simulation, dataset prep, ceiling + truth-reward diagnostics |
 | `discode_train.py` | `DISCODE_TRAIN(system_data, ...)` — the one N-DOF training loop |
@@ -98,6 +98,22 @@ autoregressive policy.
 | **V0** | `architecture='independent'` | the original: N one-shot masked-diffusion policies |
 | **V0+AR** | `architecture='joint', cross_slice_attention=False` | autoregression alone |
 | **B** | `architecture='joint', cross_slice_attention=True` | + cross-DOF structure sharing |
+| **C1** | `architecture='terms'` | terms in a bag: each DOF's expression is generated as short independent *terms* summed at assembly; the model still knows term order |
+| **C2** | `architecture='terms', term_position_encoding=False` | + drop the one embedding band that carries term order — the bag becomes a bag |
+
+**Terms in a bag (C1 / C2).** Every ground truth here is a sum of forces, and a
+sum has no order — yet the flat policy has to pick one, and the root `add` it
+must write first costs a whole nesting level. The `terms` architecture generates
+each term as its own short subexpression (with its own depth and length budget,
+under `max_terms` / `max_term_len`) and staples them under an `add` that is never
+a token the model emits. A STOP action closes the bag. C1 and C2 share the mask,
+sampler and update byte-for-byte; C2 only removes the term-index embedding.
+`term_grammar='varpro'` additionally restricts every term to the constant-fitter's
+closed-form domain (powers only over bare variables), which keeps every candidate
+off the slow nonlinear fit. The grammar limits also moved with this change —
+`MAX_TREE_DEPTH` 4→5 and `MIN_EXPR_LEN` 6→2 — because at the old values the
+linear-oscillator and van der Pol truths in `discode_sdof_sim.py` were
+unreachable for *any* policy. That shifts every pre-existing baseline once.
 
 Two separate defects motivate this, and they are worth tracking separately.
 

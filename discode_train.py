@@ -104,22 +104,33 @@ class PolicyState:
     def __init__(self, n_dof, max_len, lr, n_epochs, device,
                  architecture='joint', cross_slice_attention=True,
                  n_layers=4, d_model=128, slice_order='random',
-                 sample_order='reward', rng=None):
-        if architecture not in ('joint', 'independent'):
-            raise ValueError(f"architecture must be 'joint' or 'independent', "
-                             f"got {architecture!r}")
+                 sample_order='reward', rng=None,
+                 max_terms=8, max_term_len=8, term_grammar='free',
+                 term_position_encoding=True):
+        if architecture not in ('joint', 'independent', 'terms'):
+            raise ValueError(f"architecture must be 'joint', 'independent' or "
+                             f"'terms', got {architecture!r}")
         self.architecture = architecture
         self.n_dof        = n_dof
         self.device       = device
         self.slice_order  = slice_order
         self.sample_order = sample_order
+        self.term_grammar = term_grammar
         self.rng          = np.random.default_rng() if rng is None else rng
 
-        if architecture == 'joint':
-            self.policy = dp.ARJointPolicy(
-                n_tokens=dc.N_TOKENS, max_len=max_len, n_dof=n_dof,
-                d_model=d_model, n_layers=n_layers,
-                cross_slice_attention=cross_slice_attention).to(device)
+        if architecture in ('joint', 'terms'):
+            if architecture == 'joint':
+                self.policy = dp.ARJointPolicy(
+                    n_tokens=dc.N_TOKENS, max_len=max_len, n_dof=n_dof,
+                    d_model=d_model, n_layers=n_layers,
+                    cross_slice_attention=cross_slice_attention).to(device)
+            else:
+                self.policy = dp.TermBagPolicy(
+                    n_tokens=dc.N_TOKENS, max_terms=max_terms,
+                    max_term_len=max_term_len, n_dof=n_dof,
+                    d_model=d_model, n_layers=n_layers,
+                    cross_slice_attention=cross_slice_attention,
+                    term_position_encoding=term_position_encoding).to(device)
             self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer, T_max=n_epochs, eta_min=1e-5)
@@ -140,9 +151,21 @@ class PolicyState:
         return sum(p.numel() for net in self.nets for p in net.parameters()
                    if p.requires_grad)
 
+    def dedup_key(self, tau):
+        """Buffer-dedup key for a token sequence.
+
+        Under ``'terms'`` two bags with the same terms in a different order are
+        the same expression (the reward is order-blind), so the key is the
+        sorted term multiset.  The other architectures keep the raw sequence so
+        their behaviour — and any baseline numbers — are unchanged.
+        """
+        if self.architecture == 'terms':
+            return tuple(sorted(tuple(t) for t in dc.split_terms(tau)))
+        return tuple(tau)
+
     def refresh(self, ep, G):
         """Refresh the reference policy every ``G`` epochs, the old one every epoch."""
-        if self.architecture == 'joint':
+        if self.architecture in ('joint', 'terms'):
             if ep % G == 0:
                 self.policy_ref = copy.deepcopy(self.policy).to(self.device); self.policy_ref.eval()
             self.policy_old = copy.deepcopy(self.policy).to(self.device); self.policy_old.eval()
@@ -174,7 +197,11 @@ class PolicyState:
 
         base   = dp.choose_order(best_r, self.sample_order, self.rng)
         orders = dp.make_batch_orders(base, batch_size, self.slice_order, self.rng)
-        samples = dp.sample_joint_batch(self.policy, batch_size, max_len, n, orders)
+        if self.architecture == 'terms':
+            samples = dp.sample_term_batch(self.policy, batch_size, n, orders,
+                                           term_grammar=self.term_grammar)
+        else:
+            samples = dp.sample_joint_batch(self.policy, batch_size, max_len, n, orders)
 
         out = [[] for _ in range(n)]
         for b, sample in enumerate(samples):
@@ -185,8 +212,14 @@ class PolicyState:
                     (slice_taus[slot], dp.make_context(row, slot, slice_taus)))
 
         if do_beam:
-            for d, tau, ctx in dp.beam_candidates(
-                    self.policy, base, max_len, n, beam_width, n_return=beam_width):
+            if self.architecture == 'terms':
+                cands = dp.beam_term_candidates(
+                    self.policy, base, n, beam_width, n_return=beam_width,
+                    term_grammar=self.term_grammar)
+            else:
+                cands = dp.beam_candidates(
+                    self.policy, base, max_len, n, beam_width, n_return=beam_width)
+            for d, tau, ctx in cands:
                 out[d].append((tau, ctx))
         return out
 
@@ -214,11 +247,19 @@ class PolicyState:
             total_loss = None
             for d in eligible:
                 st = states[d]
-                jg, ent, ok = dp.jgrpo_ar(
-                    self.policy, self.policy_old, self.policy_ref,
-                    st.buffer, R_alpha=min(e[0] for e in st.buffer),
-                    dof=d, n_dof=self.n_dof, max_len=max_len, eps=eps, beta=beta,
-                    critic=st.critic if len(st.buffer) >= 32 else None)
+                critic = st.critic if len(st.buffer) >= 32 else None
+                if self.architecture == 'terms':
+                    jg, ent, ok = dp.jgrpo_terms(
+                        self.policy, self.policy_old, self.policy_ref,
+                        st.buffer, R_alpha=min(e[0] for e in st.buffer),
+                        dof=d, n_dof=self.n_dof, eps=eps, beta=beta,
+                        critic=critic, critic_max_len=max_len)
+                else:
+                    jg, ent, ok = dp.jgrpo_ar(
+                        self.policy, self.policy_old, self.policy_ref,
+                        st.buffer, R_alpha=min(e[0] for e in st.buffer),
+                        dof=d, n_dof=self.n_dof, max_len=max_len, eps=eps, beta=beta,
+                        critic=critic)
                 if not ok:
                     # A degenerate spread (or nothing above R_alpha) zeroes out
                     # THIS DOF only.  Returning early here — as the per-DOF
@@ -310,6 +351,11 @@ def DISCODE_TRAIN(
     slice_order           = 'random',  # batch slice orders: 'random' | 'fixed'
     sample_order          = 'reward',  # epoch base order: 'reward'|'random'|'fixed'
     seed                  = None,      # slice-order RNG
+    # ── 'terms' architecture only ──────────────────────────────────────────
+    max_terms             = 8,         # term slots per DOF (bag capacity)
+    max_term_len          = 8,         # token budget per term
+    term_grammar          = 'free',    # 'free' | 'varpro' (see discode_policy)
+    term_position_encoding = True,     # False -> Change 2: order-blind bag
 ):
     """Search for one acceleration expression per DOF of ``system_data``.
 
@@ -317,13 +363,21 @@ def DISCODE_TRAIN(
     DOF, or ``None`` for a DOF where nothing survived.  ``context`` is ``None``
     under ``architecture='independent'``.
 
-    The ablation matrix is three configs of this one function:
+    The ablation matrix is five configs of this one function:
 
     ==========  ==========================================================
     V0          ``architecture='independent'``
     V0+AR       ``architecture='joint', cross_slice_attention=False``
     B           ``architecture='joint', cross_slice_attention=True``
+    C1          ``architecture='terms'`` — terms in a bag, term order known
+    C2          ``architecture='terms', term_position_encoding=False``
     ==========  ==========================================================
+
+    C1 asks whether generating an expression as short independent TERMS
+    summed at assembly helps at all; C2 drops the one embedding band that
+    tells term k which earlier term came first, and asks whether permutation
+    invariance helps on top.  Mask, sampler and update are identical between
+    them.  See the section comment in ``discode_policy`` for the layout.
 
     V0 has N policies and the joint variants have one, so their parameter
     counts do not match by construction; both are printed at startup, and
@@ -366,12 +420,22 @@ def DISCODE_TRAIN(
                      cross_slice_attention=cross_slice_attention,
                      n_layers=n_layers, d_model=d_model,
                      slice_order=slice_order, sample_order=sample_order,
-                     rng=np.random.default_rng(seed))
+                     rng=np.random.default_rng(seed),
+                     max_terms=max_terms, max_term_len=max_term_len,
+                     term_grammar=term_grammar,
+                     term_position_encoding=term_position_encoding)
     if architecture == 'joint':
         print(f"[policy] joint autoregressive  "
               f"cross_slice_attention={cross_slice_attention}  "
               f"n_layers={n_layers}  d_model={d_model}")
         print(f"[policy] slice_order={slice_order}  sample_order={sample_order}")
+    elif architecture == 'terms':
+        print(f"[policy] terms-in-a-bag  max_terms={max_terms}  "
+              f"max_term_len={max_term_len}  term_grammar={term_grammar}  "
+              f"term_position_encoding={term_position_encoding}")
+        print(f"[policy] cross_slice_attention={cross_slice_attention}  "
+              f"n_layers={n_layers}  d_model={d_model}  "
+              f"slice_order={slice_order}  sample_order={sample_order}")
     else:
         print(f"[policy] {N} independent masked-diffusion policies")
     print(f"[policy] {ps.n_params():,} trainable parameters "
@@ -472,10 +536,10 @@ def DISCODE_TRAIN(
             # structure found under a different slice order is the same
             # expression, and the reward that gates it was computed in
             # isolation either way.
-            seen = set(tuple(e[1]) for e in st.buffer)
+            seen = set(ps.dedup_key(e[1]) for e in st.buffer)
             n_added = 0
             for entry in promoted:
-                key = tuple(entry[1])
+                key = ps.dedup_key(entry[1])
                 if key in seen:
                     continue
                 seen.add(key); st.buffer.append(entry); n_added += 1

@@ -67,6 +67,10 @@ def DISCODE_SDOF_EXP(
     d_model               = 128,
     slice_order           = 'random',
     sample_order          = 'reward',
+    max_terms             = 8,         # terms architecture only
+    max_term_len          = 8,
+    term_grammar          = 'free',    # 'free' | 'varpro'
+    term_position_encoding = True,     # False -> Change 2 (order-blind bag)
     seed_policy           = None,
     center_features  = False,
     system_data      = None,     # pass a preloaded SystemData to skip loading
@@ -118,6 +122,10 @@ def DISCODE_SDOF_EXP(
         d_model               = d_model,
         slice_order           = slice_order,
         sample_order          = sample_order,
+        max_terms             = max_terms,
+        max_term_len          = max_term_len,
+        term_grammar          = term_grammar,
+        term_position_encoding = term_position_encoding,
         seed                  = seed_policy,
         center_features  = center_features,
     )
