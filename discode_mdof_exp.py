@@ -138,16 +138,17 @@ def DISCODE_MDOF_EXP(
 
 if __name__ == '__main__':
     DISCODE_MDOF_EXP(
-        mat_path             = "LONO_combined.mat",
+        mat_path             = "AllData_ProcessedNOhit.mat",
         var_names            = ['q1', 'q2'],
         n_epochs             = 500,
         batch_size           = 150,
         max_len              = 40,
         trim_timesteps_front = 1000,
-        trim_timesteps_back  = 125_000,
+        trim_timesteps_back  = 125000,
         desired_timesteps    = 500,
         plot_data            = True,
     )
 
     # 1000, 125000 for NOhit
     # 1000, 128000 for LOhit
+    # 0, 0 for LONO combined

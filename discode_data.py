@@ -184,10 +184,24 @@ def load_mat_data(filepath, trim_timesteps_front=1000, trim_timesteps_back=70000
             disp = disp.transpose(1, 0, 2)
         print(f"[load_mat_data] loaded via scipy: shape acc={acc.shape}", flush=True)
 
-    acc  = acc[trim_timesteps_front: -trim_timesteps_back]
-    vel  = vel[trim_timesteps_front: -trim_timesteps_back]
-    disp = disp[trim_timesteps_front: -trim_timesteps_back]
-    time = time[trim_timesteps_front: -trim_timesteps_back]
+    # ``-0`` is not "keep everything" in Python — acc[600:-0] is acc[600:0],
+    # which is empty.  A pre-trimmed record therefore needs end=None.
+    n_raw = acc.shape[0]
+    end = -trim_timesteps_back if trim_timesteps_back else None
+    if trim_timesteps_front + trim_timesteps_back >= n_raw:
+        raise ValueError(
+            f"trim removes everything: the record has {n_raw} samples but "
+            f"trim_timesteps_front={trim_timesteps_front} + "
+            f"trim_timesteps_back={trim_timesteps_back} = "
+            f"{trim_timesteps_front + trim_timesteps_back}.\n"
+            f"If this file was already trimmed and impact-aligned (e.g. by "
+            f"data_combine.m), use trim_timesteps_front=0, "
+            f"trim_timesteps_back=0.")
+
+    acc  = acc[trim_timesteps_front: end]
+    vel  = vel[trim_timesteps_front: end]
+    disp = disp[trim_timesteps_front: end]
+    time = time[trim_timesteps_front: end]
 
     down_sample_factor = max(1, acc.shape[0] // desired_timesteps)
     acc  = acc[::down_sample_factor, :, :]

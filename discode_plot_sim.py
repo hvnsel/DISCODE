@@ -42,14 +42,20 @@ from discode_data import build_truth_system
 # ── CONFIG ─────────────────────────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════
 
-SIM_KEY       = 'coupled_duffing'   # any key from the sdof/mdof sim libraries
+SIM_KEY       = 'duffing_chain3'   # any key from the sdof/mdof sim libraries
 SIM_OVERRIDES = {}                  # e.g. {'n_traj': 2, 'n_pts': 4000, 'seed': 1}
 TRIAL         = 0                   # which trial supplies the IC + comparison
 
 # One discovered expression per DOF (RHS only, or with "<var>ddot = " prefix).
 DISCOVERED_EXPRS = [
-    "xddot = -5.874*x - 5.068e-6*xdot**7 - 0.1496*xdot + 1.504*y + 0.007891*ydot - 0.006921",
-    "yddot = -6.287e-5*x*y + 1.5*x + 4.478e-5*xdot*y - 0.5002*y**3 + 0.0001182*y**2 - 4.0*y - 0.1*ydot - 3.128e-6"
+    # coupled duffing
+    #"xddot = -5.874*x - 5.068e-6*xdot**7 - 0.1496*xdot + 1.504*y + 0.007891*ydot - 0.006921",
+    #"yddot = -6.287e-5*x*y + 1.5*x + 4.478e-5*xdot*y - 0.5002*y**3 + 0.0001182*y**2 - 4.0*y - 0.1*ydot - 3.128e-6"
+
+    # duffing chain3
+    "q1ddot = -0.5996*q1**3 - 0.0008078*q1**2*q3 + 3.242e-5*q1**2 - 3.628e-7*q1*q3**2 + 2.912e-8*q1*q3 - 6.0*q1 - 0.12*q1dot + 3.0*q2 - 5.431e-11*q3**3 + 6.539e-12*q3**2 + 0.0001094*q3 - 8.359e-6",
+    "q2ddot = 3.0*q1 - 2.773e-5*q2*q2dot**4 - 6.0*q2 - 1.714e-16*q2dot**3 - 4.947e-7*q2dot*q3 - 0.12*q2dot + 3.0*q3 + 5.396e-6",
+    "q3ddot = 0.002339*q1dot + 2.995*q2 + 0.001561*q2dot - 6.196*q3 - 0.1205*q3dot - 0.005513"
 ]
 
 # Simulation
