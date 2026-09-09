@@ -45,6 +45,7 @@ All three handle any number of DOFs.
 ## Quickstart
 
 ```bash
+pip install -r requirements.txt
 python discover_sdof_sim.py     # does the pipeline work?  (recovers Duffing in a few epochs)
 python discover_mdof_sim.py     # does it work with coupled DOFs?
 python discover_mdof_exp.py     # the real problem

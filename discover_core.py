@@ -176,8 +176,6 @@ MAX_TRAJ = 5
 # preserved, and the acceleration block needs no cumtrapz.
 W_ACC = 0.0
 
-MAX_ODE_EVALS  = 50000    # kept for API parity (unused by the energy reward)
-
 
 # ── Grammar configuration ───────────────────────────────────────────────────
 def configure_grammar(n_dof: int, var_names=None):
@@ -974,7 +972,7 @@ def _predicted_accel(fn, feats, y_mean_d, y_std_d):
     return y_mean_d + y_std_d * pred_n
 
 
-def energy_reward(exprs, max_traj=5, horizon=None, w_acc=None):
+def energy_reward(exprs, max_traj=None, horizon=None, w_acc=None):
     """Global work-energy reward for a full set of per-DOF expressions.
 
     ``exprs`` is a length-``N_DOF`` list whose entry ``d`` is ``(tau, consts)``
@@ -983,7 +981,8 @@ def energy_reward(exprs, max_traj=5, horizon=None, w_acc=None):
     kinetic-energy sum so the balance stays consistent.
 
     Returns ``r = 1 / (1 + mean_t |cum_power(t) - dKE(t)|)`` averaged over the
-    first ``max_traj`` trajectories (0 if nothing is evaluable).
+    first ``max_traj`` trajectories (``None`` = the configured ``MAX_TRAJ``);
+    0 if nothing is evaluable.
     """
     if NORM_STATS is None or not RAW_TRAJECTORIES:
         return 0.0
@@ -1466,7 +1465,7 @@ def _fit_consts_linear(tau, contexts, ym_t, ys_t, n_consts):
 
 
 def optimise_consts_energy(tau, target_dof, other_exprs=None,
-                           max_traj=5, horizon=None,
+                           max_traj=None, horizon=None,
                            n_inits=3, max_nfev=150):
     """Fit ``tau``'s constants to minimise the target DOF's **own** running
     energy residual ``| integral(vel_t * a_target) - 1/2 (vel_t^2 - vel_t0^2) |``.
@@ -1474,7 +1473,8 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
     The per-DOF work-energy relation is an exact kinematic identity, so each DOF
     is fit independently.  ``other_exprs`` is accepted for API compatibility but
     is no longer used (the other DOFs are not mixed into this DOF's balance, so
-    their errors cannot contaminate its constants).
+    their errors cannot contaminate its constants).  ``max_traj=None`` uses the
+    configured ``MAX_TRAJ`` — the same trajectories the reward scores on.
 
     Fast path: for expressions that are linear in their coefficients (with 0-2
     power exponents) the fit is a closed-form least-squares / variable
@@ -1605,9 +1605,13 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
 
 
 def get_traj_horizon(epoch, n_epochs, t_end):
-    frac = 0.30 + 0.70 * min(epoch / (n_epochs * 0.2), 1.0)
+    """Time horizon the constant fit and the reward integrate over at ``epoch``.
+
+    A growing-horizon curriculum (30% of the record at epoch 0, reaching 100%
+    after the first fifth of training) is deliberately switched off: every
+    epoch scores the full record, so rewards are comparable across epochs.
+    """
     return t_end
-    return frac * t_end
 
 
 def structural_novelty(tau, buffer, n=3):

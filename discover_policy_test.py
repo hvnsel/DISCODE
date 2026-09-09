@@ -299,6 +299,54 @@ def test_t8_term_context_reproducible():
     check('T.8 batch composition does not move an entry\'s logits', torch.equal(alone, shared))
 
 
+# ── T.9 Beam path ───────────────────────────────────────────────────────────
+def test_t9_beam_terms():
+    """The beam proposes one extra term per DOF on top of a sampled bag.  Every
+    candidate must be a complete, flat-reachable tau within the bag limits,
+    never a lone bare leaf, and carry a context that names its own DOF in the
+    requested slice order — and it must replay through the update path."""
+    print("\nT.9  beam candidates")
+    policy = make_term_policy()
+    torch.manual_seed(3)
+    order = (1, 0)
+    cands = dp.beam_term_candidates(policy, order, N_DOF, beam_width=4, n_return=4)
+    check('T.9 the beam returns candidates', len(cands) > 0, f"{len(cands)} candidates")
+    taus = [tau for _d, tau, _c in cands]
+    check('T.9 every candidate is complete', all(dc.is_complete(t) for t in taus))
+    check('T.9 every candidate is reachable under the flat grammar',
+          all(_flat_reachable(t) for t in taus))
+    check('T.9 no candidate exceeds max_terms / max_term_len',
+          all(len(dc.split_terms(t)) <= N_TERMS for t in taus)
+          and all(len(term) <= TERM_LEN for t in taus for term in dc.split_terms(t)))
+    check('T.9 no candidate is a lone bare leaf', all(len(t) > 1 for t in taus))
+    check('T.9 each context names the candidate\'s own DOF in the requested order',
+          all(c['dof_order'][c['slot']] == d and tuple(c['dof_order']) == order
+              for d, _t, c in cands))
+    check('T.9 candidates for slot 1 carry exactly one prefix slice',
+          all(set(c['prefix_slices']) == ({order[0]} if c['slot'] == 1 else set())
+              for _d, _t, c in cands))
+
+    # A beam candidate is a buffer entry like any other: the update must accept
+    # it for its own DOF and reject it for the other one.
+    d0 = cands[0][0]
+    same = [c for c in cands if c[0] == d0]
+    if len(same) >= 2:
+        buf = [(0.3 + 0.1 * i, tau, [], ctx) for i, (_d, tau, ctx) in enumerate(same)]
+        old = copy.deepcopy(policy).eval()
+        policy.train()
+        _o, _e, ok = dp.jgrpo_terms(policy, old, old, buf, 0.2, dof=d0, n_dof=N_DOF,
+                                    eps=0.2, beta=0.01)
+        policy.eval()
+        check('T.9 beam candidates replay through jgrpo_terms', ok)
+        caught = False
+        try:
+            dp.jgrpo_terms(policy, old, old, buf, 0.2, dof=1 - d0, n_dof=N_DOF,
+                           eps=0.2, beta=0.01)
+        except ValueError:
+            caught = True
+        check('T.9 ...and are rejected for the other DOF', caught)
+
+
 # ── jgrpo_terms plumbing ────────────────────────────────────────────────────
 def test_jgrpo_terms():
     """The update runs, produces gradients, and degrades gracefully.  Beyond
@@ -395,6 +443,7 @@ def main():
     test_t6_split_assemble()
     test_t7_term_padding()
     test_t8_term_context_reproducible()
+    test_t9_beam_terms()
     test_jgrpo_terms()
     test_term_pe_band()
 

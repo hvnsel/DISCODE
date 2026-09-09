@@ -109,6 +109,12 @@ def load_mat_data(filepath, trim_timesteps_front=1000, trim_timesteps_back=70000
     import h5py
     import scipy.io
 
+    if not os.path.isfile(filepath):
+        raise FileNotFoundError(
+            f"[load_mat_data] no such file: {filepath!r}.  Point mat_path / "
+            f"MAT_PATH at your .mat record — the data files are not part of "
+            f"the repository.")
+
     # ── Try HDF5 (v7.3) first, fall back to scipy for v5/v6 ─────────────────
     try:
         with h5py.File(filepath, 'r') as f:
@@ -397,8 +403,8 @@ def identity_ceiling(system, verbose=True, warn=False):
         per_trial.append(line)
 
     if verbose:
-        print(f"\n[ceiling] r( v, a_measured ) per trial — the best any "
-              f"expression can score:")
+        print("\n[ceiling] r( v, a_measured ) per trial — the best any "
+              "expression can score:")
         for j, line in enumerate(per_trial):
             cells = '  '.join(f"DOF{d}={r:.4f}" for d, r in enumerate(line))
             print(f"    trial {j}: {cells}", flush=True)

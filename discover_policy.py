@@ -453,11 +453,12 @@ def sample_term_batch(policy, batch_size, n_dof, dof_order, term_grammar='free',
                     if dc.is_complete(cur[b]):
                         tdone[b] = True
                         bags[b][slot].append(cur[b])
-            # A term that ran out of budget without completing cannot enter the
-            # bag (the assembled tau would be malformed).  Erase its tokens so
-            # ``x`` matches what ``build_term_inputs`` will rebuild, and close.
+            # A term that did not complete — it ran out of budget, or hit a
+            # dead end — cannot enter the bag (the assembled tau would be
+            # malformed).  Erase its tokens so ``x`` matches what
+            # ``build_term_inputs`` will rebuild from the bag, and close.
             for b in range(batch_size):
-                if not closed[b][slot] and cur[b] and not dc.is_complete(cur[b]):
+                if cur[b] and not dc.is_complete(cur[b]):
                     x[b, slot, j, :] = dc.MASK_TOKEN
                     closed[b][slot] = True
 

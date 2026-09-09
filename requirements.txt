@@ -1,0 +1,11 @@
+# Core pipeline (grammar, reward, VARPRO fitting, policy, training)
+numpy
+scipy
+sympy
+torch
+# Plotting scripts and plot_data=True
+matplotlib
+# Experimental .mat records saved as MATLAB v7.3 (HDF5); v5/v6 files go through scipy
+h5py
+# Optional: progress bar while forward-simulating a discovered system
+tqdm
