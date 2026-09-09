@@ -1,5 +1,5 @@
 """
-discode_policy.py
+discover_policy.py
 =================
 
 The **autoregressive joint policy** — one transformer that writes every DOF's
@@ -8,12 +8,12 @@ condition on the expressions already committed for the other DOFs.
 
 It replaces two things at once:
 
-1. *Position factorisation.*  :func:`discode_core.sample_batch` calls the
+1. *Position factorisation.*  :func:`discover_core.sample_batch` calls the
    diffusion model **once** on an all-``MASK_TOKEN`` input and draws every
    token from the resulting position-wise marginals.  That network can express
    "position 4 is often ``intpower``" but never "*given* position 3 is
    ``intpower``, position 4 should be ``x1``".  All structural coherence in a
-   sampled expression comes from :func:`discode_core.get_valid_tokens` and from
+   sampled expression comes from :func:`discover_core.get_valid_tokens` and from
    whatever VARPRO manages to fit.  Autoregression fixes this, and the fix
    applies to a single-DOF run too.
 
@@ -77,7 +77,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
-import discode_core as dc
+import discover_core as dc
 
 
 # Share of the sampled batch that gets an independent random slice order when
@@ -149,7 +149,7 @@ def build_attn_mask(n_dof: int, slice_len: int, cross_slice_attention: bool,
 class ARJointPolicy(nn.Module):
     """Causal transformer over ``n_dof`` slices of ``max_len`` tokens.
 
-    Replaces :class:`discode_core.DiffusionModel`.  Three departures from it:
+    Replaces :class:`discover_core.DiffusionModel`.  Three departures from it:
 
     * **One causal stack, not encoder-then-decoder.**  The old model ran
       ``TransformerEncoder(h)`` and then ``TransformerDecoder(h, enc_out)`` on
@@ -398,7 +398,7 @@ def beam_search_slice(policy, x, dof_order, slot, beam_width, max_len,
     is not worth its branching factor, so the slices before this one are simply
     taken as given.
 
-    Unlike :func:`discode_core.beam_search_expressions`, the distribution is
+    Unlike :func:`discover_core.beam_search_expressions`, the distribution is
     recomputed after every committed token — under autoregression there is no
     single static marginal matrix to read rows out of.
     """
@@ -517,7 +517,7 @@ def jgrpo_ar(policy, policy_old, policy_ref, S_alpha, R_alpha, dof,
              n_dof, max_len, eps, beta, critic=None):
     """J-GRPO for one DOF against the shared autoregressive policy.
 
-    Differs from :func:`discode_core.compute_jgrpo` only in how the inputs are
+    Differs from :func:`discover_core.compute_jgrpo` only in how the inputs are
     built and which positions are scored:
 
     * No ``forward_diffusion`` — the input is the teacher-forced joint
@@ -569,7 +569,7 @@ def jgrpo_ar(policy, policy_old, policy_ref, S_alpha, R_alpha, dof,
     # Never pooled across DOFs: reward scales differ wildly between them, and
     # pooling would let the DOF with the wider spread dominate the shared
     # trunk.  Advantages are in log-residual units for the reason given in
-    # discode_core.compute_jgrpo.
+    # discover_core.compute_jgrpo.
     batch_rewards = dc.log_residual_score(
         np.array([e[0] for e in valid], dtype=np.float64))
     adv_mean = float(batch_rewards.mean())
@@ -678,7 +678,7 @@ def term_valid_mask(term_prefix, position, max_term_len, term_grammar='free'):
     """Validity over ``dc.ALL_TOKENS`` for the next token of ONE term.
 
     Term mode differs from the flat grammar in exactly the ways
-    :func:`discode_core.get_valid_tokens` documents: the term sits one level
+    :func:`discover_core.get_valid_tokens` documents: the term sits one level
     below an implicit root ``add`` (``depth_offset=1``), it may be a bare
     variable, it must not itself be ``add``-rooted, and it has a per-term
     length floor of 1.  ``'varpro'`` additionally restricts a power op's child

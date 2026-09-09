@@ -1,8 +1,8 @@
 """
-discode_data.py
+discover_data.py
 ===============
 
-Everything that produces a :class:`SystemData` for DISCODE, and nothing else.
+Everything that produces a :class:`SystemData` for DISCOVER, and nothing else.
 
 A ``SystemData`` is the single container the whole pipeline runs on.  It holds
 three (m, n_dof, p_trials) arrays — displacement, velocity, acceleration — on a
@@ -18,7 +18,7 @@ slices one channel out of a multi-DOF record so the SDOF drivers can reuse an
 experimental file.
 
 :func:`generate_dataset` converts a ``SystemData`` into the normalised stats and
-raw trajectories that :mod:`discode_core` is configured with.
+raw trajectories that :mod:`discover_core` is configured with.
 
 Two diagnostics live here because they are properties of the *data*, not of the
 search:
@@ -425,7 +425,7 @@ def print_truth_rewards(system, max_traj=None, w_acc=None,
     """Score the known truth structure of each DOF with the standard reward.
 
     Requires ``system.truth_taus``.  Constants are fitted by the same
-    :func:`discode_core.optimise_consts_energy` the trainer uses, so the number
+    :func:`discover_core.optimise_consts_energy` the trainer uses, so the number
     printed is exactly what the search would score if it proposed the truth
     structure — the target it should converge to.
 
@@ -434,7 +434,7 @@ def print_truth_rewards(system, max_traj=None, w_acc=None,
     from the nominal value; the printed expression shows what it actually
     chose.
     """
-    import discode_core as dc
+    import discover_core as dc
 
     if all(t is None for t in system.truth_taus):
         return None

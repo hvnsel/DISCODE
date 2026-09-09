@@ -1,11 +1,11 @@
 """
-discode_plot_exp.py
+discover_plot_exp.py
 ===================
 Simulate discovered equations forward from an EXPERIMENTAL initial condition
 and compare against the record.
 
 Works for any number of DOFs — set ``DOF_INDEX`` to an integer to look at a
-single channel (matching a :mod:`discode_sdof_exp` run), or leave it ``None``
+single channel (matching a :mod:`discover_sdof_exp` run), or leave it ``None``
 for the full multi-DOF record.
 
 USAGE
@@ -15,7 +15,7 @@ USAGE
 2. Point the config at the same data the run used — the trim and downsample
    settings matter, since they change the time grid the equations were fitted
    on.
-3. ``python discode_plot_exp.py``
+3. ``python discover_plot_exp.py``
 
 Variable names in expressions follow ``VAR_NAMES``::
 
@@ -40,8 +40,8 @@ import sys
 
 sys.path.insert(0, '.')
 
-from discode_analysis import plot_discovered
-from discode_data import load_mat_data, select_dof
+from discover_analysis import plot_discovered
+from discover_data import load_mat_data, select_dof
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ── CONFIG ─────────────────────────────────────────────────────────────────

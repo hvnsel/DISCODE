@@ -1,11 +1,11 @@
 """
-discode_policy_test.py
+discover_policy_test.py
 ======================
 
-Correctness invariants for :mod:`discode_policy`.  Run this before anything
+Correctness invariants for :mod:`discover_policy`.  Run this before anything
 long::
 
-    python discode_policy_test.py
+    python discover_policy_test.py
 
 Each check here has a specific failure it exists to catch, and every one of
 them is silent — a model with a mis-aligned teacher-forcing shift, or with
@@ -21,8 +21,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-import discode_core as dc
-import discode_policy as dp
+import discover_core as dc
+import discover_policy as dp
 
 
 N_DOF   = 2

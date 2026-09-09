@@ -1,4 +1,4 @@
-# DISCODE — DIScover Coupled Ordinary Differential Equations
+# DISCOVER — coupled ODE discovery from response data
 
 Deep symbolic regression (GRPO-trained, after Bastiani et al. 2025) that recovers
 equations of motion from measured or simulated response data, using a
@@ -16,38 +16,38 @@ written. The original per-DOF masked-diffusion policies are still available as
 
 | file | what it is |
 |---|---|
-| `discode_core.py` | the engine: grammar, expression evaluation, VARPRO constant fitting, the reward, J-GRPO, the scoring worker, the masked-diffusion policy |
-| `discode_policy.py` | the joint autoregressive policy and the terms-in-a-bag policy: models, attention masks, sampling, beam search, `jgrpo_ar` / `jgrpo_terms` |
-| `discode_policy_test.py` | correctness invariants for the above — run it before anything long |
-| `discode_data.py` | everything that produces a `SystemData`: `.mat` loading, truth simulation, dataset prep, ceiling + truth-reward diagnostics |
-| `discode_train.py` | `DISCODE_TRAIN(system_data, ...)` — the one N-DOF training loop |
-| `discode_analysis.py` | post-hoc: expression parsing, forward simulation, energy residual, comparison plots |
+| `discover_core.py` | the engine: grammar, expression evaluation, VARPRO constant fitting, the reward, J-GRPO, the scoring worker, the masked-diffusion policy |
+| `discover_policy.py` | the joint autoregressive policy and the terms-in-a-bag policy: models, attention masks, sampling, beam search, `jgrpo_ar` / `jgrpo_terms` |
+| `discover_policy_test.py` | correctness invariants for the above — run it before anything long |
+| `discover_data.py` | everything that produces a `SystemData`: `.mat` loading, truth simulation, dataset prep, ceiling + truth-reward diagnostics |
+| `discover_train.py` | `DISCOVER_TRAIN(system_data, ...)` — the one N-DOF training loop |
+| `discover_analysis.py` | post-hoc: expression parsing, forward simulation, energy residual, comparison plots |
 
 **Drivers** — what you open and run:
 
 | file | what it does |
 |---|---|
-| `discode_sdof_sim.py` | 1-DOF demo on a synthetic system (Duffing / linear / Van der Pol) |
-| `discode_mdof_sim.py` | N-DOF demo on a synthetic system (coupled Duffing, 3-mass chain, cubic-coupled) |
-| `discode_sdof_exp.py` | one channel of an experimental `.mat` record |
-| `discode_mdof_exp.py` | the full experimental record — the real target |
+| `discover_sdof_sim.py` | 1-DOF demo on a synthetic system (Duffing / linear / Van der Pol) |
+| `discover_mdof_sim.py` | N-DOF demo on a synthetic system (coupled Duffing, 3-mass chain, cubic-coupled) |
+| `discover_sdof_exp.py` | one channel of an experimental `.mat` record |
+| `discover_mdof_exp.py` | the full experimental record — the real target |
 
 **Analysis** — paste discovered equations in, run:
 
 | file | what it does |
 |---|---|
-| `discode_score.py` | reproduces the training reward + the data's ceiling. No plots |
-| `discode_plot_sim.py` | forward-simulates discovered equations vs simulated truth |
-| `discode_plot_exp.py` | forward-simulates discovered equations vs the experimental record |
+| `discover_score.py` | reproduces the training reward + the data's ceiling. No plots |
+| `discover_plot_sim.py` | forward-simulates discovered equations vs simulated truth |
+| `discover_plot_exp.py` | forward-simulates discovered equations vs the experimental record |
 
 All three handle any number of DOFs.
 
 ## Quickstart
 
 ```bash
-python discode_sdof_sim.py     # does the pipeline work?  (recovers Duffing in a few epochs)
-python discode_mdof_sim.py     # does it work with coupled DOFs?
-python discode_mdof_exp.py     # the real problem
+python discover_sdof_sim.py     # does the pipeline work?  (recovers Duffing in a few epochs)
+python discover_mdof_sim.py     # does it work with coupled DOFs?
+python discover_mdof_exp.py     # the real problem
 ```
 
 Each run ends with a paste-ready block:
@@ -58,7 +58,7 @@ DISCOVERED_EXPRS = [
 ]
 ```
 
-Paste it into `discode_score.py` or a plotter, point the config at the same data
+Paste it into `discover_score.py` or a plotter, point the config at the same data
 (the trim/downsample settings change the time grid, so they must match), and run.
 
 ## Two numbers to read before the reward
@@ -112,7 +112,7 @@ sampler and update byte-for-byte; C2 only removes the term-index embedding.
 closed-form domain (powers only over bare variables), which keeps every candidate
 off the slow nonlinear fit. The grammar limits also moved with this change —
 `MAX_TREE_DEPTH` 4→5 and `MIN_EXPR_LEN` 6→2 — because at the old values the
-linear-oscillator and van der Pol truths in `discode_sdof_sim.py` were
+linear-oscillator and van der Pol truths in `discover_sdof_sim.py` were
 unreachable for *any* policy. That shifts every pre-existing baseline once.
 
 Two separate defects motivate this, and they are worth tracking separately.
@@ -123,7 +123,7 @@ marginals. It can learn "position 4 is often `intpower`" but never "*given*
 position 3 is `intpower`, position 4 should be `x1`" — all structural coherence
 comes from the grammar mask and from whatever VARPRO fits. Autoregression fixes
 this, and the fix applies to a 1-DOF run too, which is the cleanest place to
-measure it (`discode_sdof_sim.py`, no jointness to confound it).
+measure it (`discover_sdof_sim.py`, no jointness to confound it).
 
 **Cross-DOF structure.** An internal coupling force appears in two equations at
 once with opposite sign. Independent policies must discover the shared subtree

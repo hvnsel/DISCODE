@@ -1,39 +1,45 @@
 """
-discode_sdof_exp.py
+discover_mdof_exp.py
 ===================
 
-DISCODE on a **single DOF of experimental data**.  One channel is sliced out of
-a MATLAB record and identified on its own.
-
-This is legitimate rather than a shortcut: the work-energy relation
-``integral(v_d * a_d) = 1/2 (v_d^2 - v_d(0)^2)`` is an exact per-DOF kinematic
-identity, so DOF ``d``'s balance closes without any knowledge of the other
-DOFs — whatever coupling forces they exert are already contained in ``a_d``.
-The discovered expression may of course reference only the states of this DOF,
-so any true coupling shows up as unexplained residual.  If you want the
-coupling terms, use :mod:`discode_mdof_exp`, which keeps every channel as a
-grammar variable.
+DISCOVER on **multi-DOF experimental data** — the real target.  Every channel of
+the MATLAB record becomes a grammar variable, and one policy per DOF searches
+for that DOF's acceleration, so coupling terms are expressible.
 
 Read the ceiling before reading the reward
 ------------------------------------------
-On real data the measured acceleration does not close its own energy balance
-perfectly — filtering, drift and integration artefacts all leak in — so the
-best score ANY expression can reach is below 1.0.  ``show_ceiling`` prints that
-number.  A reward at the ceiling means the search has converged and the
-remaining error is in the data; a reward *above* it means the data channels are
-mutually inconsistent, which is a warning, not a success.
+On processed experimental data the channels rarely satisfy ``a = dv/dt`` and
+``v = dq/dt`` exactly.  Anything applied per integration stage — a high-pass to
+kill drift, a band-pass on the accelerometer — breaks the identity the reward
+is built on, and the MEASURED acceleration then scores well below 1.0 on its
+own energy balance.  That number is the ceiling: no expression can beat it, and
+the ranking among expressions can invert near it.  ``show_ceiling`` prints it
+per trial and per DOF, and it should be read first, every run.
+
+If the ceiling is low, the fix is in the data conditioning, not the search:
+every channel must be filtered with the SAME number of passes, or the
+derivative relations between them no longer hold.  Use
+:mod:`discover_mdof_sim` to confirm the pipeline itself is healthy before
+spending epochs on a record with a bad ceiling.
+
+``w_acc``
+---------
+The pure work-energy reward is weak on stiffness and strong on damping; pure
+acceleration NRMSE is the reverse — dropping a small damping term costs only a
+few percent of acceleration error but a large share of the energy residual.
+The blend ``residual = (1-w_acc)*energy + w_acc*accel_NRMSE`` is a single
+stacked least-squares solve, so it keeps the closed-form constant fit.
 """
 
 from __future__ import annotations
 
-from discode_data import load_mat_data, select_dof, identity_ceiling, plot_system_data
-from discode_train import DISCODE_TRAIN
+from discover_data import load_mat_data, identity_ceiling, plot_system_data
+from discover_train import DISCOVER_TRAIN
 
 
-def DISCODE_SDOF_EXP(
-    mat_path         = "SN_data.mat",
-    dof_index        = 0,        # which channel of the record to identify
-    var_name         = 'x',
+def DISCOVER_MDOF_EXP(
+    mat_path         = "AllData_ProcessedNOhit.mat",
+    var_names        = None,     # None -> ['q1', 'q2', ...]
     # data conditioning
     trim_timesteps_front = 1000,
     trim_timesteps_back  = 70_000,
@@ -43,7 +49,7 @@ def DISCODE_SDOF_EXP(
     # search
     n_epochs         = 300,
     batch_size       = 200,
-    max_len          = 20,
+    max_len          = 24,
     lr               = 1e-4,
     alpha            = 0.20,
     C                = 5,
@@ -57,10 +63,10 @@ def DISCODE_SDOF_EXP(
     beam_width       = 20,
     novelty_weight   = 0.15,
     energy_normalize = True,
-    max_traj         = None,
-    w_acc            = 0.5,
+    max_traj         = 10,
+    w_acc            = 0.9,
     use_pool         = True,
-    # policy architecture (see DISCODE_TRAIN)
+    # policy architecture (see DISCOVER_TRAIN)
     architecture          = 'joint',
     cross_slice_attention = True,
     n_layers              = 4,
@@ -75,16 +81,15 @@ def DISCODE_SDOF_EXP(
     center_features  = False,
     system_data      = None,     # pass a preloaded SystemData to skip loading
 ):
-    """Identify one experimental channel with the DISCODE pipeline."""
-    full = system_data
-    if full is None:
-        full = load_mat_data(mat_path,
-                             trim_timesteps_front=trim_timesteps_front,
-                             trim_timesteps_back=trim_timesteps_back,
-                             desired_timesteps=desired_timesteps,
-                             plot_data=False)
-
-    system = select_dof(full, dof_index, var_name=var_name)
+    """Identify every DOF of an experimental record with the DISCOVER pipeline."""
+    system = system_data
+    if system is None:
+        system = load_mat_data(mat_path,
+                               trim_timesteps_front=trim_timesteps_front,
+                               trim_timesteps_back=trim_timesteps_back,
+                               desired_timesteps=desired_timesteps,
+                               var_names=var_names,
+                               plot_data=False)
     print(f"[data] {system!r}")
 
     if plot_data:
@@ -95,7 +100,7 @@ def DISCODE_SDOF_EXP(
         print(f"[ceiling] worst per-DOF/per-trial ceiling: {worst:.4f} "
               f"— no expression can score above this\n", flush=True)
 
-    return DISCODE_TRAIN(
+    return DISCOVER_TRAIN(
         system_data      = system,
         n_epochs         = n_epochs,
         batch_size       = batch_size,
@@ -132,14 +137,18 @@ def DISCODE_SDOF_EXP(
 
 
 if __name__ == '__main__':
-    DISCODE_SDOF_EXP(
-        mat_path             = "SH_data.mat",
-        dof_index            = 0,
-        n_epochs             = 300,
+    DISCOVER_MDOF_EXP(
+        mat_path             = "AllData_ProcessedNOhit.mat",
+        var_names            = ['q1', 'q2'],
+        n_epochs             = 500,
         batch_size           = 150,
         max_len              = 40,
-        trim_timesteps_front = 600,
-        trim_timesteps_back  = 120_000,
-        desired_timesteps    = 2000,
+        trim_timesteps_front = 1000,
+        trim_timesteps_back  = 125000,
+        desired_timesteps    = 500,
         plot_data            = True,
     )
+
+    # 1000, 125000 for NOhit
+    # 1000, 128000 for LOhit
+    # 0, 0 for LONO combined

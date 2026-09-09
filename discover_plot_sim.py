@@ -1,11 +1,11 @@
 """
-discode_plot_sim.py
+discover_plot_sim.py
 ===================
 Simulate discovered equations forward from a SIMULATED system's initial
 condition and compare against the known truth.
 
 Works for any number of DOFs: ``SIM_KEY`` may name any entry in the
-:mod:`discode_sdof_sim` or :mod:`discode_mdof_sim` libraries.
+:mod:`discover_sdof_sim` or :mod:`discover_mdof_sim` libraries.
 
 USAGE
 -----
@@ -15,7 +15,7 @@ USAGE
    ``t_end`` / ``n_pts`` / ``seed``) to reproduce the exact dataset that was
    trained on — the ICs are drawn from a seeded generator, so the same spec
    always gives the same trials.
-3. ``python discode_plot_sim.py``
+3. ``python discover_plot_sim.py``
 
 Variable names in expressions follow the system's ``var_names`` (printed on
 load).  Supported syntax: ``+ - * / ** ^``, ``sin cos exp sqrt abs Abs sign
@@ -35,8 +35,8 @@ import sys
 
 sys.path.insert(0, '.')
 
-from discode_analysis import plot_discovered
-from discode_data import build_truth_system
+from discover_analysis import plot_discovered
+from discover_data import build_truth_system
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ── CONFIG ─────────────────────────────────────────────────────────────────
@@ -73,8 +73,8 @@ ENERGY_NORMALIZE = True
 
 def get_sim_spec(key):
     """Look ``key`` up in the SDOF and MDOF simulated libraries."""
-    from discode_sdof_sim import _REGISTRY as SDOF_REG
-    from discode_mdof_sim import _REGISTRY as MDOF_REG
+    from discover_sdof_sim import _REGISTRY as SDOF_REG
+    from discover_mdof_sim import _REGISTRY as MDOF_REG
     reg = {**SDOF_REG, **MDOF_REG}
     if key not in reg:
         raise ValueError(f"Unknown SIM_KEY '{key}'. Choose from {sorted(reg)}.")

@@ -1,23 +1,23 @@
 """
-discode_core.py
+discover_core.py
 ===============
 
-DISCODE — DIScover Coupled Ordinary Differential Equations.
+DISCOVER — coupled ODE discovery from response data.
 
-The engine behind the whole DISCODE algorithm: degree-of-freedom-agnostic
+The engine behind the whole DISCOVER algorithm: degree-of-freedom-agnostic
 diffusion-model deep symbolic regression (after Bastiani et al., 2025) driven
 by a **work-energy (power balance) reward** instead of a point-wise
 acceleration NRMSE or a forward-simulation NRMSE.
 
 Nothing in this module knows where the data came from.  It is imported by
-every DISCODE driver as::
+every DISCOVER driver as::
 
-    import discode_core as dc
+    import discover_core as dc
 
 and is configured through exactly two calls: :func:`configure_grammar` (once
 the number of DOFs is known) and :func:`set_problem_data` (once trajectories
-exist).  Data loading lives in :mod:`discode_data`, the training loop in
-:mod:`discode_train`.
+exist).  Data loading lives in :mod:`discover_data`, the training loop in
+:mod:`discover_train`.
 
 Motivation
 ----------
@@ -698,7 +698,7 @@ def assemble_terms(terms):
     ``add`` requires >= 2 children, so a single term is emitted unwrapped;
     that is still a valid expression because the sampler never lets a
     one-term bag be a bare leaf (see the STOP rule in
-    :func:`discode_policy.sample_term_batch`).
+    :func:`discover_policy.sample_term_batch`).
     """
     terms = [list(t) for t in terms if t]
     if not terms:
