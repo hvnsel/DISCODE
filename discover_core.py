@@ -5,7 +5,7 @@ discover_core.py
 DISCOVER — coupled ODE discovery from response data.
 
 The engine behind the whole DISCOVER algorithm: degree-of-freedom-agnostic
-diffusion-model deep symbolic regression (after Bastiani et al., 2025) driven
+transformer-policy deep symbolic regression (after Bastiani et al., 2025) driven
 by a **work-energy (power balance) reward** instead of a point-wise
 acceleration NRMSE or a forward-simulation NRMSE.
 
@@ -16,8 +16,8 @@ every DISCOVER driver as::
 
 and is configured through exactly two calls: :func:`configure_grammar` (once
 the number of DOFs is known) and :func:`set_problem_data` (once trajectories
-exist).  Data loading lives in :mod:`discover_data`, the training loop in
-:mod:`discover_train`.
+exist).  Data loading lives in :mod:`discover_data`, the policy in
+:mod:`discover_policy`, the training loop in :mod:`discover_train`.
 
 Motivation
 ----------
@@ -81,8 +81,6 @@ from itertools import product as _iproduct
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Categorical
 from scipy.optimize import least_squares
 import sympy as sp
 from sympy.parsing.sympy_parser import parse_expr
@@ -436,52 +434,7 @@ def _parse_local_dict():
     return d
 
 
-# ── Diffusion policy + critic ───────────────────────────────────────────────
-class DiffusionModel(nn.Module):
-    def __init__(self, n_tokens=None, max_len=32, d_model=128,
-                 n_heads=4, ff_dim=512, n_enc=2, n_dec=2):
-        super().__init__()
-        n_tokens = N_TOKENS if n_tokens is None else n_tokens
-        self.max_len    = max_len
-        self.vocab_size = VOCAB_SIZE
-        self.input_proj = nn.Linear(VOCAB_SIZE, d_model)
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=ff_dim,
-            dropout=0.0, batch_first=True, norm_first=True)
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_enc)
-        dec_layer = nn.TransformerDecoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=ff_dim,
-            dropout=0.0, batch_first=True, norm_first=True)
-        self.decoder  = nn.TransformerDecoder(dec_layer, num_layers=n_dec)
-        self.out_proj = nn.Linear(d_model, n_tokens)
-        self._pe_cache = {}
-
-    def _pos_enc(self, t: int) -> torch.Tensor:
-        if t in self._pe_cache:
-            return self._pe_cache[t]
-        D = self.vocab_size; L = self.max_len
-        pe    = torch.zeros(L, D)
-        l_idx = torch.arange(L).float()
-        j_idx = torch.arange(D // 4).float()
-        denom = torch.pow(10000.0, 4 * j_idx / D)
-        arg_l = l_idx.unsqueeze(1) / denom.unsqueeze(0)
-        pe[:, 0:D // 4 * 2:2] = torch.sin(arg_l)
-        pe[:, 1:D // 4 * 2:2] = torch.cos(arg_l)
-        arg_t = (torch.tensor(float(t)) / denom).unsqueeze(0).expand(L, -1)
-        pe[:, D // 2:D // 2 + D // 4 * 2:2]     = torch.sin(arg_t)
-        pe[:, D // 2 + 1:D // 2 + D // 4 * 2:2] = torch.cos(arg_t)
-        self._pe_cache[t] = pe
-        return pe
-
-    def forward(self, x_t: torch.Tensor, t: int) -> torch.Tensor:
-        oh = F.one_hot(x_t, num_classes=self.vocab_size).float()
-        pe = self._pos_enc(t).to(x_t.device).unsqueeze(0)
-        h  = self.input_proj(oh + pe)
-        enc_out = self.encoder(h)
-        dec_out = self.decoder(h, enc_out)
-        return self.out_proj(dec_out)
-
-
+# ── Critic ─────────────────────────────────────────────────────────────────
 class ExprCritic(nn.Module):
     def __init__(self, vocab_size=None, max_len=32, d=64):
         super().__init__()
@@ -547,8 +500,10 @@ def get_valid_tokens(tau, position, max_len, max_consts=20,
 
     The keyword arguments exist for **term-mode** generation, where ``tau`` is
     one term of a sum that will later be assembled under a root ``add`` (see
-    :func:`assemble_terms`).  They are all no-ops at their defaults, so the
-    flat whole-expression path is unchanged.
+    :func:`assemble_terms` and :func:`discover_policy.term_valid_mask`).  At
+    their defaults the mask describes the flat whole-expression grammar, which
+    is the reference every assembled bag has to be reachable under — the
+    policy test checks exactly that.
 
     depth_offset          : depth the term's root will sit at in the assembled
                             tree, minus one.  A term under a root ``add`` passes
@@ -739,57 +694,6 @@ def is_complete(tau):
                 stack[-1] = ('nary', val + 1)
             if a > 0: stack.append(('fixed', a))
     return len(stack) == 0
-
-
-def sample_expression(p: torch.Tensor, max_len: int) -> list:
-    tau = []
-    for i in range(max_len):
-        r   = get_valid_tokens(tau, i, max_len)
-        p_i = p[i, :N_TOKENS].clone() * torch.tensor(r, dtype=torch.float32)
-        if p_i.sum() == 0: p_i = torch.tensor(r, dtype=torch.float32)
-        if p_i.sum() == 0: break
-        p_i /= p_i.sum()
-        tau.append(idx2tok(Categorical(p_i).sample().item()))
-        if is_complete(tau): break
-    return tau
-
-
-def sample_batch(model, batch_size, max_len):
-    model.eval()
-    device = next(model.parameters()).device
-    x_M = torch.full((batch_size, max_len), MASK_TOKEN, dtype=torch.long, device=device)
-    with torch.no_grad():
-        p = torch.softmax(model(x_M, max_len), dim=-1).cpu()
-    return [sample_expression(p[b], max_len) for b in range(batch_size)]
-
-
-def beam_search_expressions(model, beam_width, max_len, n_return=10):
-    model.eval()
-    device = next(model.parameters()).device
-    x_M = torch.full((1, max_len), MASK_TOKEN, dtype=torch.long, device=device)
-    with torch.no_grad():
-        p = torch.softmax(model(x_M, max_len), dim=-1).cpu()[0]
-    beams = [(0.0, [])]
-    for pos in range(max_len):
-        new_beams = []
-        for lp, tau in beams:
-            if is_complete(tau): new_beams.append((lp, tau)); continue
-            mask  = get_valid_tokens(tau, pos, max_len)
-            p_pos = p[pos, :N_TOKENS].clone() * torch.tensor(mask, dtype=torch.float32)
-            if p_pos.sum() == 0: continue
-            p_pos /= p_pos.sum()
-            log_p = torch.log(p_pos + 1e-10)
-            k     = min(beam_width, int(mask.sum()))
-            topk_vals, topk_idx = log_p.topk(k)
-            for v, idx in zip(topk_vals.tolist(), topk_idx.tolist()):
-                if mask[idx] == 0: continue
-                new_beams.append((lp + v, tau + [idx2tok(idx)]))
-        complete   = [(lp, t) for lp, t in new_beams if is_complete(t)]
-        incomplete = [(lp, t) for lp, t in new_beams if not is_complete(t)]
-        incomplete.sort(key=lambda x: x[0], reverse=True)
-        beams = complete + incomplete[:beam_width]
-        if len(complete) >= n_return: break
-    return [t for _, t in beams if is_complete(t)][:n_return]
 
 
 # ── Expression evaluation (torch, normalised features) ──────────────────────
@@ -1764,104 +1668,11 @@ def energy_worker(args):
 
 
 # ── J-GRPO ──────────────────────────────────────────────────────────────────
-def forward_diffusion(token_indices, t, max_len):
-    n = len(token_indices)
-    mask_count = min(t, n)
-    masked_pos = set(np.random.choice(n, size=mask_count, replace=False).tolist())
-    result = []
-    for i in range(max_len):
-        if i < n and i not in masked_pos: result.append(token_indices[i])
-        else: result.append(MASK_TOKEN)
-    return torch.tensor(result, dtype=torch.long)
-
-
+# The objective itself lives in :func:`discover_policy.jgrpo_terms`.  Above this
+# many buffer entries a GRPO step subsamples, prioritised in log-residual units
+# (see :func:`log_residual_score`) so near-top refinements are not crowded out
+# by the compressed r-scale.
 MAX_GRPO_BATCH = 32
-
-
-def compute_jgrpo(model, model_old, model_ref,
-                  S_alpha, R_alpha, t, max_len, eps, beta, critic=None):
-    valid = [(r, tau, c) for r, tau, c in S_alpha if r - R_alpha > 0]
-    if not valid:
-        return torch.tensor(0.0, requires_grad=True), torch.tensor(0.0)
-
-    if len(valid) > MAX_GRPO_BATCH:
-        # Prioritise in log-residual units so near-top refinements are not
-        # crowded out by the compressed r-scale.
-        scores  = log_residual_score(np.array([r for r, _, _ in valid]))
-        advs    = scores - float(log_residual_score(R_alpha))
-        probs   = advs - advs.min() + 1e-6; probs /= probs.sum()
-        indices = np.random.choice(len(valid), MAX_GRPO_BATCH, replace=False, p=probs)
-        valid   = [valid[i] for i in indices]
-
-    device    = next(model.parameters()).device
-    batch_x_t = [forward_diffusion([tok2idx(tk) for tk in tau], t, max_len)
-                 for _, tau, _ in valid]
-    batch_t   = torch.stack(batch_x_t).to(device)
-
-    logits_cur = model(batch_t, t)
-    with torch.no_grad():
-        logits_old = model_old(batch_t, t)
-        logits_ref = model_ref(batch_t, t)
-
-    # ── Group-relative advantages (GRPO) ────────────────────────────────────
-    # Advantages are computed in LOG-RESIDUAL units: r = 1/(1+e) is first
-    # mapped to -log(e) = logit(r).  In r-units a k-fold residual improvement
-    # near the top of the scale (e.g. adding a small damping term: r 0.961 ->
-    # 0.985) is a ~0.02 gap that group normalisation buries; in log units it
-    # is +log(k) regardless of where on the scale it happens, so late-stage
-    # refinement keeps a full-sized gradient.  Rankings are unchanged (the map
-    # is monotone); only gradient magnitudes differ.
-    batch_rewards = log_residual_score(np.array([r for r, _, _ in valid],
-                                                dtype=np.float64))
-    adv_mean      = float(batch_rewards.mean())
-    adv_std       = float(batch_rewards.std())
-    # If the log-residual spread is degenerate (all residuals within ~0.1% of
-    # each other), (s - mean)/(std + eps) just amplifies noise into +-1
-    # advantages.  Skip the policy update.
-    if adv_std < 1e-3:
-        return torch.tensor(0.0, requires_grad=True), torch.tensor(0.0)
-    group_adv     = (batch_rewards - adv_mean) / (adv_std + 1e-6)
-
-    # NOTE: critic baseline kept for reference but intentionally NOT used for the
-    # advantage (see above).  Left here so the critic pathway stays available.
-    critic_baselines = None
-    if critic is not None:
-        with torch.no_grad():
-            crit_in = []
-            for _, tau, _ in valid:
-                tokens = [tok2idx(tk) for tk in tau] + [MASK_TOKEN] * (max_len - len(tau))
-                crit_in.append(tokens[:max_len])
-            critic_baselines = critic(
-                torch.tensor(crit_in, dtype=torch.long, device=device)
-            ).cpu().numpy()
-
-    log_p_cur = F.log_softmax(logits_cur, dim=-1)
-    total_obj = torch.tensor(0.0, device=device)
-    total_ent = torch.tensor(0.0, device=device)
-    n_terms   = 0
-
-    for bi, (reward, tau, _) in enumerate(valid):
-        A_i = float(group_adv[bi])            # group-normalised advantage
-        for k, tok in enumerate(tau):
-            if k >= max_len: break
-            ti       = tok2idx(tok)
-            lp_cur_k = log_p_cur[bi, k, ti]
-            lp_old_k = F.log_softmax(logits_old[bi, k], dim=-1)[ti].detach()
-            h        = torch.exp(lp_cur_k - lp_old_k)
-            # PPO clip: min(h*A, clip(h)*A).  Multiplying by A *after* the min
-            # is only equivalent for A >= 0; for A < 0 it leaves the ratio
-            # unclipped below 1-eps, giving unbounded down-weighting gradients
-            # on tokens shared with good expressions.
-            obj_k    = torch.min(h * A_i, torch.clamp(h, 1 - eps, 1 + eps) * A_i)
-            p_ref    = torch.softmax(logits_ref[bi, k], dim=-1).detach()
-            kl_k     = F.kl_div(log_p_cur[bi, k], p_ref, reduction='sum', log_target=False)
-            total_obj = total_obj + obj_k - beta * kl_k
-            total_ent = total_ent + Categorical(logits=logits_cur[bi, k]).entropy()
-            n_terms  += 1
-
-    if n_terms == 0:
-        return torch.tensor(0.0, requires_grad=True), torch.tensor(0.0)
-    return total_obj / n_terms, total_ent / n_terms
 
 
 # ── Denormalisation to physical units ───────────────────────────────────────

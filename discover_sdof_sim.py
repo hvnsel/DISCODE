@@ -141,17 +141,16 @@ def DISCOVER_SDOF_SIM(
     max_traj         = None,
     w_acc            = 0.5,
     use_pool         = True,
-    # policy architecture (see DISCOVER_TRAIN)
-    architecture          = 'joint',
+    # policy (see DISCOVER_TRAIN)
     cross_slice_attention = True,
     n_layers              = 4,
     d_model               = 128,
     slice_order           = 'random',
     sample_order          = 'reward',
-    max_terms             = 8,         # terms architecture only
-    max_term_len          = 8,
+    max_terms             = 8,         # term slots per DOF (bag capacity)
+    max_term_len          = 8,         # token budget per term
     term_grammar          = 'free',    # 'free' | 'varpro'
-    term_position_encoding = True,     # False -> Change 2 (order-blind bag)
+    term_position_encoding = True,     # False -> order-blind bag
     seed_policy           = None,
 ):
     """Generate a 1-DOF system from the library and try to rediscover it."""
@@ -188,7 +187,6 @@ def DISCOVER_SDOF_SIM(
         max_traj         = max_traj,
         w_acc            = w_acc,
         use_pool         = use_pool,
-        architecture          = architecture,
         cross_slice_attention = cross_slice_attention,
         n_layers              = n_layers,
         d_model               = d_model,
