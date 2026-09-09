@@ -1,9 +1,9 @@
 """
-discode_mdof_sim.py
+discover_mdof_sim.py
 ===================
 
-DISCODE on a **simulated multi-DOF** system.  Same idea as
-:mod:`discode_sdof_sim`, one DOF per policy: the states come from integrating a
+DISCOVER on a **simulated multi-DOF** system.  Same idea as
+:mod:`discover_sdof_sim`, with coupled DOFs: the states come from integrating a
 known set of coupled equations, so the work-energy identity closes exactly and
 the reward ceiling is ~1.0.  The only question is whether the search recovers
 the equations.
@@ -26,7 +26,7 @@ exponent), so ``q1^3`` is ``['intpower', 'x1']``.
 Cubic COUPLING: ``(q1 - q2)^3`` expands into four monomials (``q1^3,
 q1^2*q2, q1*q2^2, q2^3``), so its truth tau is long and carries four fitted
 exponent slots.  That used to fall off the closed-form path; it no longer does
-— :func:`discode_core._fit_consts_linear` sends >``MAX_GRID_COMBOS`` cases to
+— :func:`discover_core._fit_consts_linear` sends >``MAX_GRID_COMBOS`` cases to
 cyclic coordinate descent, which was added for exactly this structure and fits
 it essentially exactly.  ``coupled_duffing`` and ``duffing_chain3`` still keep
 the coupling linear and the cubic on the grounded springs, which keeps their
@@ -35,8 +35,8 @@ truths short; ``cubic_coupled`` is the deliberate opposite (see its docstring).
 
 from __future__ import annotations
 
-from discode_data import TruthSystem, build_truth_system, print_truth_rewards
-from discode_train import DISCODE_TRAIN
+from discover_data import TruthSystem, build_truth_system, print_truth_rewards
+from discover_train import DISCOVER_TRAIN
 
 
 # ── N-DOF system library ────────────────────────────────────────────────────
@@ -193,7 +193,7 @@ def get_mdof_system(key):
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────
-def DISCODE_MDOF_SIM(
+def DISCOVER_MDOF_SIM(
     system_key       = 'coupled_duffing',
     # data generation
     n_traj           = None,     # None = use the spec's value
@@ -222,13 +222,16 @@ def DISCODE_MDOF_SIM(
     max_traj         = None,
     w_acc            = 0.5,
     use_pool         = True,
-    # policy architecture (see DISCODE_TRAIN)
-    architecture          = 'joint',
+    # policy (see DISCOVER_TRAIN)
     cross_slice_attention = True,
     n_layers              = 4,
     d_model               = 128,
     slice_order           = 'random',
     sample_order          = 'reward',
+    max_terms             = 8,         # term slots per DOF (bag capacity)
+    max_term_len          = 8,         # token budget per term
+    term_grammar          = 'free',    # 'free' | 'varpro'
+    term_position_encoding = True,     # False -> order-blind bag
     seed_policy           = None,
 ):
     """Generate an N-DOF system from the library and try to rediscover it."""
@@ -237,14 +240,14 @@ def DISCODE_MDOF_SIM(
                                 n_pts=n_pts, seed=seed)
 
     if plot_data:
-        from discode_data import plot_system_data
+        from discover_data import plot_system_data
         plot_system_data(system)
 
     if show_truth:
         print_truth_rewards(system, max_traj=max_traj, w_acc=w_acc,
                             energy_normalize=energy_normalize)
 
-    return DISCODE_TRAIN(
+    return DISCOVER_TRAIN(
         system_data      = system,
         n_epochs         = n_epochs,
         batch_size       = batch_size,
@@ -265,18 +268,21 @@ def DISCODE_MDOF_SIM(
         max_traj         = max_traj,
         w_acc            = w_acc,
         use_pool         = use_pool,
-        architecture          = architecture,
         cross_slice_attention = cross_slice_attention,
         n_layers              = n_layers,
         d_model               = d_model,
         slice_order           = slice_order,
         sample_order          = sample_order,
+        max_terms             = max_terms,
+        max_term_len          = max_term_len,
+        term_grammar          = term_grammar,
+        term_position_encoding = term_position_encoding,
         seed                  = seed_policy,
     )
 
 
 if __name__ == '__main__':
-    DISCODE_MDOF_SIM(
+    DISCOVER_MDOF_SIM(
         system_key = 'coupled_duffing',
         n_epochs   = 300,
         batch_size = 200,

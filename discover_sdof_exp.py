@@ -1,8 +1,8 @@
 """
-discode_sdof_exp.py
+discover_sdof_exp.py
 ===================
 
-DISCODE on a **single DOF of experimental data**.  One channel is sliced out of
+DISCOVER on a **single DOF of experimental data**.  One channel is sliced out of
 a MATLAB record and identified on its own.
 
 This is legitimate rather than a shortcut: the work-energy relation
@@ -11,7 +11,7 @@ identity, so DOF ``d``'s balance closes without any knowledge of the other
 DOFs — whatever coupling forces they exert are already contained in ``a_d``.
 The discovered expression may of course reference only the states of this DOF,
 so any true coupling shows up as unexplained residual.  If you want the
-coupling terms, use :mod:`discode_mdof_exp`, which keeps every channel as a
+coupling terms, use :mod:`discover_mdof_exp`, which keeps every channel as a
 grammar variable.
 
 Read the ceiling before reading the reward
@@ -26,11 +26,11 @@ mutually inconsistent, which is a warning, not a success.
 
 from __future__ import annotations
 
-from discode_data import load_mat_data, select_dof, identity_ceiling, plot_system_data
-from discode_train import DISCODE_TRAIN
+from discover_data import load_mat_data, select_dof, identity_ceiling, plot_system_data
+from discover_train import DISCOVER_TRAIN
 
 
-def DISCODE_SDOF_EXP(
+def DISCOVER_SDOF_EXP(
     mat_path         = "SN_data.mat",
     dof_index        = 0,        # which channel of the record to identify
     var_name         = 'x',
@@ -60,18 +60,21 @@ def DISCODE_SDOF_EXP(
     max_traj         = None,
     w_acc            = 0.5,
     use_pool         = True,
-    # policy architecture (see DISCODE_TRAIN)
-    architecture          = 'joint',
+    # policy (see DISCOVER_TRAIN)
     cross_slice_attention = True,
     n_layers              = 4,
     d_model               = 128,
     slice_order           = 'random',
     sample_order          = 'reward',
+    max_terms             = 8,         # term slots per DOF (bag capacity)
+    max_term_len          = 8,         # token budget per term
+    term_grammar          = 'free',    # 'free' | 'varpro'
+    term_position_encoding = True,     # False -> order-blind bag
     seed_policy           = None,
     center_features  = False,
     system_data      = None,     # pass a preloaded SystemData to skip loading
 ):
-    """Identify one experimental channel with the DISCODE pipeline."""
+    """Identify one experimental channel with the DISCOVER pipeline."""
     full = system_data
     if full is None:
         full = load_mat_data(mat_path,
@@ -91,7 +94,7 @@ def DISCODE_SDOF_EXP(
         print(f"[ceiling] worst per-DOF/per-trial ceiling: {worst:.4f} "
               f"— no expression can score above this\n", flush=True)
 
-    return DISCODE_TRAIN(
+    return DISCOVER_TRAIN(
         system_data      = system,
         n_epochs         = n_epochs,
         batch_size       = batch_size,
@@ -112,19 +115,22 @@ def DISCODE_SDOF_EXP(
         max_traj         = max_traj,
         w_acc            = w_acc,
         use_pool         = use_pool,
-        architecture          = architecture,
         cross_slice_attention = cross_slice_attention,
         n_layers              = n_layers,
         d_model               = d_model,
         slice_order           = slice_order,
         sample_order          = sample_order,
+        max_terms             = max_terms,
+        max_term_len          = max_term_len,
+        term_grammar          = term_grammar,
+        term_position_encoding = term_position_encoding,
         seed                  = seed_policy,
         center_features  = center_features,
     )
 
 
 if __name__ == '__main__':
-    DISCODE_SDOF_EXP(
+    DISCOVER_SDOF_EXP(
         mat_path             = "SH_data.mat",
         dof_index            = 0,
         n_epochs             = 300,

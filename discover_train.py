@@ -1,14 +1,14 @@
 """
-discode_train.py
-================
+discover_train.py
+=================
 
-The DISCODE training loop.  One function, :func:`DISCODE_TRAIN`, which takes a
-:class:`discode_data.SystemData` and returns the best expression found for each
+The DISCOVER training loop.  One function, :func:`DISCOVER_TRAIN`, which takes a
+:class:`discover_data.SystemData` and returns the best expression found for each
 DOF.
 
 It knows nothing about MATLAB files, system libraries or ground truth — the
-drivers (``discode_sdof_sim``, ``discode_sdof_exp``, ``discode_mdof_sim``,
-``discode_mdof_exp``) build the ``SystemData`` and call this.  A single-DOF run
+drivers (``discover_sdof_sim``, ``discover_sdof_exp``, ``discover_mdof_sim``,
+``discover_mdof_exp``) build the ``SystemData`` and call this.  A single-DOF run
 is just ``n_dof == 1``; there is no separate SDOF loop.
 
 Per epoch:
@@ -16,37 +16,32 @@ Per epoch:
   1. The policy samples a batch of candidate token sequences per DOF (plus a
      beam-search batch every ``beam_interval`` epochs).
   2. Every candidate has its constants fitted to that DOF's own work-energy
-     balance and is scored by the reward (see :mod:`discode_core`).  The fit
+     balance and is scored by the reward (see :mod:`discover_core`).  The fit
      and the score are the same closed-form VARPRO path wherever possible.
   3. The top-``alpha`` fraction is promoted into the DOF's replay buffer,
      ranked by a novelty-scaled score but STORED as the raw reward.
   4. The critic and the J-GRPO objective are trained on that buffer.
 
-Two architectures share this loop, selected by ``architecture``:
+The policy is the term-structured transformer of :mod:`discover_policy`: one
+network writes every DOF's expression as a bag of short terms summed under a
+root ``add`` it never has to emit, and each DOF conditions on the bags already
+committed for the DOFs before it in the slice order.  Set
+``cross_slice_attention=False`` to forbid that cross-DOF attention (N
+independent term-bag policies sharing weights) and
+``term_position_encoding=False`` to make the bag order-blind.
 
-``'joint'`` (default)
-    One autoregressive transformer writes every DOF's sequence as one
-    flattened sequence, so each DOF conditions on the expressions already
-    committed for the others (:mod:`discode_policy`).  Set
-    ``cross_slice_attention=False`` to keep autoregression but forbid
-    cross-DOF attention — N independent AR models sharing weights.
-
-``'independent'``
-    The original N one-shot masked-diffusion policies, one per DOF, unchanged.
-
-The **reward and the buffers stay per-DOF under both**.
+The **reward and the buffers stay per-DOF**.
 ``integral(v_d * a_d) = 1/2 (v_d^2 - v_d(0)^2)`` is an exact per-DOF kinematic
 identity — coupling forces are already inside ``a_d`` — so each balance closes
 on its own, and mixing a partner's residual into the score would only make
 rewards incomparable across epochs.  See the docstring of
-:func:`discode_core.energy_worker`.  Only the *policy* is joint; advantages are
-still z-scored within a single DOF's batch.
+:func:`discover_core.energy_worker`.  Only the *policy* is shared; advantages
+are still z-scored within a single DOF's batch.
 
-Buffer entries are ``(energy_reward, tau, consts, context)``.  Under
-``'joint'`` the context records the slice order, this slice's slot, and the
-slices that preceded it — everything the sample could see — so the entry stays
-reproducible in isolation and comparable across epochs.  Under
-``'independent'`` it is ``None``.
+Buffer entries are ``(energy_reward, tau, consts, context)``.  ``tau`` is the
+flat assembled sum.  The context records the slice order, this slice's slot,
+and the slices that preceded it — everything the sample could see — so the
+entry stays reproducible in isolation and comparable across epochs.
 """
 
 from __future__ import annotations
@@ -61,11 +56,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-import discode_core as dc
-import discode_policy as dp
-from discode_data import generate_dataset
+import discover_core as dc
+import discover_policy as dp
+from discover_data import generate_dataset
 
-N_WORKERS = max(1, min(os.cpu_count() or 4, 8))
+N_WORKERS = max(1, min(os.cpu_count() or 4, 3))
 HOF_SIZE = 10
 
 
@@ -76,7 +71,9 @@ class DOFState:
 
     The critic predicts *this* DOF's reward and is cheap, so it stays here even
     under a shared policy.  (Its baseline is deliberately computed and not used
-    for the advantage — see :func:`discode_core.compute_jgrpo`.)
+    for the advantage — see :func:`discover_policy.jgrpo_terms`.)  ``max_len``
+    is the critic's token window; an assembled tau longer than that is
+    truncated on the way in.
     """
 
     def __init__(self, max_len, device):
@@ -91,90 +88,70 @@ class DOFState:
         self.hof        = []
 
 
-# ── Policy state (one joint policy, or N independent ones) ──────────────────
+# ── Policy state (one shared term-bag policy) ───────────────────────────────
 class PolicyState:
-    """Owns the policy weights, optimiser, schedule, and the old/ref copies.
-
-    Both architectures expose the same three operations — :meth:`refresh`,
-    :meth:`sample`, :meth:`update` — so the training loop below has a single
-    code path and ``architecture='independent'`` keeps running exactly as it
-    did before this change.
+    """Owns the policy weights, optimiser, schedule, and the old/ref copies,
+    and exposes the three operations the loop needs: :meth:`refresh`,
+    :meth:`sample`, :meth:`update`.
     """
 
-    def __init__(self, n_dof, max_len, lr, n_epochs, device,
-                 architecture='joint', cross_slice_attention=True,
-                 n_layers=4, d_model=128, slice_order='random',
-                 sample_order='reward', rng=None):
-        if architecture not in ('joint', 'independent'):
-            raise ValueError(f"architecture must be 'joint' or 'independent', "
-                             f"got {architecture!r}")
-        self.architecture = architecture
+    def __init__(self, n_dof, lr, n_epochs, device,
+                 cross_slice_attention=True, n_layers=4, d_model=128,
+                 slice_order='random', sample_order='reward', rng=None,
+                 max_terms=8, max_term_len=8, term_grammar='free',
+                 term_position_encoding=True):
         self.n_dof        = n_dof
         self.device       = device
         self.slice_order  = slice_order
         self.sample_order = sample_order
+        self.term_grammar = term_grammar
         self.rng          = np.random.default_rng() if rng is None else rng
 
-        if architecture == 'joint':
-            self.policy = dp.ARJointPolicy(
-                n_tokens=dc.N_TOKENS, max_len=max_len, n_dof=n_dof,
-                d_model=d_model, n_layers=n_layers,
-                cross_slice_attention=cross_slice_attention).to(device)
-            self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=n_epochs, eta_min=1e-5)
-            self.policy_old = copy.deepcopy(self.policy).to(device); self.policy_old.eval()
-            self.policy_ref = copy.deepcopy(self.policy).to(device); self.policy_ref.eval()
-            self.nets = [self.policy]
-        else:
-            self.models = [dc.DiffusionModel(n_tokens=dc.N_TOKENS, max_len=max_len).to(device)
-                           for _ in range(n_dof)]
-            self.optimizers = [torch.optim.Adam(m.parameters(), lr=lr) for m in self.models]
-            self.schedulers = [torch.optim.lr_scheduler.CosineAnnealingLR(
-                o, T_max=n_epochs, eta_min=1e-5) for o in self.optimizers]
-            self.models_old = [copy.deepcopy(m).to(device).eval() for m in self.models]
-            self.models_ref = [copy.deepcopy(m).to(device).eval() for m in self.models]
-            self.nets = self.models
+        self.policy = dp.TermBagPolicy(
+            n_tokens=dc.N_TOKENS, max_terms=max_terms,
+            max_term_len=max_term_len, n_dof=n_dof,
+            d_model=d_model, n_layers=n_layers,
+            cross_slice_attention=cross_slice_attention,
+            term_position_encoding=term_position_encoding).to(device)
+        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=n_epochs, eta_min=1e-5)
+        self.policy_old = copy.deepcopy(self.policy).to(device); self.policy_old.eval()
+        self.policy_ref = copy.deepcopy(self.policy).to(device); self.policy_ref.eval()
 
     def n_params(self):
-        return sum(p.numel() for net in self.nets for p in net.parameters()
-                   if p.requires_grad)
+        return sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
+
+    @staticmethod
+    def dedup_key(tau):
+        """Buffer-dedup key for a token sequence: the sorted term multiset.
+
+        Two bags with the same terms in a different order are the same
+        expression (the reward is order-blind), so they must not both enter
+        the buffer.
+        """
+        return tuple(sorted(tuple(t) for t in dc.split_terms(tau)))
 
     def refresh(self, ep, G):
         """Refresh the reference policy every ``G`` epochs, the old one every epoch."""
-        if self.architecture == 'joint':
-            if ep % G == 0:
-                self.policy_ref = copy.deepcopy(self.policy).to(self.device); self.policy_ref.eval()
-            self.policy_old = copy.deepcopy(self.policy).to(self.device); self.policy_old.eval()
-        else:
-            if ep % G == 0:
-                self.models_ref = [copy.deepcopy(m).to(self.device).eval() for m in self.models]
-            self.models_old = [copy.deepcopy(m).to(self.device).eval() for m in self.models]
+        if ep % G == 0:
+            self.policy_ref = copy.deepcopy(self.policy).to(self.device); self.policy_ref.eval()
+        self.policy_old = copy.deepcopy(self.policy).to(self.device); self.policy_old.eval()
 
     # ── sampling ────────────────────────────────────────────────────────────
-    def sample(self, batch_size, max_len, best_r, do_beam, beam_width):
+    def sample(self, batch_size, best_r, do_beam, beam_width):
         """Return, per DOF, a list of ``(tau, context)``.
 
-        Under ``'joint'`` the slice order is chosen once per epoch by
-        ``sample_order`` (``'reward'`` puts the most-converged DOF first, so the
-        others condition on it) and then varied across the batch by
-        ``slice_order`` — see :func:`discode_policy.make_batch_orders` for why
-        both matter.
+        The slice order is chosen once per epoch by ``sample_order``
+        (``'reward'`` puts the most-converged DOF first, so the others
+        condition on it) and then varied across the batch by ``slice_order``
+        — see :func:`discover_policy.make_batch_orders` for why both matter.
         """
         n = self.n_dof
-        if self.architecture == 'independent':
-            out = []
-            for i, m in enumerate(self.models):
-                exprs = dc.sample_batch(m, batch_size, max_len)
-                if do_beam:
-                    exprs.extend(dc.beam_search_expressions(
-                        m, beam_width, max_len, n_return=beam_width))
-                out.append([(tau, None) for tau in exprs])
-            return out
-
         base   = dp.choose_order(best_r, self.sample_order, self.rng)
         orders = dp.make_batch_orders(base, batch_size, self.slice_order, self.rng)
-        samples = dp.sample_joint_batch(self.policy, batch_size, max_len, n, orders)
+        samples = dp.sample_term_batch(self.policy, batch_size, n, orders,
+                                       term_grammar=self.term_grammar)
 
         out = [[] for _ in range(n)]
         for b, sample in enumerate(samples):
@@ -185,26 +162,23 @@ class PolicyState:
                     (slice_taus[slot], dp.make_context(row, slot, slice_taus)))
 
         if do_beam:
-            for d, tau, ctx in dp.beam_candidates(
-                    self.policy, base, max_len, n, beam_width, n_return=beam_width):
+            cands = dp.beam_term_candidates(
+                self.policy, base, n, beam_width, n_return=beam_width,
+                term_grammar=self.term_grammar)
+            for d, tau, ctx in cands:
                 out[d].append((tau, ctx))
         return out
 
     # ── policy update ───────────────────────────────────────────────────────
-    def update(self, states, C, max_len, eps, beta, lam_t, trainable=None):
+    def update(self, states, C, critic_max_len, eps, beta, lam_t, trainable=None):
         """``trainable`` is the set of DOFs that promoted something this epoch.
 
-        A DOF that produced no valid candidate sits the epoch out, exactly as
-        it did before this change — under a shared policy that also stops a
-        stale buffer from pushing the trunk on its own.
+        A DOF that produced no valid candidate sits the epoch out — under a
+        shared policy that also stops a stale buffer from pushing the trunk on
+        its own.
         """
         eligible = [i for i, st in enumerate(states)
                     if st.buffer and (trainable is None or i in trainable)]
-
-        if self.architecture == 'independent':
-            for i in eligible:
-                _grpo_steps_independent(self, i, states[i], C, max_len, eps, beta, lam_t)
-            return
 
         # One shared policy: one backward pass per GRPO step, but the advantage
         # stays per-DOF (never pooled — reward scales differ wildly between
@@ -214,16 +188,16 @@ class PolicyState:
             total_loss = None
             for d in eligible:
                 st = states[d]
-                jg, ent, ok = dp.jgrpo_ar(
+                critic = st.critic if len(st.buffer) >= 32 else None
+                jg, ent, ok = dp.jgrpo_terms(
                     self.policy, self.policy_old, self.policy_ref,
                     st.buffer, R_alpha=min(e[0] for e in st.buffer),
-                    dof=d, n_dof=self.n_dof, max_len=max_len, eps=eps, beta=beta,
-                    critic=st.critic if len(st.buffer) >= 32 else None)
+                    dof=d, n_dof=self.n_dof, eps=eps, beta=beta,
+                    critic=critic, critic_max_len=critic_max_len)
                 if not ok:
                     # A degenerate spread (or nothing above R_alpha) zeroes out
-                    # THIS DOF only.  Returning early here — as the per-DOF
-                    # version could afford to — would throw away the other
-                    # DOFs' gradients along with it.
+                    # THIS DOF only.  Returning early here would throw away the
+                    # other DOFs' gradients along with it.
                     continue
                 term = -(jg + lam_t * ent)
                 total_loss = term if total_loss is None else total_loss + term
@@ -258,31 +232,13 @@ def _train_critic(st, max_len, device):
     return c_loss.item() if c_loss is not None else None
 
 
-def _grpo_steps_independent(ps, i, st, C, max_len, eps, beta, lam_t):
-    """The original per-DOF masked-diffusion update, unchanged."""
-    model = ps.models[i]
-    S_grpo = [(e[0], e[1], e[2]) for e in st.buffer]
-    R_grpo = min(r for r, _, _ in S_grpo)
-    model.train()
-    for _j in range(C):
-        t_diff  = int(np.random.randint(1, max_len + 1))
-        jg, ent = dc.compute_jgrpo(
-            model, ps.models_old[i], ps.models_ref[i],
-            S_grpo, R_grpo, t_diff, max_len, eps, beta,
-            critic=st.critic if len(st.buffer) >= 32 else None)
-        loss = -(jg + lam_t * ent)
-        ps.optimizers[i].zero_grad(); loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        ps.optimizers[i].step()
-    ps.schedulers[i].step()
-
-
 # ── Main loop ───────────────────────────────────────────────────────────────
-def DISCODE_TRAIN(
-    system_data,               # a discode_data.SystemData
+def DISCOVER_TRAIN(
+    system_data,               # a discover_data.SystemData
     n_epochs         = 300,
     batch_size       = 200,
-    max_len          = 20,
+    max_len          = 20,     # critic token window; the policy's own budget
+                               # is max_terms * max_term_len
     lr               = 1e-4,
     alpha            = 0.20,
     C                = 5,
@@ -302,33 +258,39 @@ def DISCODE_TRAIN(
                                # blend: residual = (1-w)*energy + w*accel_NRMSE
     use_pool         = True,
     center_features  = False,  # see generate_dataset(): scale-only by default
-    # ── policy architecture ────────────────────────────────────────────────
-    architecture          = 'joint',   # 'joint' | 'independent'
-    cross_slice_attention = True,      # False -> V0+AR: AR, but no cross-DOF
-    n_layers              = 4,         # joint only (= old n_enc + n_dec)
-    d_model               = 128,       # joint only
+    # ── policy (see discover_policy) ───────────────────────────────────────
+    cross_slice_attention = True,      # False -> no cross-DOF attention
+    n_layers              = 4,         # transformer depth
+    d_model               = 128,       # transformer width
     slice_order           = 'random',  # batch slice orders: 'random' | 'fixed'
     sample_order          = 'reward',  # epoch base order: 'reward'|'random'|'fixed'
     seed                  = None,      # slice-order RNG
+    max_terms             = 8,         # term slots per DOF (bag capacity)
+    max_term_len          = 8,         # token budget per term
+    term_grammar          = 'free',    # 'free' | 'varpro' (see discover_policy)
+    term_position_encoding = True,     # False -> order-blind bag
 ):
     """Search for one acceleration expression per DOF of ``system_data``.
 
     Returns a list of ``(reward, tau, consts, context)`` — the best entry per
-    DOF, or ``None`` for a DOF where nothing survived.  ``context`` is ``None``
-    under ``architecture='independent'``.
+    DOF, or ``None`` for a DOF where nothing survived.
 
-    The ablation matrix is three configs of this one function:
+    Two knobs isolate two hypotheses and are worth tracking separately:
 
-    ==========  ==========================================================
-    V0          ``architecture='independent'``
-    V0+AR       ``architecture='joint', cross_slice_attention=False``
-    B           ``architecture='joint', cross_slice_attention=True``
-    ==========  ==========================================================
+    ``term_position_encoding``
+        ``True``: the model knows which term came first.  ``False`` drops the
+        one embedding band that tells term ``k`` which earlier term came
+        first, and asks whether permutation invariance helps on top of term
+        decomposition.  Mask, sampler and update are identical between them.
 
-    V0 has N policies and the joint variants have one, so their parameter
-    counts do not match by construction; both are printed at startup, and
-    ``n_layers`` / ``d_model`` are exposed so a capacity-matched run can be
-    configured explicitly rather than assumed.
+    ``cross_slice_attention``
+        ``False`` forbids a DOF from attending to the other DOFs' bags, and
+        asks whether cross-DOF structure sharing is doing anything.  The gain
+        can only show when the shared subtree is more than one token — use
+        ``system_key='cubic_coupled'`` in :mod:`discover_mdof_sim`.
+
+    ``n_layers`` / ``d_model`` are exposed so a capacity-matched comparison can
+    be configured explicitly; the parameter count is printed at startup.
     """
     device = dc.DEVICE
     system = system_data
@@ -361,21 +323,22 @@ def DISCODE_TRAIN(
         print(f"Energy-scoring pool : {N_WORKERS} workers\n")
 
     states = [DOFState(max_len, device) for _ in range(N)]
-    ps = PolicyState(N, max_len, lr, n_epochs, device,
-                     architecture=architecture,
+    ps = PolicyState(N, lr, n_epochs, device,
                      cross_slice_attention=cross_slice_attention,
                      n_layers=n_layers, d_model=d_model,
                      slice_order=slice_order, sample_order=sample_order,
-                     rng=np.random.default_rng(seed))
-    if architecture == 'joint':
-        print(f"[policy] joint autoregressive  "
-              f"cross_slice_attention={cross_slice_attention}  "
-              f"n_layers={n_layers}  d_model={d_model}")
-        print(f"[policy] slice_order={slice_order}  sample_order={sample_order}")
-    else:
-        print(f"[policy] {N} independent masked-diffusion policies")
-    print(f"[policy] {ps.n_params():,} trainable parameters "
-          f"({len(ps.nets)} network{'s' if len(ps.nets) > 1 else ''})\n")
+                     rng=np.random.default_rng(seed),
+                     max_terms=max_terms, max_term_len=max_term_len,
+                     term_grammar=term_grammar,
+                     term_position_encoding=term_position_encoding)
+    print(f"[policy] terms-in-a-bag  max_terms={max_terms}  "
+          f"max_term_len={max_term_len}  term_grammar={term_grammar}  "
+          f"term_position_encoding={term_position_encoding}")
+    print(f"[policy] cross_slice_attention={cross_slice_attention}  "
+          f"n_layers={n_layers}  d_model={d_model}  "
+          f"slice_order={slice_order}  sample_order={sample_order}")
+    print(f"[policy] {ps.n_params():,} trainable parameters  "
+          f"(critic max_len={max_len})\n")
 
     for ep in range(n_epochs):
         t0_ep   = time.time()
@@ -390,7 +353,7 @@ def DISCODE_TRAIN(
 
         # ── Step 1: Sampling ────────────────────────────────────────────────
         t1 = time.time()
-        all_exprs = ps.sample(batch_size, max_len,
+        all_exprs = ps.sample(batch_size,
                               best_r=[st.best_r for st in states],
                               do_beam=(ep > 0 and ep % beam_interval == 0),
                               beam_width=beam_width)
@@ -435,11 +398,9 @@ def DISCODE_TRAIN(
         print(f"  [2-energy]   scored  ({time.time()-t1:.2f}s)", flush=True)
 
         # ── Step 3: promotion + buffer update + train ───────────────────────
-        # Promotion and the critic are per-DOF; the policy update is not (a
-        # joint policy takes one step across every DOF's buffer), so it sits
-        # between the two per-DOF passes rather than inside the loop.  For
-        # `independent` this is a pure reordering: the buffers never interact,
-        # so pruning DOF 0 before or after DOF 1's update makes no difference.
+        # Promotion and the critic are per-DOF; the policy update is not (the
+        # shared policy takes one step across every DOF's buffer), so it sits
+        # between the two per-DOF passes rather than inside the loop.
         t1 = time.time()
         report = {}
         for i, st in enumerate(states):
@@ -471,11 +432,12 @@ def DISCODE_TRAIN(
             # Dedup on the token sequence alone, never on the context: the same
             # structure found under a different slice order is the same
             # expression, and the reward that gates it was computed in
-            # isolation either way.
-            seen = set(tuple(e[1]) for e in st.buffer)
+            # isolation either way.  The key is the sorted term multiset, so
+            # the same terms drawn in a different order collapse too.
+            seen = set(ps.dedup_key(e[1]) for e in st.buffer)
             n_added = 0
             for entry in promoted:
-                key = tuple(entry[1])
+                key = ps.dedup_key(entry[1])
                 if key in seen:
                     continue
                 seen.add(key); st.buffer.append(entry); n_added += 1
@@ -522,7 +484,7 @@ def DISCODE_TRAIN(
                 print(f"          denorm: {d}")
 
     # ── Final summary ───────────────────────────────────────────────────────
-    print(f"\n{'=' * 64}\n=== DISCODE done :: {system.name} ===")
+    print(f"\n{'=' * 64}\n=== DISCOVER done :: {system.name} ===")
     best_per_dof = []
     for i, st in enumerate(states):
         if not st.buffer:
@@ -544,7 +506,7 @@ def DISCODE_TRAIN(
             print(f"    #{rank}: energy={hof[0]:.4f}  "
                   f"{dh if dh else dc.expr_to_str(hof[1], hof[2])}")
 
-    # Paste-ready block for discode_score.py / discode_plot_*.py
+    # Paste-ready block for discover_score.py / discover_plot_*.py
     print(f"\n{'=' * 64}\nDISCOVERED_EXPRS = [")
     for i, best in enumerate(best_per_dof):
         if best is None:

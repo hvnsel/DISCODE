@@ -1,11 +1,11 @@
 """
-discode_plot_sim.py
+discover_plot_sim.py
 ===================
 Simulate discovered equations forward from a SIMULATED system's initial
 condition and compare against the known truth.
 
 Works for any number of DOFs: ``SIM_KEY`` may name any entry in the
-:mod:`discode_sdof_sim` or :mod:`discode_mdof_sim` libraries.
+:mod:`discover_sdof_sim` or :mod:`discover_mdof_sim` libraries.
 
 USAGE
 -----
@@ -15,7 +15,7 @@ USAGE
    ``t_end`` / ``n_pts`` / ``seed``) to reproduce the exact dataset that was
    trained on — the ICs are drawn from a seeded generator, so the same spec
    always gives the same trials.
-3. ``python discode_plot_sim.py``
+3. ``python discover_plot_sim.py``
 
 Variable names in expressions follow the system's ``var_names`` (printed on
 load).  Supported syntax: ``+ - * / ** ^``, ``sin cos exp sqrt abs Abs sign
@@ -35,21 +35,27 @@ import sys
 
 sys.path.insert(0, '.')
 
-from discode_analysis import plot_discovered
-from discode_data import build_truth_system
+from discover_analysis import plot_discovered
+from discover_data import build_truth_system
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ── CONFIG ─────────────────────────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════
 
-SIM_KEY       = 'coupled_duffing'   # any key from the sdof/mdof sim libraries
+SIM_KEY       = 'duffing_chain3'   # any key from the sdof/mdof sim libraries
 SIM_OVERRIDES = {}                  # e.g. {'n_traj': 2, 'n_pts': 4000, 'seed': 1}
 TRIAL         = 0                   # which trial supplies the IC + comparison
 
 # One discovered expression per DOF (RHS only, or with "<var>ddot = " prefix).
 DISCOVERED_EXPRS = [
-    "xddot = -5.874*x - 5.068e-6*xdot**7 - 0.1496*xdot + 1.504*y + 0.007891*ydot - 0.006921",
-    "yddot = -6.287e-5*x*y + 1.5*x + 4.478e-5*xdot*y - 0.5002*y**3 + 0.0001182*y**2 - 4.0*y - 0.1*ydot - 3.128e-6"
+    # coupled duffing
+    #"xddot = -5.874*x - 5.068e-6*xdot**7 - 0.1496*xdot + 1.504*y + 0.007891*ydot - 0.006921",
+    #"yddot = -6.287e-5*x*y + 1.5*x + 4.478e-5*xdot*y - 0.5002*y**3 + 0.0001182*y**2 - 4.0*y - 0.1*ydot - 3.128e-6"
+
+    # duffing chain3
+    "q1ddot = -0.5996*q1**3 - 0.0008078*q1**2*q3 + 3.242e-5*q1**2 - 3.628e-7*q1*q3**2 + 2.912e-8*q1*q3 - 6.0*q1 - 0.12*q1dot + 3.0*q2 - 5.431e-11*q3**3 + 6.539e-12*q3**2 + 0.0001094*q3 - 8.359e-6",
+    "q2ddot = 3.0*q1 - 2.773e-5*q2*q2dot**4 - 6.0*q2 - 1.714e-16*q2dot**3 - 4.947e-7*q2dot*q3 - 0.12*q2dot + 3.0*q3 + 5.396e-6",
+    "q3ddot = 0.002339*q1dot + 2.995*q2 + 0.001561*q2dot - 6.196*q3 - 0.1205*q3dot - 0.005513"
 ]
 
 # Simulation
@@ -67,8 +73,8 @@ ENERGY_NORMALIZE = True
 
 def get_sim_spec(key):
     """Look ``key`` up in the SDOF and MDOF simulated libraries."""
-    from discode_sdof_sim import _REGISTRY as SDOF_REG
-    from discode_mdof_sim import _REGISTRY as MDOF_REG
+    from discover_sdof_sim import _REGISTRY as SDOF_REG
+    from discover_mdof_sim import _REGISTRY as MDOF_REG
     reg = {**SDOF_REG, **MDOF_REG}
     if key not in reg:
         raise ValueError(f"Unknown SIM_KEY '{key}'. Choose from {sorted(reg)}.")

@@ -1,7 +1,7 @@
 """
 lono_comparison_plot.py
 =======================
-Compare the PUBLISHED LO-NO equations of motion against a DISCODE-discovered
+Compare the PUBLISHED LO-NO equations of motion against a DISCOVER-discovered
 pair, on every trial of the experimental record.
 
 Truth
@@ -34,7 +34,7 @@ are informative:
   2. ACCELERATION   — each equation evaluated on the MEASURED states.
      A one-step-local check, independent of integration stability.
   3. CUMULATIVE ENERGY — integral(v*a) against the measured change in kinetic
-     energy.  This is the quantity the DISCODE reward is built on.
+     energy.  This is the quantity the DISCOVER reward is built on.
 
 An equation can win row 2 and lose row 3, or vice versa; the console table
 reports both so the comparison is not decided by whichever panel is prettiest.
@@ -55,9 +55,9 @@ import numpy as np
 
 sys.path.insert(0, '.')
 
-from discode_analysis import (clean_exprs, cumtrapz, forward_simulate,
+from discover_analysis import (clean_exprs, cumtrapz, forward_simulate,
                               predict_accel)
-from discode_data import load_mat_data
+from discover_data import load_mat_data
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ── CONFIG ─────────────────────────────────────────────────────────────────
@@ -90,7 +90,7 @@ SIVA = dict(
 # Approach II: b1=3.7751, b2=0.7751,  k1=18883, k2=1933.8, alpha=2.6805e7, beta=2.0012
 
 # ── Discovered equations — keep exactly ONE pair uncommented ───────────────
-GENERATED_LABEL = "DISCODE run E"
+GENERATED_LABEL = "DISCOVER run E"
 
 GENERATED_EXPRS = [
     "q1ddot = -1.279e+4*q1**3 - 8.551*q1**2*q1dot - 4.268e+6*q1**2*q2 + 0.8043*q1**2*q2dot + 2.084*q1**2 - 0.001906*q1*q1dot**2 - 1902.0*q1*q1dot*q2 + 0.0003585*q1*q1dot*q2dot + 0.000929*q1*q1dot - 4.748e+8*q1*q2**2 + 178.9*q1*q2*q2dot + 463.7*q1*q2 - 1.686e-5*q1*q2dot**2 - 8.738e-5*q1*q2dot - 6598.0*q1 - 1.416e-7*q1dot**3 - 0.212*q1dot**2*q2 + 3.995e-8*q1dot**2*q2dot + 1.035e-7*q1dot**2 - 1.058e+5*q1dot*q2**2 + 0.03988*q1dot*q2*q2dot + 0.1033*q1dot*q2 - 3.758e-9*q1dot*q2dot**2 - 1.947e-8*q1dot*q2dot - 1.951*q1dot + 6.6e+7*q2**3 + 9953.0*q2**2*q2dot + 2.579e+4*q2**2 - 0.001876*q2*q2dot**2 - 0.00972*q2*q2dot + 484.6*q2 + 1.178e-10*q2dot**3 + 9.158e-10*q2dot**2 + 0.3482*q2dot + 0.04959",
@@ -98,28 +98,28 @@ GENERATED_EXPRS = [
 ]
 
 # ── run A ──────────────────────────────────────────────────────────────────
-# GENERATED_LABEL = "DISCODE run A"
+# GENERATED_LABEL = "DISCOVER run A"
 # GENERATED_EXPRS = [
 #     "q1ddot = -1.659e+9*q1**3 + 1.051e+5*q1**2*q1dot + 3.093e+8*q1**2*q2 - 2.92e+4*q1**2 - 1.044e+4*q1*q1dot**2 + 4.107e+6*q1*q1dot*q2 - 122.5*q1*q1dot - 4.257e+8*q1*q2**2 + 2.805e+4*q1*q2 - 1588.0*q1 - 3.709*q1dot**3 + 2888.0*q1dot**2*q2 - 0.1285*q1dot**2 - 7.06e+5*q1dot*q2**2 + 58.84*q1dot*q2 - 0.001129*q1dot + 5.584e+7*q2**3 - 6735.0*q2**2 + 92.36*q2 - 3.304e-6",
 #     "q2ddot = 3.224e+5*q1**3 + 3282.0*q1**2*q1dot - 7.63e+6*q1**2*q2 + 186.2*q1**2*q2dot + 11.13*q1*q1dot**2 - 5.177e+4*q1*q1dot*q2 + 1.263*q1*q1dot*q2dot + 6.019e+7*q1*q2**2 - 2937.0*q1*q2*q2dot + 0.03583*q1*q2dot**2 + 1339.0*q1 + 0.01259*q1dot**3 - 87.82*q1dot**2*q2 + 0.002143*q1dot**2*q2dot + 2.042e+5*q1dot*q2**2 - 9.964*q1dot*q2*q2dot + 0.0001215*q1dot*q2dot**2 - 1.684*q1dot - 2.794e+7*q2**3 + 1.158e+4*q2**2*q2dot - 0.2826*q2*q2dot**2 - 1606.0*q2 + 2.298e-6*q2dot**3 - 0.4418*q2dot",
 # ]
 
 # ── run B ──────────────────────────────────────────────────────────────────
-# GENERATED_LABEL = "DISCODE run B"
+# GENERATED_LABEL = "DISCOVER run B"
 # GENERATED_EXPRS = [
 #     "q1ddot = -1.618e+9*q1**3 + 3616.0*q1*q1dot - 7880.0*q1 - 0.05822*q1dot**3 + 118.0*q1dot**2*q2 + 0.03304*q1dot**2*q2dot + 7.05*q1dot**2 - 7.972e+4*q1dot*q2**2 - 44.65*q1dot*q2*q2dot - 641.8*q1dot*q2 - 0.006251*q1dot*q2dot**2 + 25.74*q1dot*q2dot - 1.661*q1dot + 1.795e+7*q2**3 + 1.508e+4*q2**2*q2dot + 2.756e+4*q2**2 + 4.224*q2*q2dot**2 + 15.44*q2*q2dot + 602.7*q2 + 0.0003942*q2dot**3 + 0.002161*q2dot**2 + 0.3853*q2dot + 0.002406",
 #     "q2ddot = 1.48e+7*q1**3 + 1.179e+5*q1**2*q1dot - 5.736e+7*q1**2*q2 + 1.417e+4*q1**2*q2dot - 1801.0*q1**2 + 313.3*q1*q1dot**2 - 3.047e+5*q1*q1dot*q2 + 75.26*q1*q1dot*q2dot - 9.569*q1*q1dot + 7.41e+7*q1*q2**2 - 3.66e+4*q1*q2*q2dot + 4653.0*q1*q2 + 4.52*q1*q2dot**2 - 1.149*q1*q2dot + 1324.0*q1 + 0.2774*q1dot**3 - 404.7*q1dot**2*q2 + 0.09996*q1dot**2*q2dot - 0.01271*q1dot**2 + 1.968e+5*q1dot*q2**2 - 97.22*q1dot*q2*q2dot + 12.36*q1dot*q2 + 0.01201*q1dot*q2dot**2 - 0.003053*q1dot*q2dot - 0.8906*q1dot - 3.191e+7*q2**3 + 2.364e+4*q2**2*q2dot - 3006.0*q2**2 - 5.839*q2*q2dot**2 + 1.485*q2*q2dot - 1608.0*q2 + 0.0004807*q2dot**3 - 0.0001834*q2dot**2 - 0.5757*q2dot - 9.879e-7",
 # ]
 
 # ── run C ──────────────────────────────────────────────────────────────────
-# GENERATED_LABEL = "DISCODE run C"
+# GENERATED_LABEL = "DISCOVER run C"
 # GENERATED_EXPRS = [
 #     "q1ddot = -1.279e+4*q1**3 - 8.551*q1**2*q1dot - 4.268e+6*q1**2*q2 + 0.8043*q1**2*q2dot + 2.084*q1**2 - 0.001906*q1*q1dot**2 - 1902.0*q1*q1dot*q2 + 0.0003585*q1*q1dot*q2dot + 0.000929*q1*q1dot - 4.748e+8*q1*q2**2 + 178.9*q1*q2*q2dot + 463.7*q1*q2 - 1.686e-5*q1*q2dot**2 - 8.738e-5*q1*q2dot - 6598.0*q1 - 1.416e-7*q1dot**3 - 0.212*q1dot**2*q2 + 3.995e-8*q1dot**2*q2dot + 1.035e-7*q1dot**2 - 1.058e+5*q1dot*q2**2 + 0.03988*q1dot*q2*q2dot + 0.1033*q1dot*q2 - 3.758e-9*q1dot*q2dot**2 - 1.947e-8*q1dot*q2dot - 1.951*q1dot + 6.6e+7*q2**3 + 9953.0*q2**2*q2dot + 2.579e+4*q2**2 - 0.001876*q2*q2dot**2 - 0.00972*q2*q2dot + 484.6*q2 + 1.178e-10*q2dot**3 + 9.158e-10*q2dot**2 + 0.3482*q2dot + 0.04959",
 #     "q2ddot = 6.629e+6*q1**3 + 34.47*q1**2*q1dot + 8.152e+5*q1**2*q2 + 2.768*q1**2*q2dot + 0.1081*q1*q1dot**2 + 5112.0*q1*q1dot*q2 + 0.01736*q1*q1dot*q2dot + 6.044e+7*q1*q2**2 + 410.4*q1*q2*q2dot + 0.0006968*q1*q2dot**2 + 1383.0*q1 + 0.000113*q1dot**3 + 8.014*q1dot**2*q2 + 2.721e-5*q1dot**2*q2dot + 1.895e+5*q1dot*q2**2 + 1.287*q1dot*q2*q2dot + 2.185e-6*q1dot*q2dot**2 - 1.193*q1dot - 2.945e+7*q2**3 + 1.522e+4*q2**2*q2dot + 0.05166*q2*q2dot**2 - 1673.0*q2 + 5.847e-8*q2dot**3 - 0.5637*q2dot + 0.008289",
 # ]
 
 # ── run D ──────────────────────────────────────────────────────────────────
-# GENERATED_LABEL = "DISCODE run D"
+# GENERATED_LABEL = "DISCOVER run D"
 # GENERATED_EXPRS = [
 #     "q1ddot = -1.783e+9*q1**3 - 1.028e+6*q1**2*q1dot + 5.082e+8*q1**2*q2 - 2.693e+4*q1**2*q2dot + 1.198e+5*q1**2 - 1107.0*q1*q1dot**2 + 1.094e+6*q1*q1dot*q2 - 57.98*q1*q1dot*q2dot + 258.0*q1*q1dot - 2.705e+8*q1*q2**2 + 2.867e+4*q1*q2*q2dot - 1.275e+5*q1*q2 - 0.7596*q1*q2dot**2 + 6.759*q1*q2dot - 6723.0*q1 - 0.3971*q1dot**3 + 589.0*q1dot**2*q2 - 0.03121*q1dot**2*q2dot + 0.1389*q1dot**2 - 2.912e+5*q1dot*q2**2 + 30.86*q1dot*q2*q2dot - 137.3*q1dot*q2 - 0.0008177*q1dot*q2dot**2 + 0.007276*q1dot*q2dot - 0.01619*q1dot + 4.799e+7*q2**3 - 7629.0*q2**2*q2dot + 3.394e+4*q2**2 + 0.4043*q2*q2dot**2 - 3.597*q2*q2dot + 448.6*q2 - 34.57*q2dot**3 + 9.531e-5*q2dot**2 + 0.3591*q2dot + 0.05788",
 #     "q2ddot = 1.46e+7*q1**3 + 1.139e+5*q1**2*q1dot - 5.682e+7*q1**2*q2 + 1.638e+4*q1**2*q2dot - 5411.0*q1**2 + 296.1*q1*q1dot**2 - 2.954e+5*q1*q1dot*q2 + 85.15*q1*q1dot*q2dot - 28.13*q1*q1dot + 7.368e+7*q1*q2**2 - 4.248e+4*q1*q2*q2dot + 1.403e+4*q1*q2 + 6.122*q1*q2dot**2 - 4.045*q1*q2dot + 1323.0*q1 + 0.2566*q1dot**3 - 384.0*q1dot**2*q2 + 0.1107*q1dot**2*q2dot - 0.03657*q1dot**2 + 1.916e+5*q1dot*q2**2 - 110.4*q1dot*q2*q2dot + 36.48*q1dot*q2 + 0.01592*q1dot*q2dot**2 - 0.01052*q1dot*q2dot - 0.9003*q1dot - 3.185e+7*q2**3 + 2.754e+4*q2**2*q2dot - 9099.0*q2**2 - 7.939*q2*q2dot**2 + 5.246*q2*q2dot - 1608.0*q2 + 0.0007628*q2dot**3 - 0.000756*q2dot**2 - 0.5966*q2dot + 0.05462",

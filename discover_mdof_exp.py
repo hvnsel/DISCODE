@@ -1,10 +1,10 @@
 """
-discode_mdof_exp.py
+discover_mdof_exp.py
 ===================
 
-DISCODE on **multi-DOF experimental data** — the real target.  Every channel of
-the MATLAB record becomes a grammar variable, and one policy per DOF searches
-for that DOF's acceleration, so coupling terms are expressible.
+DISCOVER on **multi-DOF experimental data** — the real target.  Every channel of
+the MATLAB record becomes a grammar variable, and the policy searches for every
+DOF's acceleration at once, so coupling terms are expressible.
 
 Read the ceiling before reading the reward
 ------------------------------------------
@@ -19,7 +19,7 @@ per trial and per DOF, and it should be read first, every run.
 If the ceiling is low, the fix is in the data conditioning, not the search:
 every channel must be filtered with the SAME number of passes, or the
 derivative relations between them no longer hold.  Use
-:mod:`discode_mdof_sim` to confirm the pipeline itself is healthy before
+:mod:`discover_mdof_sim` to confirm the pipeline itself is healthy before
 spending epochs on a record with a bad ceiling.
 
 ``w_acc``
@@ -33,11 +33,11 @@ stacked least-squares solve, so it keeps the closed-form constant fit.
 
 from __future__ import annotations
 
-from discode_data import load_mat_data, identity_ceiling, plot_system_data
-from discode_train import DISCODE_TRAIN
+from discover_data import load_mat_data, identity_ceiling, plot_system_data
+from discover_train import DISCOVER_TRAIN
 
 
-def DISCODE_MDOF_EXP(
+def DISCOVER_MDOF_EXP(
     mat_path         = "AllData_ProcessedNOhit.mat",
     var_names        = None,     # None -> ['q1', 'q2', ...]
     # data conditioning
@@ -66,18 +66,21 @@ def DISCODE_MDOF_EXP(
     max_traj         = 10,
     w_acc            = 0.9,
     use_pool         = True,
-    # policy architecture (see DISCODE_TRAIN)
-    architecture          = 'joint',
+    # policy (see DISCOVER_TRAIN)
     cross_slice_attention = True,
     n_layers              = 4,
     d_model               = 128,
     slice_order           = 'random',
     sample_order          = 'reward',
+    max_terms             = 8,         # term slots per DOF (bag capacity)
+    max_term_len          = 8,         # token budget per term
+    term_grammar          = 'free',    # 'free' | 'varpro'
+    term_position_encoding = True,     # False -> order-blind bag
     seed_policy           = None,
     center_features  = False,
     system_data      = None,     # pass a preloaded SystemData to skip loading
 ):
-    """Identify every DOF of an experimental record with the DISCODE pipeline."""
+    """Identify every DOF of an experimental record with the DISCOVER pipeline."""
     system = system_data
     if system is None:
         system = load_mat_data(mat_path,
@@ -96,7 +99,7 @@ def DISCODE_MDOF_EXP(
         print(f"[ceiling] worst per-DOF/per-trial ceiling: {worst:.4f} "
               f"— no expression can score above this\n", flush=True)
 
-    return DISCODE_TRAIN(
+    return DISCOVER_TRAIN(
         system_data      = system,
         n_epochs         = n_epochs,
         batch_size       = batch_size,
@@ -117,29 +120,33 @@ def DISCODE_MDOF_EXP(
         max_traj         = max_traj,
         w_acc            = w_acc,
         use_pool         = use_pool,
-        architecture          = architecture,
         cross_slice_attention = cross_slice_attention,
         n_layers              = n_layers,
         d_model               = d_model,
         slice_order           = slice_order,
         sample_order          = sample_order,
+        max_terms             = max_terms,
+        max_term_len          = max_term_len,
+        term_grammar          = term_grammar,
+        term_position_encoding = term_position_encoding,
         seed                  = seed_policy,
         center_features  = center_features,
     )
 
 
 if __name__ == '__main__':
-    DISCODE_MDOF_EXP(
-        mat_path             = "LONO_combined.mat",
+    DISCOVER_MDOF_EXP(
+        mat_path             = "AllData_ProcessedNOhit.mat",
         var_names            = ['q1', 'q2'],
         n_epochs             = 500,
         batch_size           = 150,
         max_len              = 40,
         trim_timesteps_front = 1000,
-        trim_timesteps_back  = 125_000,
+        trim_timesteps_back  = 125000,
         desired_timesteps    = 500,
         plot_data            = True,
     )
 
     # 1000, 125000 for NOhit
     # 1000, 128000 for LOhit
+    # 0, 0 for LONO combined

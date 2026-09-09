@@ -1,11 +1,11 @@
 """
-discode_plot_exp.py
+discover_plot_exp.py
 ===================
 Simulate discovered equations forward from an EXPERIMENTAL initial condition
 and compare against the record.
 
 Works for any number of DOFs — set ``DOF_INDEX`` to an integer to look at a
-single channel (matching a :mod:`discode_sdof_exp` run), or leave it ``None``
+single channel (matching a :mod:`discover_sdof_exp` run), or leave it ``None``
 for the full multi-DOF record.
 
 USAGE
@@ -15,7 +15,7 @@ USAGE
 2. Point the config at the same data the run used — the trim and downsample
    settings matter, since they change the time grid the equations were fitted
    on.
-3. ``python discode_plot_exp.py``
+3. ``python discover_plot_exp.py``
 
 Variable names in expressions follow ``VAR_NAMES``::
 
@@ -40,19 +40,20 @@ import sys
 
 sys.path.insert(0, '.')
 
-from discode_analysis import plot_discovered
-from discode_data import load_mat_data, select_dof
+from discover_analysis import plot_discovered
+from discover_data import load_mat_data, select_dof
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ── CONFIG ─────────────────────────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════
 
-#MAT_PATH  = "AllData_ProcessedLOhit.mat"
-MAT_PATH = "SH_data.mat"
-#VAR_NAMES = ['q1', 'q2']    # one name per DOF, in data-column order
-VAR_NAMES = ['x']
-DOF_INDEX = 0               # None = all channels; an int = single-DOF slice
-TRIAL     = 0              # which trial supplies the IC and the comparison
+MAT_PATH  = "AllData_ProcessedNOhit.mat"
+# MAT_PATH = "SN_data.mat"
+VAR_NAMES = ['q1', 'q2']    # one name per DOF, in data-column order
+# VAR_NAMES = ['x']
+DOF_INDEX = None               # None = all channels; an int = single-DOF slice
+#DOF_INDEX = 0
+TRIAL     = 3              # which trial supplies the IC and the comparison
 
 # One discovered expression per DOF (RHS only, or with "<var>ddot = " prefix).
 DISCOVERED_EXPRS = [
@@ -73,11 +74,18 @@ DISCOVERED_EXPRS = [
     #" q2ddot = 4940.0*q1**3 + 46.5*q1**2*q1dot + 9.5e+5*q1**2*q2 + 3.806*q1**2*q2dot - 1.595*q1**2 + 0.1459*q1*q1dot**2 + 5962.0*q1*q1dot*q2 + 0.02388*q1*q1dot*q2dot - 0.01001*q1*q1dot + 6.09e+7*q1*q2**2 + 487.9*q1*q2*q2dot - 204.5*q1*q2 + 0.0009774*q1*q2dot**2 - 0.0008191*q1*q2dot + 1406.0*q1 + 0.0001526*q1dot**3 + 9.354*q1dot**2*q2 + 3.747e-5*q1dot**2*q2dot - 1.57e-5*q1dot**2 + 1.911e+5*q1dot*q2**2 + 1.531*q1dot*q2*q2dot - 0.6416*q1dot*q2 + 3.067e-6*q1dot*q2dot**2 - 2.57e-6*q1dot*q2dot - 1.199*q1dot - 2.953e+7*q2**3 + 1.564e+4*q2**2*q2dot - 6554.0*q2**2 + 0.06266*q2*q2dot**2 - 0.05251*q2*q2dot - 1672.0*q2 + 8.367e-8*q2dot**3 - 1.052e-7*q2dot**2 - 0.569*q2dot + 0.03509"
 
     #THE BEST for NO hit
-    # "q1ddot = 4.723e+5*q1*q1dot*q2 - 4.769e+8*q1*q2**2 - 6632.0*q1 + 104.2*q1dot**2*q2 - 1.715e+5*q1dot*q2**2 - 26.39*q1dot*q2 - 1.758*q1dot + 6.693e+7*q2**3 + 2.665e+4*q2**2 + 484.6*q2 + 0.3474*q2dot + 0.04955",
+     #"q1ddot = 4.723e+5*q1*q1dot*q2 - 4.769e+8*q1*q2**2 - 6632.0*q1 + 104.2*q1dot**2*q2 - 1.715e+5*q1dot*q2**2 - 26.39*q1dot*q2 - 1.758*q1dot + 6.693e+7*q2**3 + 2.665e+4*q2**2 + 484.6*q2 + 0.3474*q2dot + 0.04955",
     #" q2ddot = 1.443e+7*q1**3 + 1.435e+5*q1**2*q1dot - 5.699e+7*q1**2*q2 + 2688.0*q1**2 + 475.7*q1*q1dot**2 - 3.778e+5*q1*q1dot*q2 - 57.34*q1*q1dot + 7.503e+7*q1*q2**2 + 1788.0*q1*q2 + 1262.0*q1 + 0.5256*q1dot**3 - 626.3*q1dot**2*q2 + 0.1242*q1dot**2 + 2.487e+5*q1dot*q2**2 + 59.76*q1dot*q2 + 0.02674*q1dot*q2dot - 1.589*q1dot - 3.293e+7*q2**3 - 6474.0*q2**2 - 3.154*q2*q2dot - 1584.0*q2 - 0.4488*q2dot + 0.01904"
 
     #"q1ddot = -4.778e+8*q1*q2**2 - 6613.0*q1 - 9.689e+4*q1dot*q2**2 - 2.025*q1dot + 6.68e+7*q2**3 + 2.622e+4*q2**2 + 483.5*q2 + 0.375*q2dot + 0.05084",
     #"q2ddot = 1.372e+7*q1**3 + 1.367e+5*q1**2*q1dot - 5.481e+7*q1**2*q2 - 2474.0*q1**2 + 454.0*q1*q1dot**2 - 3.641e+5*q1*q1dot*q2 - 16.44*q1*q1dot + 7.301e+7*q1*q2**2 + 6592.0*q1*q2 + 1272.0*q1 + 7.566*q1dot**3 - 604.7*q1dot**2*q2 - 0.0273*q1dot**2 + 2.425e+5*q1dot*q2**2 + 21.9*q1dot*q2 - 1.765*q1dot - 3.242e+7*q2**3 - 4391.0*q2**2 - 1592.0*q2 - 0.4284*q2dot - 2.982e-6"
+
+    # using set transformer architecture
+    #"q1ddot = -1.731e+9*q1**3 - 7318.0*q1 - 2.553*q1dot + 1.896e+7*q2**3 + 540.3*q2 + 0.543*q2dot",
+    #"q2ddot = 1681.0*q1 + 2.019*q1dot - 2.356e+7*q2**3 + 9.069e+4*q2**2*q2dot + 3109.0*q2**2 - 116.3*q2*q2dot**2 - 7.978*q2*q2dot - 1602.0*q2 + 0.04975*q2dot**3 + 0.005117*q2dot**2 - 0.9891*q2dot + 2.005e-6"
+
+    "q1ddot = -1.642e+9*q1**3 + 2.856e+5*q1**2*q2dot + 1.786e+5*q1**2 + 613.1*q1*q2dot**2 + 766.8*q1*q2dot - 7791.0*q1 - 2.604*q1dot + 1.829e+7*q2**3 + 589.8*q2 + 0.4388*q2dot**3 + 0.8232*q2dot**2 + 0.5147*q2dot + 0.1073",
+    "q2ddot = 4.142e+6*q1**3 + 4.371e+4*q1**2*q1dot - 2.209e+7*q1**2*q2 + 153.7*q1*q1dot**2 - 1.554e+5*q1*q1dot*q2 + 3.928e+7*q1*q2**2 + 1733.0*q1 - 2824.0*q1dot**9 + 3686.0*q1dot**7 - 1603.0*q1dot**5 + 232.6*q1dot**3 - 273.3*q1dot**2*q2 + 1.382e+5*q1dot*q2**2 - 6.355*q1dot - 2.328e+7*q2**3 - 1747.0*q2"
 
     # LO
     #"q1ddot = -2.323e+5*q1 - 12.62*q1dot + 1.392e+4*q2 - 21.35*q2dot - 0.5777",
@@ -86,17 +94,25 @@ DISCOVERED_EXPRS = [
     #"q1ddot = 1.31e+26*q1**5*q1dot**5 - 1.22e+5*q1*q1dot - 2.36e+5*q1 - 11.4*q1dot + 6.937e+7*q2**2 + 1.475e+4*q2 - 0.7803",
     #"q2ddot = -1.548e+11*q1**3 - 8.955e+5*q1**2*q1dot - 1.307e+9*q1**2*q2 - 3.442e+4*q1**2*q2dot - 2.476e+6*q1**2 + 1275.0*q1*q1dot**2 + 3.724e+6*q1*q1dot*q2 + 98.04*q1*q1dot*q2dot + 7052.0*q1*q1dot + 2.718e+9*q1*q2**2 + 1.431e+5*q1*q2*q2dot + 1.029e+7*q1*q2 + 1.884*q1*q2dot**2 + 271.0*q1*q2dot + 2.229e+4*q1 - 0.6055*q1dot**3 - 2652.0*q1dot**2*q2 - 0.06981*q1dot**2*q2dot - 5.021*q1dot**2 - 3.871e+6*q1dot*q2**2 - 203.8*q1dot*q2*q2dot - 1.466e+4*q1dot*q2 - 0.002683*q1dot*q2dot**2 - 0.386*q1dot*q2dot + 1.51*q1dot - 1.884e+9*q2**3 - 1.488e+5*q2**2*q2dot - 1.07e+7*q2**2 - 3.917*q2*q2dot**2 - 563.5*q2*q2dot - 2.027e+4*q2 - 3.437e-5*q2dot**3 - 0.007418*q2dot**2 - 0.5335*q2dot + 0.1201"
 
+    # using set transformer architecture
+    #"q1ddot = 1.051e+9*q1*q1dot*q2dot**2 - 2.319e+5*q1 - 5.091e+8*q1dot*q2*q2dot**2 + 7.085e+5*q1dot*q2dot**3 - 10.07*q1dot + 1.9e+4*q2",
+    #"q2ddot = 1.909e+4*q1 - 2.623e+8*q1dot*q2*q2dot**2 + 0.5198*q1dot - 1.97e+4*q2 - 1.085e+4*q2dot**3 - 0.001542*q2dot"
+    #"q2ddot = 5.262e+11*q1*q2**2 + 1.675e+4*q1 + 6.768e+8*q2*q2dot**3 + 1.384e+6*q2*q2dot**2 - 1.94e+4*q2 - 2.003*q2dot"
+    
     # SN_data
     # "xddot = 6.329e+10*x**4*xdot**3 - 2.122e+7*x**3 - 223.5*x*xdot - 464.8*x - 213.9*xdot**4 - 14.68*xdot**3 - 0.1694*xdot - 0.01385"
 
+
     # SH_data
     #"xddot = 2.711e+8*x**3 + 4.889e+7*x**2*xdot**3 - 6.892e+6*x**2*xdot - 2.413e+5*x**2 + 8570.0*x*xdot**2 - 1.318e+4*x*xdot - 1.316e+4*x - 154.5*xdot**3 - 13.75*xdot**2 - 3.627*xdot - 0.004036"
-    "xddot = 2.25e+8*x**3*xdot + 2.103e+8*x**3 - 1.979e+7*x**2*xdot**2 - 4.77e+6*x**2*xdot - 1.662e+5*x**2 - 2.104e+5*x*xdot**3 - 5.499e+4*x*xdot**2 - 707.6*x*xdot - 1.188e+4*x - 90.68*xdot**3 - 9.485*xdot**2 - 6.091*xdot - 0.01357"
+    #"xddot = 2.25e+8*x**3*xdot + 2.103e+8*x**3 - 1.979e+7*x**2*xdot**2 - 4.77e+6*x**2*xdot - 1.662e+5*x**2 - 2.104e+5*x*xdot**3 - 5.499e+4*x*xdot**2 - 707.6*x*xdot - 1.188e+4*x - 90.68*xdot**3 - 9.485*xdot**2 - 6.091*xdot - 0.01357"
+    #"xddot = 3.191e+8*x**3 - 1.259e+4*x - 731.2*xdot**5 - 47.42*xdot**2 - 9.726*xdot"
+    # LONO Combined
 ]
 
 
 # Data loading — must match the training run.
-TRIM_FRONT        = 600 #600
+TRIM_FRONT        = 1000 #600
 TRIM_BACK         = 120_000
 DESIRED_TIMESTEPS = 8000
 

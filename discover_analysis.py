@@ -1,14 +1,14 @@
 """
-discode_analysis.py
+discover_analysis.py
 ===================
 
 Shared machinery for looking at a discovered equation after the search: turning
 a printed expression back into something evaluable, integrating it forward, and
 computing the work-energy residual it leaves behind.
 
-One implementation, used by :mod:`discode_score`, :mod:`discode_plot_sim` and
-:mod:`discode_plot_exp`.  This matters more than it looks: the residual
-definition here has to agree with :func:`discode_core.energy_reward` or the
+One implementation, used by :mod:`discover_score`, :mod:`discover_plot_sim` and
+:mod:`discover_plot_exp`.  This matters more than it looks: the residual
+definition here has to agree with :func:`discover_core.energy_reward` or the
 number you read after training will not be the number you trained on.
 
 Expression convention

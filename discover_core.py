@@ -1,23 +1,23 @@
 """
-discode_core.py
+discover_core.py
 ===============
 
-DISCODE — DIScover Coupled Ordinary Differential Equations.
+DISCOVER — coupled ODE discovery from response data.
 
-The engine behind the whole DISCODE algorithm: degree-of-freedom-agnostic
-diffusion-model deep symbolic regression (after Bastiani et al., 2025) driven
+The engine behind the whole DISCOVER algorithm: degree-of-freedom-agnostic
+transformer-policy deep symbolic regression (after Bastiani et al., 2025) driven
 by a **work-energy (power balance) reward** instead of a point-wise
 acceleration NRMSE or a forward-simulation NRMSE.
 
 Nothing in this module knows where the data came from.  It is imported by
-every DISCODE driver as::
+every DISCOVER driver as::
 
-    import discode_core as dc
+    import discover_core as dc
 
 and is configured through exactly two calls: :func:`configure_grammar` (once
 the number of DOFs is known) and :func:`set_problem_data` (once trajectories
-exist).  Data loading lives in :mod:`discode_data`, the training loop in
-:mod:`discode_train`.
+exist).  Data loading lives in :mod:`discover_data`, the policy in
+:mod:`discover_policy`, the training loop in :mod:`discover_train`.
 
 Motivation
 ----------
@@ -81,8 +81,6 @@ from itertools import product as _iproduct
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Categorical
 from scipy.optimize import least_squares
 import sympy as sp
 from sympy.parsing.sympy_parser import parse_expr
@@ -100,8 +98,13 @@ BINARY_OPS   = ['add', 'mul']            # ['add', 'sub', 'mul']
 UNARY_OPS    = list(POWER_OPS)
 N_ARY_OPS    = ['add', 'sub', 'mul']
 CONSTANTS    = ['const']
-MAX_TREE_DEPTH = 4
-MIN_EXPR_LEN   = 6
+# Depth 5 (not 4): the root ``add`` of a sum-of-terms costs a whole level, and
+# van der Pol's ``mu*(1 - x^2)*xdot`` needs four levels *below* it.  At 4 the
+# search provably could not write that truth.  MIN_EXPR_LEN 2 (not 6): at 6 the
+# linear oscillator ``add(x1, x2, end)`` (4 tokens) was unreachable too.  The
+# term-structured policy applies its own per-term floor via ``min_len``.
+MAX_TREE_DEPTH = 5
+MIN_EXPR_LEN   = 2
 
 # Exponent limits: continuous exponents (abspower/sgnpower) live in
 # [MIN_EXP, MAX_EXP]; intpower exponents are snapped to a nonzero integer in
@@ -172,8 +175,6 @@ MAX_TRAJ = 5
 # blend is a single stacked least-squares solve -- the VARPRO fast path is
 # preserved, and the acceleration block needs no cumtrapz.
 W_ACC = 0.0
-
-MAX_ODE_EVALS  = 50000    # kept for API parity (unused by the energy reward)
 
 
 # ── Grammar configuration ───────────────────────────────────────────────────
@@ -431,52 +432,7 @@ def _parse_local_dict():
     return d
 
 
-# ── Diffusion policy + critic ───────────────────────────────────────────────
-class DiffusionModel(nn.Module):
-    def __init__(self, n_tokens=None, max_len=32, d_model=128,
-                 n_heads=4, ff_dim=512, n_enc=2, n_dec=2):
-        super().__init__()
-        n_tokens = N_TOKENS if n_tokens is None else n_tokens
-        self.max_len    = max_len
-        self.vocab_size = VOCAB_SIZE
-        self.input_proj = nn.Linear(VOCAB_SIZE, d_model)
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=ff_dim,
-            dropout=0.0, batch_first=True, norm_first=True)
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_enc)
-        dec_layer = nn.TransformerDecoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=ff_dim,
-            dropout=0.0, batch_first=True, norm_first=True)
-        self.decoder  = nn.TransformerDecoder(dec_layer, num_layers=n_dec)
-        self.out_proj = nn.Linear(d_model, n_tokens)
-        self._pe_cache = {}
-
-    def _pos_enc(self, t: int) -> torch.Tensor:
-        if t in self._pe_cache:
-            return self._pe_cache[t]
-        D = self.vocab_size; L = self.max_len
-        pe    = torch.zeros(L, D)
-        l_idx = torch.arange(L).float()
-        j_idx = torch.arange(D // 4).float()
-        denom = torch.pow(10000.0, 4 * j_idx / D)
-        arg_l = l_idx.unsqueeze(1) / denom.unsqueeze(0)
-        pe[:, 0:D // 4 * 2:2] = torch.sin(arg_l)
-        pe[:, 1:D // 4 * 2:2] = torch.cos(arg_l)
-        arg_t = (torch.tensor(float(t)) / denom).unsqueeze(0).expand(L, -1)
-        pe[:, D // 2:D // 2 + D // 4 * 2:2]     = torch.sin(arg_t)
-        pe[:, D // 2 + 1:D // 2 + D // 4 * 2:2] = torch.cos(arg_t)
-        self._pe_cache[t] = pe
-        return pe
-
-    def forward(self, x_t: torch.Tensor, t: int) -> torch.Tensor:
-        oh = F.one_hot(x_t, num_classes=self.vocab_size).float()
-        pe = self._pos_enc(t).to(x_t.device).unsqueeze(0)
-        h  = self.input_proj(oh + pe)
-        enc_out = self.encoder(h)
-        dec_out = self.decoder(h, enc_out)
-        return self.out_proj(dec_out)
-
-
+# ── Critic ─────────────────────────────────────────────────────────────────
 class ExprCritic(nn.Module):
     def __init__(self, vocab_size=None, max_len=32, d=64):
         super().__init__()
@@ -535,10 +491,39 @@ def _parse_stack(tau):
     return stack, open_slots, nary_depth, current_depth, parent_op
 
 
-def get_valid_tokens(tau, position, max_len, max_consts=20):
+def get_valid_tokens(tau, position, max_len, max_consts=20,
+                     depth_offset=0, min_len=None, allow_leaf_at_zero=False,
+                     forbid_at_root=(), power_child_vars_only=False):
+    """Validity mask over ``ALL_TOKENS`` for the next token of prefix ``tau``.
+
+    The keyword arguments exist for **term-mode** generation, where ``tau`` is
+    one term of a sum that will later be assembled under a root ``add`` (see
+    :func:`assemble_terms` and :func:`discover_policy.term_valid_mask`).  At
+    their defaults the mask describes the flat whole-expression grammar, which
+    is the reference every assembled bag has to be reachable under — the
+    policy test checks exactly that.
+
+    depth_offset          : depth the term's root will sit at in the assembled
+                            tree, minus one.  A term under a root ``add`` passes
+                            1, so its nesting budget matches what the flat
+                            grammar would allow for the same assembled tau.
+    min_len               : per-term length floor; ``None`` -> ``MIN_EXPR_LEN``.
+    allow_leaf_at_zero    : let a term be a bare variable / const.
+    forbid_at_root        : tokens not allowed at position 0.  Term mode passes
+                            ``('add',)``: an ``add``-rooted term would assemble to
+                            ``add(add(...), ...)``, which ``is_complete`` accepts
+                            but ``_FORBIDDEN_NESTING`` forbids — a candidate the
+                            rest of the system would never generate.
+    power_child_vars_only : restrict a power op's child to a bare variable, which
+                            is exactly the closed-form/VARPRO applicability
+                            boundary (``_expand_monomials`` returns ``None`` for
+                            a power of anything else).
+    """
     remaining = max_len - position
     stack, open_slots, nary_depth, current_depth, parent_op = _parse_stack(tau)
     if stack is None: return np.zeros(N_TOKENS, dtype=np.float32)
+    min_len = MIN_EXPR_LEN if min_len is None else int(min_len)
+    depth   = current_depth + int(depth_offset)
 
     n_consts = tau.count('const')
     top_kind = stack[-1][0] if stack else None
@@ -551,7 +536,7 @@ def get_valid_tokens(tau, position, max_len, max_consts=20):
             if top_kind == 'nary' and top_val >= 2:
                 new_open = open_slots - 1
                 if new_open <= remaining - 1:
-                    if not (new_open == 0 and nary_depth == 1 and position + 1 < MIN_EXPR_LEN):
+                    if not (new_open == 0 and nary_depth == 1 and position + 1 < min_len):
                         mask[idx] = 1.0
             continue
 
@@ -573,28 +558,107 @@ def get_valid_tokens(tau, position, max_len, max_consts=20):
             new_open = open_slots - consume + a
             if new_open < 0 or new_open > remaining - 1: continue
 
-        if position == 0 and a == 0: continue
+        if position == 0 and a == 0 and not allow_leaf_at_zero: continue
+        if position == 0 and tok in forbid_at_root: continue
         if (a == 0 and open_slots == 1 and nary_depth == 0
-                and position + 1 < MIN_EXPR_LEN): continue
+                and position + 1 < min_len): continue
         if tok == 'const' and n_consts >= max_consts: continue
-        if tok in _OP_TOKENS and current_depth >= MAX_TREE_DEPTH: continue
+        if tok in _OP_TOKENS and depth >= MAX_TREE_DEPTH: continue
         if tok in forbidden_child_ops: continue
+        if (power_child_vars_only and parent_op in POWER_OPS
+                and tok not in VAR_SET): continue
 
         if tok in _OP_TOKENS:
             child_pos   = position + 1
-            child_depth = current_depth + 1
+            child_depth = depth + 1
             if tok in N_ARY_OPS:
                 child_leaf_valid = True
             elif top_kind == 'nary':
                 child_leaf_valid = True
             else:
                 child_would_complete = (open_slots == 1 and nary_depth == 0)
-                child_leaf_valid = (not child_would_complete) or (child_pos + 1 >= MIN_EXPR_LEN)
+                child_leaf_valid = (not child_would_complete) or (child_pos + 1 >= min_len)
             if not child_leaf_valid and not (child_depth < MAX_TREE_DEPTH): continue
 
         mask[idx] = 1.0
 
     return mask
+
+
+# ── Sum-of-terms helpers (term-structured policy) ────────────────────────────
+def _subtree_end(tau, start):
+    """Index one past the complete subtree that begins at ``tau[start]``.
+
+    Same stack walk as :func:`is_complete`, started mid-sequence.  If the
+    subtree is not closed by the end of ``tau`` (a partial term), returns
+    ``len(tau)``.
+    """
+    stack = [('fixed', 1)]
+    pos = start
+    while pos < len(tau) and stack:
+        tok = tau[pos]; pos += 1
+        kind, val = stack[-1]
+        if tok == 'end':
+            if kind != 'nary': return pos
+            stack.pop()
+            if stack:
+                pk, pv = stack[-1]
+                if pk == 'fixed':
+                    stack[-1] = ('fixed', pv - 1)
+                    if pv - 1 == 0: stack.pop()
+        elif tok in N_ARY_OPS:
+            if kind == 'fixed':
+                stack[-1] = ('fixed', val - 1)
+                if val - 1 == 0: stack.pop()
+            elif kind == 'nary':
+                stack[-1] = ('nary', val + 1)
+            stack.append(('nary', 0))
+        else:
+            a = ARITY[tok]
+            if kind == 'fixed':
+                stack[-1] = ('fixed', val - 1)
+                if val - 1 == 0: stack.pop()
+            elif kind == 'nary':
+                stack[-1] = ('nary', val + 1)
+            if a > 0: stack.append(('fixed', a))
+    return pos
+
+
+def split_terms(tau):
+    """Inverse of :func:`assemble_terms`: the top-level summands of ``tau``.
+
+    An ``add``-rooted tau yields the token span of each child, in the order
+    they appear (a trailing partial child is returned as-is).  Anything else is
+    a single term.  Deterministic, so the term-structured policy can rebuild
+    its teacher-forcing input from the flat tau a buffer entry stores.
+    """
+    tau = list(tau)
+    if not tau:
+        return []
+    if tau[0] != 'add':
+        return [tau]
+    terms, pos = [], 1
+    while pos < len(tau) and tau[pos] != 'end':
+        end = _subtree_end(tau, pos)
+        terms.append(tau[pos:end])
+        pos = end
+    return terms
+
+
+def assemble_terms(terms):
+    """``['add'] + t1 + ... + tm + ['end']``, or the bare term when ``m == 1``.
+
+    ``add`` requires >= 2 children, so a single term is emitted unwrapped;
+    that is still a valid expression because the sampler never lets a
+    one-term bag be a bare leaf (see the STOP rule in
+    :func:`discover_policy.sample_term_batch`).
+    """
+    terms = [list(t) for t in terms if t]
+    if not terms:
+        return []
+    if len(terms) == 1:
+        return terms[0]
+    return ['add'] + [tok for t in terms for tok in t] + ['end']
 
 
 def is_complete(tau):
@@ -628,57 +692,6 @@ def is_complete(tau):
                 stack[-1] = ('nary', val + 1)
             if a > 0: stack.append(('fixed', a))
     return len(stack) == 0
-
-
-def sample_expression(p: torch.Tensor, max_len: int) -> list:
-    tau = []
-    for i in range(max_len):
-        r   = get_valid_tokens(tau, i, max_len)
-        p_i = p[i, :N_TOKENS].clone() * torch.tensor(r, dtype=torch.float32)
-        if p_i.sum() == 0: p_i = torch.tensor(r, dtype=torch.float32)
-        if p_i.sum() == 0: break
-        p_i /= p_i.sum()
-        tau.append(idx2tok(Categorical(p_i).sample().item()))
-        if is_complete(tau): break
-    return tau
-
-
-def sample_batch(model, batch_size, max_len):
-    model.eval()
-    device = next(model.parameters()).device
-    x_M = torch.full((batch_size, max_len), MASK_TOKEN, dtype=torch.long, device=device)
-    with torch.no_grad():
-        p = torch.softmax(model(x_M, max_len), dim=-1).cpu()
-    return [sample_expression(p[b], max_len) for b in range(batch_size)]
-
-
-def beam_search_expressions(model, beam_width, max_len, n_return=10):
-    model.eval()
-    device = next(model.parameters()).device
-    x_M = torch.full((1, max_len), MASK_TOKEN, dtype=torch.long, device=device)
-    with torch.no_grad():
-        p = torch.softmax(model(x_M, max_len), dim=-1).cpu()[0]
-    beams = [(0.0, [])]
-    for pos in range(max_len):
-        new_beams = []
-        for lp, tau in beams:
-            if is_complete(tau): new_beams.append((lp, tau)); continue
-            mask  = get_valid_tokens(tau, pos, max_len)
-            p_pos = p[pos, :N_TOKENS].clone() * torch.tensor(mask, dtype=torch.float32)
-            if p_pos.sum() == 0: continue
-            p_pos /= p_pos.sum()
-            log_p = torch.log(p_pos + 1e-10)
-            k     = min(beam_width, int(mask.sum()))
-            topk_vals, topk_idx = log_p.topk(k)
-            for v, idx in zip(topk_vals.tolist(), topk_idx.tolist()):
-                if mask[idx] == 0: continue
-                new_beams.append((lp + v, tau + [idx2tok(idx)]))
-        complete   = [(lp, t) for lp, t in new_beams if is_complete(t)]
-        incomplete = [(lp, t) for lp, t in new_beams if not is_complete(t)]
-        incomplete.sort(key=lambda x: x[0], reverse=True)
-        beams = complete + incomplete[:beam_width]
-        if len(complete) >= n_return: break
-    return [t for _, t in beams if is_complete(t)][:n_return]
 
 
 # ── Expression evaluation (torch, normalised features) ──────────────────────
@@ -959,7 +972,7 @@ def _predicted_accel(fn, feats, y_mean_d, y_std_d):
     return y_mean_d + y_std_d * pred_n
 
 
-def energy_reward(exprs, max_traj=5, horizon=None, w_acc=None):
+def energy_reward(exprs, max_traj=None, horizon=None, w_acc=None):
     """Global work-energy reward for a full set of per-DOF expressions.
 
     ``exprs`` is a length-``N_DOF`` list whose entry ``d`` is ``(tau, consts)``
@@ -968,7 +981,8 @@ def energy_reward(exprs, max_traj=5, horizon=None, w_acc=None):
     kinetic-energy sum so the balance stays consistent.
 
     Returns ``r = 1 / (1 + mean_t |cum_power(t) - dKE(t)|)`` averaged over the
-    first ``max_traj`` trajectories (0 if nothing is evaluable).
+    first ``max_traj`` trajectories (``None`` = the configured ``MAX_TRAJ``);
+    0 if nothing is evaluable.
     """
     if NORM_STATS is None or not RAW_TRAJECTORIES:
         return 0.0
@@ -1451,7 +1465,7 @@ def _fit_consts_linear(tau, contexts, ym_t, ys_t, n_consts):
 
 
 def optimise_consts_energy(tau, target_dof, other_exprs=None,
-                           max_traj=5, horizon=None,
+                           max_traj=None, horizon=None,
                            n_inits=3, max_nfev=150):
     """Fit ``tau``'s constants to minimise the target DOF's **own** running
     energy residual ``| integral(vel_t * a_target) - 1/2 (vel_t^2 - vel_t0^2) |``.
@@ -1459,7 +1473,8 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
     The per-DOF work-energy relation is an exact kinematic identity, so each DOF
     is fit independently.  ``other_exprs`` is accepted for API compatibility but
     is no longer used (the other DOFs are not mixed into this DOF's balance, so
-    their errors cannot contaminate its constants).
+    their errors cannot contaminate its constants).  ``max_traj=None`` uses the
+    configured ``MAX_TRAJ`` — the same trajectories the reward scores on.
 
     Fast path: for expressions that are linear in their coefficients (with 0-2
     power exponents) the fit is a closed-form least-squares / variable
@@ -1590,9 +1605,13 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
 
 
 def get_traj_horizon(epoch, n_epochs, t_end):
-    frac = 0.30 + 0.70 * min(epoch / (n_epochs * 0.2), 1.0)
+    """Time horizon the constant fit and the reward integrate over at ``epoch``.
+
+    A growing-horizon curriculum (30% of the record at epoch 0, reaching 100%
+    after the first fifth of training) is deliberately switched off: every
+    epoch scores the full record, so rewards are comparable across epochs.
+    """
     return t_end
-    return frac * t_end
 
 
 def structural_novelty(tau, buffer, n=3):
@@ -1653,104 +1672,11 @@ def energy_worker(args):
 
 
 # ── J-GRPO ──────────────────────────────────────────────────────────────────
-def forward_diffusion(token_indices, t, max_len):
-    n = len(token_indices)
-    mask_count = min(t, n)
-    masked_pos = set(np.random.choice(n, size=mask_count, replace=False).tolist())
-    result = []
-    for i in range(max_len):
-        if i < n and i not in masked_pos: result.append(token_indices[i])
-        else: result.append(MASK_TOKEN)
-    return torch.tensor(result, dtype=torch.long)
-
-
+# The objective itself lives in :func:`discover_policy.jgrpo_terms`.  Above this
+# many buffer entries a GRPO step subsamples, prioritised in log-residual units
+# (see :func:`log_residual_score`) so near-top refinements are not crowded out
+# by the compressed r-scale.
 MAX_GRPO_BATCH = 32
-
-
-def compute_jgrpo(model, model_old, model_ref,
-                  S_alpha, R_alpha, t, max_len, eps, beta, critic=None):
-    valid = [(r, tau, c) for r, tau, c in S_alpha if r - R_alpha > 0]
-    if not valid:
-        return torch.tensor(0.0, requires_grad=True), torch.tensor(0.0)
-
-    if len(valid) > MAX_GRPO_BATCH:
-        # Prioritise in log-residual units so near-top refinements are not
-        # crowded out by the compressed r-scale.
-        scores  = log_residual_score(np.array([r for r, _, _ in valid]))
-        advs    = scores - float(log_residual_score(R_alpha))
-        probs   = advs - advs.min() + 1e-6; probs /= probs.sum()
-        indices = np.random.choice(len(valid), MAX_GRPO_BATCH, replace=False, p=probs)
-        valid   = [valid[i] for i in indices]
-
-    device    = next(model.parameters()).device
-    batch_x_t = [forward_diffusion([tok2idx(tk) for tk in tau], t, max_len)
-                 for _, tau, _ in valid]
-    batch_t   = torch.stack(batch_x_t).to(device)
-
-    logits_cur = model(batch_t, t)
-    with torch.no_grad():
-        logits_old = model_old(batch_t, t)
-        logits_ref = model_ref(batch_t, t)
-
-    # ── Group-relative advantages (GRPO) ────────────────────────────────────
-    # Advantages are computed in LOG-RESIDUAL units: r = 1/(1+e) is first
-    # mapped to -log(e) = logit(r).  In r-units a k-fold residual improvement
-    # near the top of the scale (e.g. adding a small damping term: r 0.961 ->
-    # 0.985) is a ~0.02 gap that group normalisation buries; in log units it
-    # is +log(k) regardless of where on the scale it happens, so late-stage
-    # refinement keeps a full-sized gradient.  Rankings are unchanged (the map
-    # is monotone); only gradient magnitudes differ.
-    batch_rewards = log_residual_score(np.array([r for r, _, _ in valid],
-                                                dtype=np.float64))
-    adv_mean      = float(batch_rewards.mean())
-    adv_std       = float(batch_rewards.std())
-    # If the log-residual spread is degenerate (all residuals within ~0.1% of
-    # each other), (s - mean)/(std + eps) just amplifies noise into +-1
-    # advantages.  Skip the policy update.
-    if adv_std < 1e-3:
-        return torch.tensor(0.0, requires_grad=True), torch.tensor(0.0)
-    group_adv     = (batch_rewards - adv_mean) / (adv_std + 1e-6)
-
-    # NOTE: critic baseline kept for reference but intentionally NOT used for the
-    # advantage (see above).  Left here so the critic pathway stays available.
-    critic_baselines = None
-    if critic is not None:
-        with torch.no_grad():
-            crit_in = []
-            for _, tau, _ in valid:
-                tokens = [tok2idx(tk) for tk in tau] + [MASK_TOKEN] * (max_len - len(tau))
-                crit_in.append(tokens[:max_len])
-            critic_baselines = critic(
-                torch.tensor(crit_in, dtype=torch.long, device=device)
-            ).cpu().numpy()
-
-    log_p_cur = F.log_softmax(logits_cur, dim=-1)
-    total_obj = torch.tensor(0.0, device=device)
-    total_ent = torch.tensor(0.0, device=device)
-    n_terms   = 0
-
-    for bi, (reward, tau, _) in enumerate(valid):
-        A_i = float(group_adv[bi])            # group-normalised advantage
-        for k, tok in enumerate(tau):
-            if k >= max_len: break
-            ti       = tok2idx(tok)
-            lp_cur_k = log_p_cur[bi, k, ti]
-            lp_old_k = F.log_softmax(logits_old[bi, k], dim=-1)[ti].detach()
-            h        = torch.exp(lp_cur_k - lp_old_k)
-            # PPO clip: min(h*A, clip(h)*A).  Multiplying by A *after* the min
-            # is only equivalent for A >= 0; for A < 0 it leaves the ratio
-            # unclipped below 1-eps, giving unbounded down-weighting gradients
-            # on tokens shared with good expressions.
-            obj_k    = torch.min(h * A_i, torch.clamp(h, 1 - eps, 1 + eps) * A_i)
-            p_ref    = torch.softmax(logits_ref[bi, k], dim=-1).detach()
-            kl_k     = F.kl_div(log_p_cur[bi, k], p_ref, reduction='sum', log_target=False)
-            total_obj = total_obj + obj_k - beta * kl_k
-            total_ent = total_ent + Categorical(logits=logits_cur[bi, k]).entropy()
-            n_terms  += 1
-
-    if n_terms == 0:
-        return torch.tensor(0.0, requires_grad=True), torch.tensor(0.0)
-    return total_obj / n_terms, total_ent / n_terms
 
 
 # ── Denormalisation to physical units ───────────────────────────────────────

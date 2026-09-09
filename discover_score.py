@@ -1,5 +1,5 @@
 """
-discode_score.py
+discover_score.py
 ================
 Score discovered equations with the SAME reward the training loop uses.
 No simulation, no plots — paste expressions in, get the number out.
@@ -43,7 +43,7 @@ import numpy as np
 
 sys.path.insert(0, '.')
 
-from discode_analysis import score_system
+from discover_analysis import score_system
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ── CONFIG ─────────────────────────────────────────────────────────────────
@@ -61,7 +61,7 @@ TRIM_BACK         = 120_000
 DESIRED_TIMESTEPS = 2000
 
 # ── simulated ──────────────────────────────────────────────────────────────
-SIM_KEY = 'coupled_duffing'      # a key from discode_mdof_sim / discode_sdof_sim
+SIM_KEY = 'coupled_duffing'      # a key from discover_mdof_sim / discover_sdof_sim
 SIM_OVERRIDES = {}               # e.g. {'n_traj': 2, 'n_pts': 4000}
 
 # ── common ─────────────────────────────────────────────────────────────────
@@ -80,7 +80,7 @@ EXPRS = [
 def build_system():
     """Rebuild the dataset the run was trained on."""
     if SOURCE == 'experimental':
-        from discode_data import load_mat_data, select_dof
+        from discover_data import load_mat_data, select_dof
         sysd = load_mat_data(MAT_PATH,
                              trim_timesteps_front=TRIM_FRONT,
                              trim_timesteps_back=TRIM_BACK,
@@ -93,9 +93,9 @@ def build_system():
 
     if SOURCE == 'simulated':
         # Lazy: the sim libraries live in the drivers, which import torch.
-        from discode_data import build_truth_system
-        from discode_sdof_sim import _REGISTRY as SDOF_REG
-        from discode_mdof_sim import _REGISTRY as MDOF_REG
+        from discover_data import build_truth_system
+        from discover_sdof_sim import _REGISTRY as SDOF_REG
+        from discover_mdof_sim import _REGISTRY as MDOF_REG
         reg = {**SDOF_REG, **MDOF_REG}
         if SIM_KEY not in reg:
             raise ValueError(f"Unknown SIM_KEY '{SIM_KEY}'. "

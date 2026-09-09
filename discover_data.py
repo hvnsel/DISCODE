@@ -1,8 +1,8 @@
 """
-discode_data.py
+discover_data.py
 ===============
 
-Everything that produces a :class:`SystemData` for DISCODE, and nothing else.
+Everything that produces a :class:`SystemData` for DISCOVER, and nothing else.
 
 A ``SystemData`` is the single container the whole pipeline runs on.  It holds
 three (m, n_dof, p_trials) arrays — displacement, velocity, acceleration — on a
@@ -18,7 +18,7 @@ slices one channel out of a multi-DOF record so the SDOF drivers can reuse an
 experimental file.
 
 :func:`generate_dataset` converts a ``SystemData`` into the normalised stats and
-raw trajectories that :mod:`discode_core` is configured with.
+raw trajectories that :mod:`discover_core` is configured with.
 
 Two diagnostics live here because they are properties of the *data*, not of the
 search:
@@ -109,6 +109,12 @@ def load_mat_data(filepath, trim_timesteps_front=1000, trim_timesteps_back=70000
     import h5py
     import scipy.io
 
+    if not os.path.isfile(filepath):
+        raise FileNotFoundError(
+            f"[load_mat_data] no such file: {filepath!r}.  Point mat_path / "
+            f"MAT_PATH at your .mat record — the data files are not part of "
+            f"the repository.")
+
     # ── Try HDF5 (v7.3) first, fall back to scipy for v5/v6 ─────────────────
     try:
         with h5py.File(filepath, 'r') as f:
@@ -184,10 +190,24 @@ def load_mat_data(filepath, trim_timesteps_front=1000, trim_timesteps_back=70000
             disp = disp.transpose(1, 0, 2)
         print(f"[load_mat_data] loaded via scipy: shape acc={acc.shape}", flush=True)
 
-    acc  = acc[trim_timesteps_front: -trim_timesteps_back]
-    vel  = vel[trim_timesteps_front: -trim_timesteps_back]
-    disp = disp[trim_timesteps_front: -trim_timesteps_back]
-    time = time[trim_timesteps_front: -trim_timesteps_back]
+    # ``-0`` is not "keep everything" in Python — acc[600:-0] is acc[600:0],
+    # which is empty.  A pre-trimmed record therefore needs end=None.
+    n_raw = acc.shape[0]
+    end = -trim_timesteps_back if trim_timesteps_back else None
+    if trim_timesteps_front + trim_timesteps_back >= n_raw:
+        raise ValueError(
+            f"trim removes everything: the record has {n_raw} samples but "
+            f"trim_timesteps_front={trim_timesteps_front} + "
+            f"trim_timesteps_back={trim_timesteps_back} = "
+            f"{trim_timesteps_front + trim_timesteps_back}.\n"
+            f"If this file was already trimmed and impact-aligned (e.g. by "
+            f"data_combine.m), use trim_timesteps_front=0, "
+            f"trim_timesteps_back=0.")
+
+    acc  = acc[trim_timesteps_front: end]
+    vel  = vel[trim_timesteps_front: end]
+    disp = disp[trim_timesteps_front: end]
+    time = time[trim_timesteps_front: end]
 
     down_sample_factor = max(1, acc.shape[0] // desired_timesteps)
     acc  = acc[::down_sample_factor, :, :]
@@ -383,8 +403,8 @@ def identity_ceiling(system, verbose=True, warn=False):
         per_trial.append(line)
 
     if verbose:
-        print(f"\n[ceiling] r( v, a_measured ) per trial — the best any "
-              f"expression can score:")
+        print("\n[ceiling] r( v, a_measured ) per trial — the best any "
+              "expression can score:")
         for j, line in enumerate(per_trial):
             cells = '  '.join(f"DOF{d}={r:.4f}" for d, r in enumerate(line))
             print(f"    trial {j}: {cells}", flush=True)
@@ -411,7 +431,7 @@ def print_truth_rewards(system, max_traj=None, w_acc=None,
     """Score the known truth structure of each DOF with the standard reward.
 
     Requires ``system.truth_taus``.  Constants are fitted by the same
-    :func:`discode_core.optimise_consts_energy` the trainer uses, so the number
+    :func:`discover_core.optimise_consts_energy` the trainer uses, so the number
     printed is exactly what the search would score if it proposed the truth
     structure — the target it should converge to.
 
@@ -420,7 +440,7 @@ def print_truth_rewards(system, max_traj=None, w_acc=None,
     from the nominal value; the printed expression shows what it actually
     chose.
     """
-    import discode_core as dc
+    import discover_core as dc
 
     if all(t is None for t in system.truth_taus):
         return None
