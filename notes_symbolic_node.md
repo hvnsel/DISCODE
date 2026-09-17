@@ -9,28 +9,83 @@ normal draw, reported as % NSR).
 
 ## The short version
 
-Their architecture is not the transferable part. Their **objective** is.
+Their architecture is not the transferable part. Their **objective** is — but
+not in the way I first concluded, and the correction matters more than the
+original claim.
 
-They replace the one-step derivative-matching loss that SINDy and everything
-like it uses with an H-step RK4 rollout loss, and every headline result in the
-paper is downstream of that one choice. Our work-energy reward is on the wrong
-side of it: it integrates the *error* along the record but never feeds the
-model's own state back, so it sits in the H=1 regime that their Figure 12 shows
-getting stuck.
+They replace one-step derivative matching with an H-step RK4 rollout loss.
+That is one way to stop scoring a model pointwise. The horizon is not the only
+way, and on this code it is not the best one: **our reward is already an
+integral method, and its problem is not the absence of a horizon but the shape
+of the integral it takes.**
 
-Measured on our own duffing, fitting the true structure's three coefficients:
+`energy_reward` scores `|cumtrapz(v * a_pred) - 1/2 (v^2 - v0^2)|` at every
+sample. That cumulative integral runs from `t = 0`, so the residual at time `t`
+carries the accumulated noise of every earlier sample — a random walk whose
+variance grows with `t`, shared across all 2000 residuals of a trajectory.
+Cut the same identity into short windows and the equations become independent
+with bounded noise, at the same cost and in the same closed form.
 
-| NSR | our energy fit (c, k, a) | rel. err | rollout fit H=200 | rel. err |
+Fitting the same three coefficients of the same true structure on the same
+noisy duffing record, so the only variable is the objective:
+
+| objective | 5% NSR | 10% | 20% | cost |
 |---|---|---|---|---|
-| 0% | 0.3000, 1.0000, 0.5001 | 0.0000 | 0.3000, 1.0000, 0.5000 | 0.0000 |
-| 5% | 0.3287, 0.9839, **-0.1562** | 0.475 | 0.2969, 0.9965, 0.5178 | **0.016** |
-| 10% | 0.2763, 0.5631, **-0.1490** | 0.605 | 0.2998, 0.9950, 0.5345 | **0.025** |
-| 20% | 0.1975, **-0.1602**, **-0.1502** | 0.934 | 0.3235, 0.9976, 0.5642 | **0.070** |
+| pointwise acceleration (SINDy-like) | 0.0023 | 0.0105 | 0.0422 | 1.0 ms |
+| pointwise + Savitzky-Golay | **0.0011** | **0.0017** | **0.0029** | 0.8 ms |
+| cumulative work-energy (**ours**) | 0.0370 | 0.0804 | 0.2498 | 1.2 ms |
+| windowed work-energy, W=500 | 0.0018 | 0.0046 | 0.0163 | 1.6 ms |
+| rollout H=200, multiple shooting | 0.0164 | 0.0248 | 0.0697 | 327 ms |
 
-Truth is `(0.30, 1.0, 0.50)`. At 5% noise our fit already has the **wrong sign**
-on the cubic; at 20% it has the wrong sign on the spring as well, i.e. it
-reports an unstable system. The rollout fit keeps all three signs and lands
-within 7% at 20% noise — a 13x accuracy gap, and a qualitative one.
+Mean relative error over `(c, k, a) = (0.30, 1.0, 0.50)`. The windowed form is
+**15x more accurate than what we do now and 4x more accurate than the rollout,
+at 1/200 of the rollout's cost.** Savitzky-Golay plus a pointwise fit is better
+still and needs a measured acceleration channel.
+
+### Structure selection, which is what the search actually depends on
+
+Coefficients are secondary; the search lives or dies on whether the objective
+ranks *structures* correctly. Fitting `a = -c v - k q - a q^n` and picking `n`
+by residual (truth is `n = 3`):
+
+```
+  NSR  mode              n=1      n=2      n=3      n=4      n=5      n=6   picks
+   0%  cumulative    0.15695  0.02341  0.00002  0.01966  0.03815  0.05606   n=3  OK
+   0%  windowed      0.20985  0.03581  0.00002  0.02657  0.04645  0.06159   n=3  OK
+   5%  cumulative    0.16142  0.09636  0.08180  0.07455  0.07377  0.07828   n=5  WRONG
+   5%  windowed      0.21478  0.06827  0.05438  0.05752  0.06704  0.07702   n=3  OK
+  10%  cumulative    0.19746  0.16466  0.15201  0.14429  0.14072  0.14051   n=6  WRONG
+  10%  windowed      0.23079  0.11805  0.10848  0.10815  0.11205  0.11725   n=4  close
+  20%  cumulative    0.28728  0.27471  0.26375  0.25593  0.25128  0.24924   n=6  WRONG
+  20%  windowed      0.28745  0.22306  0.21601  0.21360  0.21377  0.21516   n=4  close
+  30%  cumulative    0.36391  0.35510  0.34406  0.33562  0.33050  0.32821   n=6  WRONG
+  30%  windowed      0.36381  0.32822  0.32246  0.31941  0.31821  0.31813   n=6  WRONG
+```
+
+Two things to read here. Windowing buys about one noise decade of
+structure-selection robustness — correct at 5% where the cumulative form is
+already broken, off by one at 10-20% where the cumulative form has failed
+completely. And under the cumulative form at any noise the residual is
+**monotone decreasing in n**: it always picks the largest exponent on offer.
+That is not noise sensitivity, it is a degenerate objective — higher powers
+give more freedom to absorb accumulated noise, so flexibility is rewarded
+without bound. Windowing restores a genuine interior minimum.
+
+Windowing also separates candidates better, which is what GRPO advantages
+consume. At 10% NSR, ranking five structures by residual:
+
+```
+                 truth   linear  quadratic  vdp-ish  truth+junk
+  cumulative   0.15201  0.19746    0.16892  0.19688     0.15199
+  windowed     0.10848  0.23079    0.19900  0.18305     0.10554
+```
+
+Margin from truth to the best *wrong* structure: 11% cumulative, **69%
+windowed** — a 6x better margin for a change that costs 0.4 ms.
+
+It does not fix parsimony: `truth + junk` still edges out truth at every noise
+level under both objectives. That hole needs an explicit complexity penalty,
+exactly as `notes_soft_leaves.md` says.
 
 ## The thing I got wrong first
 
@@ -63,10 +118,12 @@ On clean data the gate earns its keep: it reverses the parsimony inversion the
 soft-leaf note flagged as unfixable by smoothing (reward prefers the junk term
 by 6e-6; the rollout rejects it by 1.5-1.6x at every H). At any real noise level the
 gate is useless, because it is reranking candidates whose coefficients are
-already wrong. Refitting under the rollout loss fixes them; reranking after a
-pointwise fit does not.
+already wrong. Refitting under a better objective fixes them; reranking after a bad fit does
+not.
 
-**The horizon has to be inside the fit.**
+**The fix has to be inside the fit — but the horizon is not the cheapest way
+to get it there.** See the short version: windowing the integral we already
+compute beats the rollout on this system at 1/200 of the cost.
 
 ## Their Figure 12, reproduced on our system
 
@@ -142,7 +199,9 @@ and is the one to argue about.
    thousands of structures possible at all — then refit the promoted elites'
    coefficients under an H-step rollout loss and re-score. The *structure*
    search stays where it is; only the constants get the horizon treatment.
-   This is the smallest change that buys the 13x.
+   Worth doing only after the windowed objective, which is cheaper and, on
+   this system, better. If windowing closes the gap the rollout refinement may
+   not be needed at all.
 
 Multiple shooting is part of why tier 3 works and should not be dropped: the
 segments are re-initialised from observed states every `stride` samples rather
@@ -227,3 +286,37 @@ dropping to one trajectory would reintroduce a documented failure mode.
   that promoted them destabilise J-GRPO? The advantage is z-scored per DOF over
   the sampled batch; injecting a differently-scored elite into that batch is
   not obviously safe.
+
+## Correction: what the first version of this note got wrong
+
+The original headline table compared `optimise_consts_energy` (the real
+grammar path) against a rollout fit written directly in physical coordinates,
+and reported the energy fit "flipping the sign of the cubic" at 5% NSR with
+mean relative errors of 0.475 / 0.605 / 0.934. That was not an
+objective-vs-objective comparison and the sign claim was an artifact.
+
+What actually happens, reading the fitted constants out of the grammar path:
+
+```
+  NSR  fitted expression                                     exponent
+   0%  -0.6395*x1 - 0.2110*x2 - 0.0481*x1**3                    3   OK
+   5%  -0.5848*x1 - 0.1792*x2 + 0.0381*x1**2                    2   WRONG
+  10%  -0.3177*x1 - 0.1448*x2 + 0.0365*x1**2                    2   WRONG
+  20%  +0.1452*x1 - 0.0890*x2 + 0.0373*x1**2                    2   WRONG
+```
+
+The failure at 5% is the **exponent snapping from 3 to 2** — a structure
+error, not a coefficient error. My probe assumed a cubic basis and so reported
+a meaningless third coefficient, which I read as a sign flip. No amount of
+coefficient refinement fixes a wrong exponent, so this is worse news than the
+thing I originally reported, not better.
+
+What survives unchanged: at 20% NSR the fit really does flip the sign of the
+spring term (`+0.1452*x1` where the truth is negative, i.e. it reports an
+unstable system), the reward collapses from 0.99997 to 0.563, and it stops
+separating candidates. The cumulative objective degrades badly under noise.
+
+What is superseded: the recommendation. The horizon does help (0.070 at 20%
+NSR against the cumulative form's 0.250), but it is not the right tool for
+this failure, and the honest ordering is windowing first, rollout only if
+windowing is not enough.
