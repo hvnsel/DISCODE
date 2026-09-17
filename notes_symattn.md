@@ -226,3 +226,87 @@ replacing a working search.
   multi-DOF are untested.
 - Sparsemax is not the only choice — α-entmax interpolates between softmax
   (α=1) and sparsemax (α=2) and would make the sparsity itself a knob.
+
+## Post-mortem on van der Pol: the relaxation is the problem
+
+0/16 was not an op-set problem. Two further attempts and a diagnostic settled
+it.
+
+**Attempt 2 — give `mul` its exponents.** The soft-leaf note's canonical form is
+`c · Π_k (w_k·x)^{p_k}`, so `mul` became `spow(u,p1) * spow(v,p2)`, making
+`x^2 * xdot` reachable in one op with no dead intermediate. It **regressed
+everything**:
+
+```
+                        old [lin,pow,mul]      new [lin,ppow]      [lin,ppow,ppow]
+vanderpol               1.14e-02  0/4          -                   2.15e-05  0/4
+duffing                 5.97e-11  4/4          3.01e-05  0/4       1.00e-08  2/4
+cubic_coupled           1.38e-09  3/4          3.50e-02  0/4       crashed
+```
+
+`u^{p1} · v^{p2}` is **unidentifiable** when the two heads select overlapping
+operands: `p1` and `p2` are then pinned only through their sum, so the
+optimiser wanders along a flat direction. It reported exponents of 4.22 and
+3.32 for a plain cubic. A product of powers needs one exponent *per slot*, not
+one per head.
+
+**The diagnostic that ended it.** Before trying a third op, check whether the
+objective can even see the answer. Windowed work-energy residual on fixed
+design matrices:
+
+```
+TRUTH   [xdot, x^2*xdot, x]                    1.890e-09
+decoy   [xdot, (x+0.53xdot)^1.78, x]           1.677e-02
+decoy   [xdot, (x+0.53xdot)^2, x]              1.711e-02
+linear  [xdot, x]                              3.666e-01
+```
+
+The objective separates the truth by **seven orders of magnitude**. It is not
+a scoring problem. And the decoy family has a genuine basin:
+
+```
+residual over (x + c*xdot)^p, with x and xdot also in the readout
+      c       p=1.5       p=2.0       p=2.5       p=3.0
+   0.00   3.618e-01   3.610e-01   3.602e-01   3.595e-01
+   0.20   1.278e-01   1.156e-01   1.059e-01   9.832e-02
+   0.53   1.708e-02   1.711e-02   1.919e-02   2.247e-02
+   0.80   6.125e-02   6.234e-02   6.531e-02   6.928e-02
+```
+
+`c = 0.53` is a local minimum in `c`, and at the bottom of it the residual is
+**flat in the exponent** (1.708e-02 → 1.711e-02 → 1.919e-02). That is exactly
+where all 16 runs parked, and why they stopped moving.
+
+**The discrete search does not have this problem.** Handed the same system, the
+existing grammar and fitter:
+
+```
+xdot + x + x*x*xdot      reward 0.999940    residual 6.04e-05
+xdot + x + x^3           reward 0.526705    residual 8.99e-01
+xdot + x + x*xdot        reward 0.513295    residual 9.48e-01
+xdot + x                 reward 0.513300    residual 9.48e-01
+```
+
+`0.506*xdot - 0.847*x - 0.976*x*x*xdot`, found by *sampling* the structure and
+fitting, at 280x lower residual than the relaxation's local minimum.
+
+### The conclusion, which cuts against this whole line of work
+
+**Smoothing the search space created a local minimum that the discrete search
+does not have.** The relaxation offers a continuous downhill path to a wrong
+answer, and once in that basin the gradient with respect to the exponent
+vanishes. A sampler has no such trap — it does not have to walk there, it
+proposes the structure and scores it.
+
+This is the honest answer to the "round the jaggedness" thread that started
+`notes_soft_leaves.md`. Jaggedness is not purely a cost. The ability to *jump*
+is what gets past a basin that gradient descent falls into, and the two systems
+where the relaxation succeeded (duffing, cubic_coupled) are precisely the ones
+whose target is `c(w·x)^p` — a form the relaxation can reach by descending.
+`vanderpol`'s cross term is not, on this landscape, reachable that way.
+
+What survives: **sparsemax removing the discretisation gap** is still real and
+still portable to the state-channel attention in `notes_architecture.md`. That
+finding is about the *discretisation* step and is independent of everything
+above. What does not survive is the case for replacing the discrete search
+with a relaxation.

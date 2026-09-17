@@ -247,7 +247,12 @@ none is required for the leaf change and none should be bundled into it:
 
 - Every measurement above is on a **static** landscape. The monotone path
   exists; nobody has run the search with soft leaves. That is evidence the
-  gradient is there, not that the search exploits it.
+  gradient is there, not that the search exploits it. **And a relaxation
+  has since been built and measured** (`notes_symattn.md`): on `vanderpol`
+  it parks in a spurious local minimum in 16 of 16 runs, at a residual
+  280x worse than what the discrete search reaches by sampling the same
+  structure. Smoothing can create minima the jagged space does not have.
+  Any soft-leaf work has to be checked against that case specifically.
 - **Conditioning.** A direction can be ill-posed where a variable choice never
   is. If two channels are correlated in a record, the fit returns something
   arbitrary that still scores well. Report the conditioning of the fitted
