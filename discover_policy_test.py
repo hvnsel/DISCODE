@@ -431,6 +431,107 @@ def test_term_pe_band():
           tuple(out.shape) == (2, N_DOF, N_TERMS, TERM_LEN, dc.N_TOKENS + 1))
 
 
+def test_directional_leaves():
+    """``dleaf`` / ``vleaf``: every tau-walker must agree on their const slots
+    and their value, and the default table must be untouched.
+
+    The failure this exists to catch is silent and total.  Each directional
+    leaf owns ``N_DOF`` const slots, and *seven* separate functions walk a tau
+    handing out those slots in pre-order (``count_total_consts``,
+    ``_parse_tree``, ``_build_param_code``, ``evaluate``, ``compile_to_numpy``,
+    ``expr_to_sympy_str``, ``expr_to_str``).  If any one of them disagrees by a
+    single slot, every constant after that point shifts by one and the
+    candidate is evaluated as a different expression than the one that was
+    fitted — with no error raised anywhere.
+    """
+    print("\ndirectional leaves (dleaf / vleaf)")
+    try:
+        # default table first: enabling the feature must not change it
+        dc.configure_grammar(N_DOF)
+        base_tokens = list(dc.ALL_TOKENS)
+        check('default grammar has no directional leaves',
+              dc.DIR_LEAF_SET == set() and 'dleaf' not in dc.ALL_TOKENS)
+
+        dc.configure_grammar(N_DOF, directional_leaves=True)
+        check('enabling adds exactly two tokens',
+              dc.N_TOKENS == len(base_tokens) + 2
+              and set(dc.ALL_TOKENS) - set(base_tokens) == {'dleaf', 'vleaf'},
+              f"{dc.ALL_TOKENS}")
+        check('both are leaves',
+              dc.ARITY['dleaf'] == 0 and dc.ARITY['vleaf'] == 0)
+        check('dleaf spans the displacement columns, vleaf the velocities',
+              dc.LEAF_CHANNELS['dleaf'] == [2 * d for d in range(N_DOF)]
+              and dc.LEAF_CHANNELS['vleaf'] == [2 * d + 1 for d in range(N_DOF)])
+        check('each owns N_DOF const slots',
+              dc.CONST_SLOTS['dleaf'] == N_DOF == dc.CONST_SLOTS['vleaf'])
+
+        taus = {
+            'dleaf':                    ['dleaf'],
+            'add(dleaf, vleaf)':        ['add', 'dleaf', 'vleaf', 'end'],
+            'intpower(dleaf)':          ['intpower', 'dleaf'],
+            'add(x1, intpower(dleaf))': ['add', 'x1', 'intpower', 'dleaf', 'end'],
+            'mul(dleaf, vleaf)':        ['mul', 'dleaf', 'vleaf', 'end'],
+        }
+        agree = []
+        for name, tau in taus.items():
+            n_count = dc.count_total_consts(tau)
+            n_parse = dc._parse_tree(tau)[1]
+            n_code  = dc._build_param_code(tau)[1]
+            agree.append(n_count == n_parse == n_code)
+        check('count_total_consts / _parse_tree / _build_param_code agree',
+              all(agree), f"{len(agree)} taus")
+
+        rng = np.random.default_rng(0)
+        X = rng.normal(size=(5, 2 * N_DOF))
+        devs = []
+        for name, tau in taus.items():
+            consts = list(rng.normal(size=dc.count_total_consts(tau)))
+            fn = dc.compile_to_numpy(tau, consts)
+            a = np.asarray(fn(*[X[:, k] for k in range(2 * N_DOF)]), float)
+            b = dc.evaluate(tau, torch.tensor(X, dtype=torch.float64),
+                            consts).numpy()
+            devs.append(float(np.abs(a - b).max()))
+        check('compile_to_numpy and evaluate agree numerically',
+              max(devs) < 1e-10, f"max deviation {max(devs):.2e}")
+
+        fn = dc.compile_to_numpy(['dleaf'], [1.0, -1.0])
+        v = np.asarray(fn(*[X[:, k] for k in range(2 * N_DOF)]), float)
+        check('dleaf(1, -1) is the relative coordinate x1 - x3',
+              np.allclose(v, X[:, 0] - X[:, 2]))
+        fn = dc.compile_to_numpy(['vleaf'], [1.0, -1.0])
+        v = np.asarray(fn(*[X[:, k] for k in range(2 * N_DOF)]), float)
+        check('vleaf(1, -1) is the relative velocity x2 - x4',
+              np.allclose(v, X[:, 1] - X[:, 3]))
+
+        # VARPRO boundary: bare leaf stays closed-form, powered leaf does not
+        m1 = dc._expand_monomials(dc._parse_tree(['dleaf'])[0])
+        check('a bare dleaf keeps the closed form (N_DOF monomials)',
+              m1 is not None and len(m1) == N_DOF)
+        m2 = dc._expand_monomials(dc._parse_tree(['intpower', 'dleaf'])[0])
+        check('intpower(dleaf) leaves the closed form (nonlinear in the weights)',
+              m2 is None)
+
+        # reachability: the varpro term grammar must admit them under a power,
+        # which is the entire point of the token
+        mask = dp.term_valid_mask(['intpower'], 1, TERM_LEN,
+                                  term_grammar='varpro').numpy()
+        allowed = {t for t, m in zip(dc.ALL_TOKENS, mask) if m > 0}
+        check("varpro lets a power op take a directional leaf",
+              {'dleaf', 'vleaf'} <= allowed, f"allowed: {sorted(allowed)}")
+        check('intpower(dleaf) is a complete term',
+              dc.is_complete(['intpower', 'dleaf']))
+
+        # the policy's output layer must widen with the table
+        pol = dp.TermBagPolicy(n_tokens=dc.N_TOKENS, max_terms=N_TERMS,
+                               max_term_len=TERM_LEN, n_dof=N_DOF,
+                               d_model=32, n_heads=4, ff_dim=64, n_layers=1)
+        check('policy vocabulary tracks the widened table',
+              pol.out_proj.out_features == dc.N_TOKENS + 1
+              and pol.stop_idx == dc.N_TOKENS)
+    finally:
+        dc.configure_grammar(N_DOF)     # restore for anything downstream
+
+
 def main():
     dc.configure_grammar(N_DOF)
     print(f"grammar: {dc.ALL_TOKENS}  (N_TOKENS={dc.N_TOKENS})")
@@ -446,6 +547,7 @@ def main():
     test_t9_beam_terms()
     test_jgrpo_terms()
     test_term_pe_band()
+    test_directional_leaves()
 
     print(f"\n{'=' * 60}")
     print(f"{len(_PASS)} passed, {len(_FAIL)} failed")

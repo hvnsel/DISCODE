@@ -269,6 +269,7 @@ def DISCOVER_TRAIN(
     max_term_len          = 8,         # token budget per term
     term_grammar          = 'free',    # 'free' | 'varpro' (see discover_policy)
     term_position_encoding = True,     # False -> order-blind bag
+    directional_leaves     = False,    # True -> add the dleaf / vleaf tokens
 ):
     """Search for one acceleration expression per DOF of ``system_data``.
 
@@ -296,8 +297,12 @@ def DISCOVER_TRAIN(
     system = system_data
     N = system.n_dof
 
-    dc.configure_grammar(N, system.var_names)
+    dc.configure_grammar(N, system.var_names, directional_leaves)
     print(f"[vocab]  {N}-DOF tokens: {dc.ALL_TOKENS}")
+    if directional_leaves:
+        print(f"[vocab]  dleaf spans {[dc.VARIABLES[c] for c in dc.LEAF_CHANNELS['dleaf']]}"
+              f", vleaf spans {[dc.VARIABLES[c] for c in dc.LEAF_CHANNELS['vleaf']]}"
+              f"  ({dc.N_DOF} fitted weights each)")
     print(f"[config] System='{system.name}'  N_DOF={N}  reward=work-energy")
     print(f"[config] {len(system.time)} pts  {system.t_end:.4g} s  "
           f"{(len(system.time)-1)/system.t_end:.0f} Hz eff  "
@@ -318,7 +323,7 @@ def DISCOVER_TRAIN(
             max_workers=N_WORKERS,
             initializer=dc.init_energy_worker,
             initargs=(N, system.var_names, norm_stats, raw_trajs,
-                      energy_normalize, max_traj, w_acc),
+                      energy_normalize, max_traj, w_acc, directional_leaves),
         )
         print(f"Energy-scoring pool : {N_WORKERS} workers\n")
 

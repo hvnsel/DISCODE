@@ -56,7 +56,22 @@ acceleration target is ever used.
 Grammar
 -------
 Leaves are bare state variables ``x1..x{2N}`` (each carrying an **implicit
-leading coefficient**) and free constants.  Powers are the unary operators::
+leading coefficient**) and free constants.  With
+``configure_grammar(..., directional_leaves=True)`` there are two more leaves::
+
+    dleaf = a_1 q_1  + a_2 q_2  + ... + a_N q_N       N_DOF fitted weights
+    vleaf = a_1 qd_1 + a_2 qd_2 + ... + a_N qd_N      N_DOF fitted weights
+
+A directional leaf is a fitted DIRECTION in one block of the state rather than
+a choice of one channel, which is what lets ``intpower(dleaf)`` express
+``(q_1 - q_2)^3`` as a single term instead of the four monomials its expansion
+needs.  Measured on ``cubic_coupled``: 3 terms and 6 constants against 6 terms
+and 16 constants for the same reward.  A bare directional leaf is still linear
+in its own weights, so it keeps the closed-form fit; under a power op the
+weights are nonlinear and the fit falls back to the optimiser, where the
+integer exponent is gridded rather than optimised through.
+
+Powers are the unary operators::
 
     abspower(u) = c * |u|^p            p in [MIN_EXP, MAX_EXP]  (fitted)
     sgnpower(u) = c * sign(u) * |u|^p  p in [MIN_EXP, MAX_EXP]  (fitted)
@@ -94,6 +109,12 @@ DEVICE = torch.device('cpu')
 # tuple needs the trailing comma — ('intpower') is the *string* 'intpower'
 # and silently breaks every `tok in DOUBLE_CONST_TOKS` check.
 POWER_OPS    = ('intpower',)
+# Directional leaves.  ``dleaf`` evaluates to a fitted linear combination of the
+# DISPLACEMENT channels, ``vleaf`` the same over the VELOCITY channels -- the
+# "a*q1 + b*q2 + ..." leaf.  Off by default; enable per-run with
+# ``configure_grammar(n_dof, directional_leaves=True)``.  They are ADDITIVE:
+# the bare variables stay in the table, so nothing that worked before changes.
+DIR_LEAVES   = ('dleaf', 'vleaf')
 BINARY_OPS   = ['add', 'mul']            # ['add', 'sub', 'mul']
 UNARY_OPS    = list(POWER_OPS)
 N_ARY_OPS    = ['add', 'sub', 'mul']
@@ -117,6 +138,9 @@ MAX_EXP      = 7.0
 # COEFF_TOKENS is rebuilt in configure_grammar (it is the variable set).
 COEFF_TOKENS      = set()
 DOUBLE_CONST_TOKS = set(POWER_OPS)       # coefficient + exponent
+# token -> number of const slots it consumes, in pre-order.  Rebuilt by
+# ``configure_grammar``; every tau-walker reads this instead of special-casing.
+CONST_SLOTS       = {}
 
 _OP_TOKENS         = set(BINARY_OPS + UNARY_OPS)
 _FORBIDDEN_NESTING = {
@@ -131,6 +155,8 @@ N_VARS     = 4
 VARIABLES  = ['x1', 'x2', 'x3', 'x4']    # physical state-column names
 VAR_SET    = set(VARIABLES)
 COL_MAP    = {v: i for i, v in enumerate(VARIABLES)}
+DIR_LEAF_SET  = set()                    # enabled directional-leaf tokens
+LEAF_CHANNELS = {}                       # 'dleaf' -> [col, ...] it spans
 ALL_TOKENS = BINARY_OPS + UNARY_OPS + VARIABLES + CONSTANTS + ['end']
 N_TOKENS   = len(ALL_TOKENS)
 MASK_TOKEN = N_TOKENS
@@ -178,15 +204,28 @@ W_ACC = 0.0
 
 
 # ── Grammar configuration ───────────────────────────────────────────────────
-def configure_grammar(n_dof: int, var_names=None):
+def configure_grammar(n_dof: int, var_names=None, directional_leaves=False):
     """Initialise the global token table for an ``n_dof`` system (2*n_dof vars).
 
     Leaf tokens are the bare state variables (each with an implicit leading
     coefficient) plus ``const``.  Powers are the unary ops ``abspower`` /
     ``sgnpower`` / ``intpower``, each consuming (coefficient, exponent).
+
+    ``directional_leaves`` adds ``dleaf`` and ``vleaf``, each a fitted linear
+    combination over one block of state channels::
+
+        dleaf = a_1 q_1 + a_2 q_2 + ... + a_N q_N        (N_DOF const slots)
+        vleaf = a_1 qd_1 + a_2 qd_2 + ... + a_N qd_N     (N_DOF const slots)
+
+    They are leaves (arity 0) and are legal anywhere a bare variable is,
+    including as a power op's child -- which is the point, since
+    ``intpower(dleaf)`` is how ``(q_1 - q_2)^3`` becomes ONE term instead of
+    the four monomials its expansion needs.  Bare variables are kept, so the
+    default table is unchanged when this is off.
     """
     global N_DOF, N_VARS, VARIABLES, VAR_SET, COL_MAP, COEFF_TOKENS
     global ALL_TOKENS, N_TOKENS, MASK_TOKEN, VOCAB_SIZE, ARITY, SYMS, VAR_NAMES
+    global DIR_LEAF_SET, LEAF_CHANNELS, CONST_SLOTS
 
     N_DOF  = int(n_dof)
     N_VARS = 2 * N_DOF
@@ -195,8 +234,24 @@ def configure_grammar(n_dof: int, var_names=None):
     COL_MAP   = {v: i for i, v in enumerate(VARIABLES)}
     COEFF_TOKENS = set(VARIABLES)
 
-    ALL_TOKENS = BINARY_OPS + UNARY_OPS + VARIABLES + CONSTANTS + ['end']
+    if directional_leaves:
+        DIR_LEAF_SET  = set(DIR_LEAVES)
+        LEAF_CHANNELS = {'dleaf': [2 * d for d in range(N_DOF)],
+                         'vleaf': [2 * d + 1 for d in range(N_DOF)]}
+    else:
+        DIR_LEAF_SET  = set()
+        LEAF_CHANNELS = {}
+    dir_toks = [t for t in DIR_LEAVES if t in DIR_LEAF_SET]
+
+    ALL_TOKENS = (BINARY_OPS + UNARY_OPS + VARIABLES + dir_toks
+                  + CONSTANTS + ['end'])
     N_TOKENS   = len(ALL_TOKENS)
+
+    CONST_SLOTS = {}
+    for t in VARIABLES: CONST_SLOTS[t] = 1
+    for t in CONSTANTS: CONST_SLOTS[t] = 1
+    for t in DOUBLE_CONST_TOKS: CONST_SLOTS[t] = 2
+    for t in dir_toks: CONST_SLOTS[t] = N_DOF
     MASK_TOKEN = N_TOKENS
     VOCAB_SIZE = N_TOKENS + 1
 
@@ -204,6 +259,7 @@ def configure_grammar(n_dof: int, var_names=None):
     for t in BINARY_OPS: ARITY[t] = 2
     for t in UNARY_OPS:  ARITY[t] = 1
     for t in VARIABLES:  ARITY[t] = 0
+    for t in DIR_LEAF_SET: ARITY[t] = 0
     for t in CONSTANTS:  ARITY[t] = 0
     ARITY['end'] = 0
 
@@ -281,16 +337,20 @@ def _clip_exp(p):
     return float(np.clip(float(p), MIN_EXP, MAX_EXP))
 
 
+def dir_leaf_terms(tok):
+    """``[(weight_offset, variable_name), ...]`` for a directional leaf token.
+
+    ``weight_offset`` indexes within the leaf's own block of ``N_DOF`` const
+    slots; ``variable_name`` is the state column that weight multiplies.
+    """
+    return [(k, VARIABLES[col]) for k, col in enumerate(LEAF_CHANNELS[tok])]
+
+
 def count_total_consts(tau):
-    """Constant slots in pre-order: variables and ``const`` take 1 slot,
-    power operators take 2 (coefficient, exponent)."""
-    n = 0
-    for t in tau:
-        if t == 'const' or t in VAR_SET:
-            n += 1
-        elif t in DOUBLE_CONST_TOKS:
-            n += 2
-    return n
+    """Constant slots in pre-order, from ``CONST_SLOTS``: variables and
+    ``const`` take 1, power operators take 2 (coefficient, exponent), and a
+    directional leaf takes ``N_DOF`` (one weight per channel it spans)."""
+    return sum(CONST_SLOTS.get(t, 0) for t in tau)
 
 
 # ── sympy <-> tau conversion ────────────────────────────────────────────────
@@ -306,6 +366,10 @@ def expr_to_sympy_str(tau: list, consts: list) -> str:
     def node_to_str():
         if pos[0] >= len(tau): return '0'
         tok = tau[pos[0]]; pos[0] += 1
+        if tok in DIR_LEAF_SET:
+            parts = [f"(({_next_const(1.0 if k == 0 else 0.0)})*{v})"
+                     for k, v in dir_leaf_terms(tok)]
+            return '(' + ' + '.join(parts) + ')'
         if tok in VAR_SET:
             v = _next_const()
             return f"(({v})*{tok})"
@@ -514,10 +578,12 @@ def get_valid_tokens(tau, position, max_len, max_consts=20,
                             ``add(add(...), ...)``, which ``is_complete`` accepts
                             but ``_FORBIDDEN_NESTING`` forbids — a candidate the
                             rest of the system would never generate.
-    power_child_vars_only : restrict a power op's child to a bare variable, which
-                            is exactly the closed-form/VARPRO applicability
-                            boundary (``_expand_monomials`` returns ``None`` for
-                            a power of anything else).
+    power_child_vars_only : restrict a power op's child to a bare variable or a
+                            directional leaf.  A bare variable keeps the fit in
+                            the closed form; a directional leaf deliberately
+                            leaves it (``(a q1 + b q2)^n`` is nonlinear in the
+                            weights) because that is the only way to write a
+                            power of a relative coordinate as one term.
     """
     remaining = max_len - position
     stack, open_slots, nary_depth, current_depth, parent_op = _parse_stack(tau)
@@ -566,7 +632,7 @@ def get_valid_tokens(tau, position, max_len, max_consts=20,
         if tok in _OP_TOKENS and depth >= MAX_TREE_DEPTH: continue
         if tok in forbidden_child_ops: continue
         if (power_child_vars_only and parent_op in POWER_OPS
-                and tok not in VAR_SET): continue
+                and tok not in VAR_SET and tok not in DIR_LEAF_SET): continue
 
         if tok in _OP_TOKENS:
             child_pos   = position + 1
@@ -710,6 +776,11 @@ def evaluate(tau, x, consts):
         if pos[0] >= len(tau): return None
         tok = tau[pos[0]]; pos[0] += 1
 
+        if tok in DIR_LEAF_SET:
+            r = torch.zeros(x.shape[0], dtype=x.dtype, device=x.device)
+            for k, v in dir_leaf_terms(tok):
+                r = r + _next_const(1.0 if k == 0 else 0.0) * x[:, COL_MAP[v]]
+            return None if torch.any(~torch.isfinite(r)) else r
         if tok in VAR_SET:
             c = _next_const()
             r = c * x[:, COL_MAP[tok]]
@@ -786,6 +857,12 @@ def _build_param_code(tau):
     def build():
         if pos[0] >= len(tau): return '0'
         tok = tau[pos[0]]; pos[0] += 1
+        if tok in DIR_LEAF_SET:
+            parts = []
+            for _, v in dir_leaf_terms(tok):
+                ci = len(const_indices); const_indices.append(ci)
+                parts.append(f'c[{ci}]*{v}')
+            return '(' + '+'.join(parts) + ')'
         if tok in VAR_SET:
             ci = len(const_indices); const_indices.append(ci)
             return f'c[{ci}]*{tok}'
@@ -834,6 +911,12 @@ def expr_to_str(tau, consts=None):
     def n2s():
         if pos[0] >= len(tau): return '?'
         tok = tau[pos[0]]; pos[0] += 1
+        if tok in DIR_LEAF_SET:
+            parts = []
+            for k, v in dir_leaf_terms(tok):
+                c = _next_const(1.0 if k == 0 else 0.0)
+                parts.append(f"{c:+.4g}*{disp.get(v, v)}")
+            return '(' + ' '.join(parts) + ')'
         if tok in VAR_SET:
             v = _next_const()
             return f"{v:.4g}*{disp.get(tok, tok)}"
@@ -876,6 +959,10 @@ def compile_to_numpy(tau, consts):
     def build():
         if pos[0] >= len(tau): return None
         tok = tau[pos[0]]; pos[0] += 1
+        if tok in DIR_LEAF_SET:
+            parts = [f'({_next_const(1.0 if k == 0 else 0.0)!r}*{v})'
+                     for k, v in dir_leaf_terms(tok)]
+            return '(' + '+'.join(parts) + ')'
         if tok in VAR_SET:
             c = _next_const()
             return f'({c!r}*{tok})'
@@ -1077,6 +1164,11 @@ MAX_FIT_ROWS  = 8000
 #                     than this (cost grows as slots * grid * passes).
 #   MAX_CD_PASSES   : coordinate-descent sweeps before giving up on further
 #                     improvement.
+# Same idea for the NONLINEAR fallback: pin each intpower exponent to an
+# integer and fit the rest, rather than letting least_squares chase a discrete
+# parameter through a continuous slot.  Without this a power over a directional
+# leaf fits its exponent to the local slope and lands on 1.
+MAX_NL_GRID     = 36
 MAX_GRID_COMBOS = 1600
 MAX_EXP_SLOTS   = 40
 MAX_CD_PASSES   = 3
@@ -1149,6 +1241,11 @@ def _parse_tree(tau):
         if pos[0] >= len(tau):
             return {'op': 'const_one'}
         tok = tau[pos[0]]; pos[0] += 1
+        if tok in DIR_LEAF_SET:
+            cols  = list(LEAF_CHANNELS[tok])
+            slots = list(range(slot[0], slot[0] + len(cols)))
+            slot[0] += len(cols)
+            return {'op': 'dirleaf', 'tok': tok, 'cols': cols, 'coeffs': slots}
         if tok in VAR_SET:
             s = slot[0]; slot[0] += 1
             return {'op': 'var', 'col': COL_MAP[tok], 'coeff': s}
@@ -1186,6 +1283,14 @@ def _expand_monomials(node):
     if op == 'var':
         return [{'factors': [('var', node['col'])],
                  'amp': {node['coeff']}, 'exps': set()}]
+    if op == 'dirleaf':
+        # A directional leaf is a SUM of singly-weighted channels, so at degree
+        # one it is linear in its own weights and the closed form still applies
+        # -- exactly as if the term had been written ``add(x1, x3, ...)``.  Under
+        # a power op the weights appear nonlinearly; the POWER_OPS branch below
+        # rejects any non-``var`` child, which routes those to the optimiser.
+        return [{'factors': [('var', c)], 'amp': {sl}, 'exps': set()}
+                for c, sl in zip(node['cols'], node['coeffs'])]
     if op == 'const':
         return [{'factors': [], 'amp': {node['val']}, 'exps': set()}]
     if op in POWER_OPS:
@@ -1563,15 +1668,36 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
     for (_t, _cols, vel_t, _co, dke, _s, _at, _as) in contexts:
         e_scale = max(e_scale, float(np.std(dke)) + 1e-9)
 
-    def _make_smart(cs, pv):
-        """Initial const vector in pre-order: coefficient=cs for variables and
-        consts; (coefficient=cs, exponent=pv) for power operators."""
+    def _make_smart(cs, pv, direction='unit'):
+        """Initial const vector in pre-order.
+
+        coefficient=cs for variables and consts; (coefficient=cs, exponent=pv)
+        for power operators; and for a directional leaf, a whole ``N_DOF``-long
+        weight block seeded by ``direction``:
+
+            'unit'   (1, 0, 0, ...)   the leaf starts as a bare variable
+            'sum'    (1, 1, 1, ...)   every channel equally
+            'diff'   (1, -1, 1, ...)  the relative coordinate
+
+        Those three are the canonical directions, and 'diff' is the one a
+        coupled system's ``(q_1 - q_2)^n`` needs.  This function MUST cover
+        every token that owns const slots -- a length mismatch silently drops
+        the whole initialiser in the loop below.
+        """
         init = []
         for t in tau:
-            if t in VAR_SET or t == 'const':
-                init.append(cs)
+            if t in DIR_LEAF_SET:
+                k = CONST_SLOTS[t]
+                if direction == 'sum':
+                    init.extend([1.0] * k)
+                elif direction == 'diff':
+                    init.extend([1.0 if i % 2 == 0 else -1.0 for i in range(k)])
+                else:
+                    init.extend([1.0] + [0.0] * (k - 1))
             elif t in DOUBLE_CONST_TOKS:
                 init.append(cs); init.append(pv)
+            elif t in CONST_SLOTS:
+                init.extend([cs] * CONST_SLOTS[t])
         return np.array(init, dtype=float)
 
     inits = [
@@ -1579,6 +1705,14 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
         _make_smart( e_scale, 3.0), _make_smart(-e_scale, 1.0),
         _make_smart(-e_scale, 2.0), _make_smart(-e_scale, 3.0),
         _make_smart( e_scale * 0.1, 3.0), _make_smart(-e_scale * 0.1, 3.0),
+    ]
+    if any(t in DIR_LEAF_SET for t in tau):
+        # Seed the other two canonical directions before the random restarts.
+        inits = ([_make_smart( e_scale, 3.0, 'diff'),
+                  _make_smart(-e_scale, 3.0, 'diff'),
+                  _make_smart( e_scale, 3.0, 'sum'),
+                  _make_smart(-e_scale, 3.0, 'sum')] + inits)
+    inits += [
         np.ones(n_consts), np.zeros(n_consts),
         rng.uniform(-e_scale * 2, e_scale * 2, n_consts),
         rng.uniform(-1, 1, n_consts),
@@ -1592,15 +1726,48 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
             init[pi] = float(np.clip(init[pi], 1.0, INTPOWER_MAX))
     inits = [i for i in inits if len(i) == n_consts][:n_inits]
 
+    # Grid the intpower exponents instead of optimising through them: pin each
+    # to an integer with a hairline bound and fit everything else.  This is the
+    # same exhaustive-integer-grid guarantee the closed-form path gives, and it
+    # is what makes ``intpower(dleaf)`` land on exponent 3 rather than 1.
+    int_grid = [n for n in range(-INTPOWER_MAX, INTPOWER_MAX + 1) if n != 0]
+    combos = [None]
+    if (int_power_indices
+            and len(int_grid) ** len(int_power_indices) <= MAX_NL_GRID):
+        combos = list(_iproduct(int_grid, repeat=len(int_power_indices)))
+
     best_cost, best_c = np.inf, None
-    for init in inits:
-        try:
-            res = least_squares(residuals, init, method=opt_method,
-                                bounds=opt_bounds, max_nfev=max_nfev)
-            if res.cost < best_cost:
-                best_cost, best_c = res.cost, res.x.tolist()
-        except Exception:
-            pass
+    for combo in combos:
+        if combo is None:
+            lb_c, ub_c, method_c = opt_bounds[0], opt_bounds[1], opt_method
+        else:
+            lb_c = np.array(opt_bounds[0], dtype=float).copy()
+            ub_c = np.array(opt_bounds[1], dtype=float).copy()
+            if lb_c.ndim == 0:
+                lb_c = np.full(n_consts, -np.inf); ub_c = np.full(n_consts, np.inf)
+            for pi, n in zip(int_power_indices, combo):
+                lb_c[pi], ub_c[pi] = n - 1e-6, n + 1e-6
+            method_c = 'trf'
+        # With the exponent pinned there is far less to search, so one
+        # initialiser per grid point and a fraction of the evaluation budget.
+        # Measured on ``intpower(dleaf)`` over ``cubic_coupled``: the answer
+        # (exponent 3, direction -(q1-q2) to 4 decimals) is fully recovered at
+        # 30 evaluations per grid point and degrades below 20, while the
+        # default 150 costs 2.3x the time for an identical result.
+        use  = inits[:1] if combo is not None else inits
+        nfev = max(30, int(max_nfev) // 4) if combo is not None else max_nfev
+        for init in use:
+            init = np.asarray(init, dtype=float).copy()
+            if combo is not None:
+                for pi, n in zip(int_power_indices, combo):
+                    init[pi] = float(n)
+            try:
+                res = least_squares(residuals, init, method=method_c,
+                                    bounds=(lb_c, ub_c), max_nfev=nfev)
+                if res.cost < best_cost:
+                    best_cost, best_c = res.cost, res.x.tolist()
+            except Exception:
+                pass
     return best_c if best_c is not None else [1.0] * n_consts
 
 
@@ -1630,8 +1797,12 @@ def structural_novelty(tau, buffer, n=3):
 
 # ── Energy worker (ProcessPool) ─────────────────────────────────────────────
 def init_energy_worker(n_dof, var_names, norm_stats, raw_trajs,
-                       energy_normalize=True, max_traj=5, w_acc=None):
-    configure_grammar(n_dof, var_names)
+                       energy_normalize=True, max_traj=5, w_acc=None,
+                       directional_leaves=False):
+    # ``directional_leaves`` MUST match the parent's: a worker with a different
+    # token table computes a different ``count_total_consts`` for the same tau
+    # and silently mis-fits every candidate it is handed.
+    configure_grammar(n_dof, var_names, directional_leaves)
     set_problem_data(norm_stats, raw_trajs, energy_normalize, max_traj, w_acc)
 
 
