@@ -108,7 +108,7 @@ DEVICE = torch.device('cpu')
 # set POWER_OPS = ('abspower', 'sgnpower', 'intpower').  NOTE: a 1-element
 # tuple needs the trailing comma — ('intpower') is the *string* 'intpower'
 # and silently breaks every `tok in DOUBLE_CONST_TOKS` check.
-POWER_OPS    = ('intpower',)
+POWER_OPS    = ('abspower', 'sgnpower', 'intpower')
 # Directional leaves.  ``dleaf`` evaluates to a fitted linear combination of the
 # DISPLACEMENT channels, ``vleaf`` the same over the VELOCITY channels -- the
 # "a*q1 + b*q2 + ..." leaf.  Off by default; enable per-run with
@@ -131,7 +131,14 @@ MIN_EXPR_LEN   = 2
 # [MIN_EXP, MAX_EXP]; intpower exponents are snapped to a nonzero integer in
 # [-INTPOWER_MAX, INTPOWER_MAX].
 INTPOWER_MAX = 3
-MIN_EXP      = 0.5
+# MIN_EXP is 0.0, not 0.5, deliberately: sgnpower's exponent is a CHARACTER
+# dial.  sgn(u)*|u|^p is u at p = 1 and sgn(u) at p = 0, continuously in
+# between, so the range [0, 1] interpolates viscous damping into Coulomb
+# friction.  Measured span-escape against {1, u, u^3, sgn, |u|} peaks at
+# p ~ 0.25 -- i.e. the richest part of the dial is exactly what a floor of 0.5
+# used to exclude.  It must NOT go below 0: |u|^p is singular at the origin,
+# which for an oscillator is where the data spends its time.
+MIN_EXP      = 0.0
 MAX_EXP      = 7.0
 
 # Tokens that carry an implicit leading coefficient / extra constants.
