@@ -532,6 +532,91 @@ def test_directional_leaves():
         dc.configure_grammar(N_DOF)     # restore for anything downstream
 
 
+def test_blend():
+    """``blend(u) = e^(au)(c1 cos bu + c2 sin bu)`` -- the one transcendental.
+
+    Two failures this exists to catch, both of which happened while it was
+    written and both of which are silent.  (1) The polish step's bounds were
+    shared across every exponent-like slot, which clamped a blend's DECAY RATE
+    to be non-negative and so forbade every decaying oscillation.  (2) The
+    integrated-column cache rounds exponent values to 6 decimals, so
+    least_squares' default finite-difference step of ~1.5e-8 hit the same cache
+    key, the residual came back bitwise identical, the gradient was exactly
+    zero, and the polish silently terminated at its starting grid point.
+    """
+    print("\nblend (the transcendental operator)")
+    try:
+        dc.configure_grammar(N_DOF)
+        base = list(dc.ALL_TOKENS)
+        check('blend is absent by default', 'blend' not in base)
+
+        dc.configure_grammar(N_DOF, transcendental=True)
+        check('enabling adds exactly one token',
+              set(dc.ALL_TOKENS) - set(base) == {'blend'}, f"{dc.ALL_TOKENS}")
+        check('blend is unary and owns 4 const slots',
+              dc.ARITY['blend'] == 1 and dc.CONST_SLOTS['blend'] == 4)
+
+        taus = {'blend(x1)':          ['blend', 'x1'],
+                'add(x1,blend(x2))':  ['add', 'x1', 'blend', 'x2', 'end'],
+                'mul(blend(x1),x2)':  ['mul', 'blend', 'x1', 'x2', 'end']}
+        ok = all(dc.count_total_consts(t) == dc._parse_tree(t)[1]
+                 == dc._build_param_code(t)[1] for t in taus.values())
+        check('every walker agrees on blend const slots', ok)
+
+        rng = np.random.default_rng(0)
+        X = rng.normal(size=(6, 2 * N_DOF)) * 0.8
+        cases = {'exp':  ([1.0, 0.0, 1.0, 0.0], lambda u: np.exp(u)),
+                 'cos':  ([1.0, 0.0, 0.0, 1.0], lambda u: np.cos(u)),
+                 'sin':  ([0.0, 1.0, 0.0, 1.0], lambda u: np.sin(u)),
+                 'damped': ([1.0, 0.0, -0.4, 2.0],
+                            lambda u: np.exp(-0.4 * u) * np.cos(2 * u))}
+        devs = []
+        for _n, (cs, ref) in cases.items():
+            consts = cs + [1.0]
+            fn = dc.compile_to_numpy(['blend', 'x1'], consts)
+            a = np.asarray(fn(*[X[:, k] for k in range(2 * N_DOF)]), float)
+            b = dc.evaluate(['blend', 'x1'],
+                            torch.tensor(X, dtype=torch.float64), consts).numpy()
+            devs.append(max(float(np.abs(a - ref(X[:, 0])).max()),
+                            float(np.abs(a - b).max())))
+        check('blend reproduces exp, cos, sin and a damped oscillation exactly',
+              max(devs) < 1e-12, f"max deviation {max(devs):.2e}")
+
+        m = dc._expand_monomials(dc._parse_tree(['blend', 'x1'])[0])
+        check('blend of a variable keeps the closed form (2 monomials, 2 slots)',
+              m is not None and len(m) == 2
+              and all(len(f['exps']) == 2 for f in m))
+        kinds = sorted(f['factors'][0][0] for f in m)
+        check('its factors are the cos and sin branches',
+              kinds == ['blendcos', 'blendsin'], f"{kinds}")
+
+        # the two bugs, as direct assertions on the helpers
+        check("a blend's decay rate is allowed to be negative",
+              dc.exp_slot_bound('blend_a')[0] < 0.0,
+              f"blend_a bound {dc.exp_slot_bound('blend_a')}")
+        check("a power's exponent is NOT allowed negative (singular at 0)",
+              dc.exp_slot_bound('power')[0] >= 0.0,
+              f"power bound {dc.exp_slot_bound('power')}")
+        check('the a-grid is denser near zero than at its ends',
+              min(abs(b - a) for a, b in zip(dc.BLEND_A_GRID, dc.BLEND_A_GRID[1:])
+                  if abs(a) < 0.6 and abs(b) < 0.6)
+              < abs(dc.BLEND_A_GRID[1] - dc.BLEND_A_GRID[0]),
+              f"{dc.BLEND_A_GRID}")
+
+        dc.configure_grammar(N_DOF, directional_leaves=True, transcendental=True)
+        check('blend of a directional leaf leaves the closed form',
+              dc._expand_monomials(dc._parse_tree(['blend', 'dleaf'])[0]) is None)
+        mask = dp.term_valid_mask(['blend'], 1, TERM_LEN,
+                                  term_grammar='varpro').numpy()
+        allowed = {t for t, mv in zip(dc.ALL_TOKENS, mask) if mv > 0}
+        check('varpro lets blend take a variable or a directional leaf',
+              {'dleaf', 'vleaf', 'x1'} <= allowed, f"{sorted(allowed)}")
+        check('a blend of a blend is forbidden',
+              'blend' not in allowed)
+    finally:
+        dc.configure_grammar(N_DOF)
+
+
 def main():
     dc.configure_grammar(N_DOF)
     print(f"grammar: {dc.ALL_TOKENS}  (N_TOKENS={dc.N_TOKENS})")
@@ -548,6 +633,7 @@ def main():
     test_jgrpo_terms()
     test_term_pe_band()
     test_directional_leaves()
+    test_blend()
 
     print(f"\n{'=' * 60}")
     print(f"{len(_PASS)} passed, {len(_FAIL)} failed")

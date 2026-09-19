@@ -427,7 +427,8 @@ def identity_ceiling(system, verbose=True, warn=False):
 
 
 def print_truth_rewards(system, max_traj=None, w_acc=None,
-                        energy_normalize=True, directional_leaves=False):
+                        energy_normalize=True, directional_leaves=False,
+                        transcendental=False):
     """Score the known truth structure of each DOF with the standard reward.
 
     Requires ``system.truth_taus``.  Constants are fitted by the same
@@ -446,7 +447,8 @@ def print_truth_rewards(system, max_traj=None, w_acc=None,
         return None
 
     max_traj = system.n_trials if max_traj is None else int(max_traj)
-    dc.configure_grammar(system.n_dof, system.var_names, directional_leaves)
+    dc.configure_grammar(system.n_dof, system.var_names, directional_leaves,
+                         transcendental)
     _X, _y, raw, ns = generate_dataset(system, device=None)
     # w_acc MUST match the training run or the printed target is not the number
     # the search is chasing.
