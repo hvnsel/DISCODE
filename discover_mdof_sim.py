@@ -20,8 +20,9 @@ Grammar note for ``truth_taus``
 For an N-DOF system the state layout is ``x1 = q_1``, ``x2 = qd_1``,
 ``x3 = q_2``, ``x4 = qd_2``, ...  Every variable leaf carries an implicit
 fitted coefficient, so ``['add', 'x1', 'x2', 'x3', 'end']`` is
-``c1*q1 + c2*qd1 + c3*q2``.  ``intpower`` supplies (coefficient, integer
-exponent), so ``q1^3`` is ``['intpower', 'x1']``.
+``c1*q1 + c2*qd1 + c3*q2``.  ``power`` supplies (even amplitude, odd amplitude,
+exponent), so ``q1^3`` is ``['power', 'x1']`` with the odd amplitude carrying
+the coefficient and the exponent fitting to 3.
 
 Cubic COUPLING: ``(q1 - q2)^3`` expands into four monomials (``q1^3,
 q1^2*q2, q1*q2^2, q2^3``), so its truth tau is long and carries four fitted
@@ -70,8 +71,8 @@ def _coupled_duffing():
             f"yddot = {-(k2+kc):.4g}*y {-c2:+.4g}*ydot {+kc:+.4g}*x {-a2:+.4g}*y^3",
         ],
         truth_taus=[
-            ['add', 'x1', 'x2', 'x3', 'intpower', 'x1', 'end'],   # q1, qd1, q2, q1^3
-            ['add', 'x1', 'x3', 'x4', 'intpower', 'x3', 'end'],   # q1, q2, qd2, q2^3
+            ['add', 'x1', 'x2', 'x3', 'power', 'x1', 'end'],   # q1, qd1, q2, q1^3
+            ['add', 'x1', 'x3', 'x4', 'power', 'x3', 'end'],   # q1, q2, qd2, q2^3
         ],
         var_names=['x', 'y'],
         t_end=25.0, n_pts=2500, n_traj=4,
@@ -112,9 +113,9 @@ def _duffing_chain3():
             f"q3ddot = {+k:.4g}*q2 {-2*k:+.4g}*q3 {-c:+.4g}*q3dot {-a:+.4g}*q3^3",
         ],
         truth_taus=[
-            ['add', 'x1', 'x2', 'x3', 'intpower', 'x1', 'end'],
+            ['add', 'x1', 'x2', 'x3', 'power', 'x1', 'end'],
             ['add', 'x1', 'x3', 'x4', 'x5', 'end'],
-            ['add', 'x3', 'x5', 'x6', 'intpower', 'x5', 'end'],
+            ['add', 'x3', 'x5', 'x6', 'power', 'x5', 'end'],
         ],
         var_names=['q1', 'q2', 'q3'],
         t_end=20.0, n_pts=2500, n_traj=4,
@@ -152,13 +153,13 @@ def _cubic_coupled():
         return -c2 * v2 - k2 * q2 + a * (q1 - q2) ** 3
 
     # (q1 - q2)^3 = q1^3 - 3 q1^2 q2 + 3 q1 q2^2 - q2^3.  Every leaf carries an
-    # implicit fitted coefficient and every intpower fits its own exponent, so
+    # implicit fitted coefficient and every ``power`` fits its own exponent, so
     # the four monomials are written structurally and the signs come out of the
     # fit.
-    _cube = ['intpower', 'x1',                    # q1^3
-             'mul', 'intpower', 'x1', 'x3', 'end',   # q1^2 * q2
-             'mul', 'x1', 'intpower', 'x3', 'end',   # q1 * q2^2
-             'intpower', 'x3']                    # q2^3
+    _cube = ['power', 'x1',                       # q1^3
+             'mul', 'power', 'x1', 'x3', 'end',      # q1^2 * q2
+             'mul', 'x1', 'power', 'x3', 'end',      # q1 * q2^2
+             'power', 'x3']                       # q2^3
 
     return TruthSystem(
         name='mdof_cubic_coupled',

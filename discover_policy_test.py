@@ -218,7 +218,7 @@ def test_t6_split_assemble():
         if d >= 2 or r < .4:
             return [str(rng.choice(V))]
         if r < .6:
-            return ['intpower', str(rng.choice(V))]
+            return ['power', str(rng.choice(V))]
         ch = [node(d + 1) for _ in range(rng.integers(2, 4))]
         return ['mul'] + [t for c in ch for t in c] + ['end']
 
@@ -227,12 +227,12 @@ def test_t6_split_assemble():
         m = int(rng.integers(1, 6))
         terms = [node() for _ in range(m)]
         if m == 1 and len(terms[0]) == 1:
-            terms[0] = ['intpower', terms[0][0]]        # the sampler forbids this bag
+            terms[0] = ['power', terms[0][0]]        # the sampler forbids this bag
         tau = dc.assemble_terms(terms)
         ok &= dc.split_terms(tau) == terms and dc.is_complete(tau)
     check('T.6 split(assemble(terms)) == terms, incl. m == 1', bool(ok))
     check('T.6 a non-add tau is a single term',
-          dc.split_terms(['intpower', 'x1']) == [['intpower', 'x1']])
+          dc.split_terms(['power', 'x1']) == [['power', 'x1']])
     # The failure mode the term-root rule exists for:
     bad = dc.assemble_terms([['add', 'x1', 'x2', 'end'], ['x3']])
     check('T.6 an add-rooted term assembles to something the flat grammar rejects',
@@ -282,7 +282,7 @@ def test_t8_term_context_reproducible():
     about what the entry even means."""
     print("\nT.8  context reproducibility")
     policy = make_term_policy()
-    tau_a = ['add', 'x1', 'x2', 'intpower', 'x1', 'end']
+    tau_a = ['add', 'x1', 'x2', 'power', 'x1', 'end']
     tau_b = ['add', 'x3', 'mul', 'x1', 'x3', 'end', 'end']
     entry_a = (0.9, tau_b, [], {'dof_order': (0, 1), 'slot': 1, 'prefix_slices': {0: tau_a}})
     entry_b = (0.5, tau_a, [], {'dof_order': (1, 0), 'slot': 1, 'prefix_slices': {1: tau_b}})
@@ -468,8 +468,8 @@ def test_directional_leaves():
         taus = {
             'dleaf':                    ['dleaf'],
             'add(dleaf, vleaf)':        ['add', 'dleaf', 'vleaf', 'end'],
-            'intpower(dleaf)':          ['intpower', 'dleaf'],
-            'add(x1, intpower(dleaf))': ['add', 'x1', 'intpower', 'dleaf', 'end'],
+            'power(dleaf)':             ['power', 'dleaf'],
+            'add(x1, power(dleaf))':    ['add', 'x1', 'power', 'dleaf', 'end'],
             'mul(dleaf, vleaf)':        ['mul', 'dleaf', 'vleaf', 'end'],
         }
         agree = []
@@ -507,19 +507,19 @@ def test_directional_leaves():
         m1 = dc._expand_monomials(dc._parse_tree(['dleaf'])[0])
         check('a bare dleaf keeps the closed form (N_DOF monomials)',
               m1 is not None and len(m1) == N_DOF)
-        m2 = dc._expand_monomials(dc._parse_tree(['intpower', 'dleaf'])[0])
-        check('intpower(dleaf) leaves the closed form (nonlinear in the weights)',
+        m2 = dc._expand_monomials(dc._parse_tree(['power', 'dleaf'])[0])
+        check('power(dleaf) leaves the closed form (nonlinear in the weights)',
               m2 is None)
 
         # reachability: the varpro term grammar must admit them under a power,
         # which is the entire point of the token
-        mask = dp.term_valid_mask(['intpower'], 1, TERM_LEN,
+        mask = dp.term_valid_mask(['power'], 1, TERM_LEN,
                                   term_grammar='varpro').numpy()
         allowed = {t for t, m in zip(dc.ALL_TOKENS, mask) if m > 0}
         check("varpro lets a power op take a directional leaf",
               {'dleaf', 'vleaf'} <= allowed, f"allowed: {sorted(allowed)}")
-        check('intpower(dleaf) is a complete term',
-              dc.is_complete(['intpower', 'dleaf']))
+        check('power(dleaf) is a complete term',
+              dc.is_complete(['power', 'dleaf']))
 
         # the policy's output layer must widen with the table
         pol = dp.TermBagPolicy(n_tokens=dc.N_TOKENS, max_terms=N_TERMS,

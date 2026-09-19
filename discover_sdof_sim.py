@@ -21,9 +21,10 @@ Grammar note for ``truth_taus``
 -------------------------------
 State layout is ``x1 = q``, ``x2 = qdot``.  Every variable leaf carries an
 implicit fitted coefficient, so ``['add', 'x1', 'x2', 'end']`` is
-``c1*q + c2*qdot`` — the whole linear oscillator.  Powers come from
-``intpower`` (coefficient + integer exponent), so ``q^3`` is
-``['intpower', 'x1']``.  Supplying a tau is optional; it only enables the
+``c1*q + c2*qdot`` — the whole linear oscillator.  Powers come from the single
+``power`` op, which consumes (even amplitude, odd amplitude, exponent), so
+``q^3`` is ``['power', 'x1']`` with the ODD amplitude carrying the coefficient
+and the exponent fitting to 3.  Supplying a tau is optional; it only enables the
 ``[truth]`` reward printout, which tells you the score the search is aiming at.
 """
 
@@ -45,7 +46,7 @@ def _duffing():
         name='sdof_duffing',
         accel_fns=[a0],
         truth_strs=[f"xddot = -{c:.4g}*xdot - {k:.4g}*x - {a:.4g}*x^3"],
-        truth_taus=[['add', 'x1', 'x2', 'intpower', 'x1', 'end']],
+        truth_taus=[['add', 'x1', 'x2', 'power', 'x1', 'end']],
         var_names=['x'],
         t_end=20.0, n_pts=2000, n_traj=4,
         ic_scale=[1.5, 1.5],       # [q, qdot]
@@ -88,7 +89,7 @@ def _vanderpol():
         accel_fns=[a0],
         truth_strs=[f"xddot = {mu:.4g}*(1-x^2)*xdot - x"],
         # mu*xdot - mu*x^2*xdot - x  ->  c1*x + c2*xdot + c3*(x^2 * xdot)
-        truth_taus=[['add', 'x1', 'x2', 'mul', 'intpower', 'x1', 'x2',
+        truth_taus=[['add', 'x1', 'x2', 'mul', 'power', 'x1', 'x2',
                      'end', 'end']],
         var_names=['x'],
         t_end=20.0, n_pts=2000, n_traj=4,
