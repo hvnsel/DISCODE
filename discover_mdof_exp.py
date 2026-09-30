@@ -29,6 +29,16 @@ acceleration NRMSE is the reverse — dropping a small damping term costs only a
 few percent of acceleration error but a large share of the energy residual.
 The blend ``residual = (1-w_acc)*energy + w_acc*accel_NRMSE`` is a single
 stacked least-squares solve, so it keeps the closed-form constant fit.
+
+``reward='simulation'``
+-----------------------
+Instead of the balance, each candidate is integrated forward from the measured
+initial state and scored by the NRMSE of its displacement against the record
+(:mod:`discover_rollout`).  That needs no derivative relation between the
+channels, only the initial velocity, so it is the reward to try when the
+ceiling is low.  The ceiling bounds the energy reward only and is not printed
+under it.  ``sim_window`` restarts the simulation from the record every that
+many seconds instead of one free run per trial.
 """
 
 from __future__ import annotations
@@ -65,6 +75,10 @@ def DISCOVER_MDOF_EXP(
     energy_normalize = True,
     max_traj         = 10,
     w_acc            = 0.9,
+    reward           = 'energy',   # 'energy' | 'simulation'
+    sim_window       = None,       # simulation: None = one free run per trial,
+                                   #   else restart from the record every N s
+    sim_w_vel        = 0.0,        # simulation: velocity weight in the NRMSE
     use_pool         = True,
     # policy (see DISCOVER_TRAIN)
     cross_slice_attention = True,
@@ -94,7 +108,7 @@ def DISCOVER_MDOF_EXP(
     if plot_data:
         plot_system_data(system)
 
-    if show_ceiling:
+    if show_ceiling and reward == 'energy':
         worst, _ = identity_ceiling(system, verbose=True)
         print(f"[ceiling] worst per-DOF/per-trial ceiling: {worst:.4f} "
               f"— no expression can score above this\n", flush=True)
@@ -119,6 +133,9 @@ def DISCOVER_MDOF_EXP(
         energy_normalize = energy_normalize,
         max_traj         = max_traj,
         w_acc            = w_acc,
+        reward           = reward,
+        sim_window       = sim_window,
+        sim_w_vel        = sim_w_vel,
         use_pool         = use_pool,
         cross_slice_attention = cross_slice_attention,
         n_layers              = n_layers,

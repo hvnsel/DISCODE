@@ -142,6 +142,10 @@ def DISCOVER_SDOF_SIM(
     energy_normalize = True,
     max_traj         = None,
     w_acc            = 0.5,
+    reward           = 'energy',   # 'energy' | 'simulation'
+    sim_window       = None,       # simulation: None = one free run per trial,
+                                   #   else restart from the record every N s
+    sim_w_vel        = 0.0,        # simulation: velocity weight in the NRMSE
     use_pool         = True,
     # policy (see DISCOVER_TRAIN)
     cross_slice_attention = True,
@@ -166,7 +170,8 @@ def DISCOVER_SDOF_SIM(
 
     if show_truth:
         print_truth_rewards(system, max_traj=max_traj, w_acc=w_acc,
-                            energy_normalize=energy_normalize)
+                            energy_normalize=energy_normalize, reward=reward,
+                            sim_window=sim_window, sim_w_vel=sim_w_vel)
 
     return DISCOVER_TRAIN(
         system_data      = system,
@@ -188,6 +193,9 @@ def DISCOVER_SDOF_SIM(
         energy_normalize = energy_normalize,
         max_traj         = max_traj,
         w_acc            = w_acc,
+        reward           = reward,
+        sim_window       = sim_window,
+        sim_w_vel        = sim_w_vel,
         use_pool         = use_pool,
         cross_slice_attention = cross_slice_attention,
         n_layers              = n_layers,

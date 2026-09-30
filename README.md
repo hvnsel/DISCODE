@@ -16,7 +16,8 @@ committed for the others. See [Policy architecture](#policy-architecture).
 
 | file | what it is |
 |---|---|
-| `discover_core.py` | the engine: grammar, expression evaluation, VARPRO constant fitting, the reward, the scoring worker, the critic |
+| `discover_core.py` | the engine: grammar, expression evaluation, VARPRO constant fitting, the rewards, the scoring worker, the critic |
+| `discover_rollout.py` | the forward-simulation reward's integrator: one DOF at a time against the measured record (torch-free, shared with `discover_score.py`) |
 | `discover_policy.py` | the terms-in-a-bag policy: model, attention mask, sampling, beam search, `jgrpo_terms` |
 | `discover_policy_test.py` | correctness invariants for the above — run it before anything long |
 | `discover_data.py` | everything that produces a `SystemData`: `.mat` loading, truth simulation, dataset prep, ceiling + truth-reward diagnostics |
@@ -65,7 +66,8 @@ Paste it into `discover_score.py` or a plotter, point the config at the same dat
 ## Two numbers to read before the reward
 
 **The ceiling.** The reward the *measured* acceleration scores on its own energy
-balance. No expression can beat it. On simulated data it must be ~1.0 — if it
+balance. No expression can beat it (under the energy reward — the simulation
+reward below has no ceiling, and the experimental drivers skip it there). On simulated data it must be ~1.0 — if it
 isn't, the trapezoid rule is under-resolving the `v*a` integrand and every reward
 is capped; raise `n_pts`. On experimental data it is typically well below 1.0
 because filtering breaks `a = dv/dt` and `v = dq/dt`, and near the ceiling the
@@ -88,6 +90,49 @@ reverse. Pure energy therefore cannot rank stiffness well, and pure NRMSE
 effectively never selects a small dissipative term. Both are linear in the
 coefficients, so the blend is one stacked least-squares solve and the closed-form
 constant fit is preserved. Default `0.5`.
+
+## Two reward schemes: `reward='energy'` or `reward='simulation'`
+
+Every driver and `DISCOVER_TRAIN` take `reward`:
+
+| `reward` | a candidate is scored by |
+|---|---|
+| `'energy'` (default) | the work-energy residual blended with acceleration NRMSE by `w_acc`, on the measured states (above) |
+| `'simulation'` | integrating it forward from the measured initial state and taking the NRMSE of its simulated displacement against the measured one |
+
+Both map a residual `e` to `r = 1/(1+e)` and both are per DOF, so everything
+after the score — buffers, GRPO, the hall of fame — is shared. The constants are
+fitted the same way under both: the closed-form work-energy / acceleration fit,
+steered by `w_acc`. Under `'simulation'`, `w_acc` therefore only shapes the fit;
+the simulation decides the ranking.
+
+**One DOF at a time.** In a multi-DOF run, DOF d's equation is integrated on its
+own, and the other DOFs' states are read off the measured record at every step.
+A coupling term is judged against the partner's true motion, and DOF d's score
+never depends on the partner's current expression — the same isolation the
+energy reward has. The full coupled simulation of a finished set of equations is
+what `discover_plot_sim.py` / `discover_plot_exp.py` do.
+
+Two more knobs, used only by `'simulation'`:
+
+| knob | default | what it does |
+|---|---|---|
+| `sim_window` | `None` | `None` is one free run per trial, from its first sample to its last. A number restarts the simulation from the measured state every that many seconds (multiple shooting). A small frequency error then costs a bounded phase error per window instead of one that grows over the whole record, and it runs faster |
+| `sim_w_vel` | `0.0` | blends velocity NRMSE into the displacement NRMSE: `(1-w)*NRMSE(q) + w*NRMSE(qdot)` |
+
+The integrator is RK4 on the record's own samples. The step is sized from the
+data: at least 50 steps per cycle of the fastest measured motion, so an
+oversampled simulated record is stepped every few samples and a coarse one gets
+substeps. An equation that diverges is frozen at 10× the largest measured
+amplitude and scores a large but finite residual.
+
+Measured per candidate on the simulated registry (4 trials, 1500–2500 samples),
+a free run costs 25–150 ms and a 2 s window 3–15 ms, against ~2 ms for the energy
+reward. Both rewards share the constant fit, which usually costs more: on an
+untrained policy's free-grammar candidates its median was 0.3 s.
+
+To score pasted equations with it afterwards, set `REWARD = 'simulation'` (and
+the same `SIM_WINDOW` / `SIM_W_VEL`) in `discover_score.py`.
 
 ## Policy architecture
 
