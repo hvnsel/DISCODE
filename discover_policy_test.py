@@ -617,6 +617,147 @@ def test_blend():
         dc.configure_grammar(N_DOF)
 
 
+def test_intpower():
+    """``intpower(u) = c * u^n`` -- the standard integer power, next to ``power``.
+
+    ``power`` contains u^n only as a special case the fit never lands on: its
+    polish moves the exponent off the integer and its wrong-parity amplitude
+    comes back small but nonzero, so a Duffing truth printed as
+    ``-0.5001*Abs(x)**3.0*sign(x) + 9.1e-6*Abs(x)**3.0``.  ``intpower`` exists
+    to give ``-0.5*x**3``, which only holds if its exponent stays an EXACT
+    integer through both fit paths: the closed form must not polish it, and the
+    nonlinear fallback must pin and snap it.  Both failures are silent -- the
+    reward barely moves -- so they are asserted here through the real fitter.
+    """
+    import contextlib
+    import io
+
+    import sympy as sp
+
+    from discover_data import build_truth_system, generate_dataset
+    from discover_mdof_sim import get_mdof_system
+    from discover_sdof_sim import get_sdof_system
+
+    def load(spec, directional_leaves=False, **kw):
+        with contextlib.redirect_stdout(io.StringIO()):
+            system = build_truth_system(spec, **kw)
+        dc.configure_grammar(system.n_dof, system.var_names, directional_leaves)
+        _X, _y, raw, ns = generate_dataset(system, device=None)
+        dc.set_problem_data(ns, raw, True, None, 0.5)
+        return ns
+
+    print("\nintpower (the standard integer power)")
+    saved = (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+             dc.MAX_TRAJ, dc.W_ACC)
+    try:
+        dc.configure_grammar(N_DOF)
+        check('intpower is in the default table next to power',
+              {'intpower', 'power'} <= set(dc.ALL_TOKENS), f"{dc.ALL_TOKENS}")
+        check('intpower is unary and owns 2 const slots',
+              dc.ARITY['intpower'] == 1 and dc.CONST_SLOTS['intpower'] == 2)
+
+        taus = {'intpower(x1)':           ['intpower', 'x1'],
+                'add(x1,intpower(x2))':   ['add', 'x1', 'intpower', 'x2', 'end'],
+                'mul(intpower(x1),x3)':   ['mul', 'intpower', 'x1', 'x3', 'end'],
+                'add(intpower,power)':    ['add', 'intpower', 'x1',
+                                           'power', 'x3', 'end']}
+        ok = all(dc.count_total_consts(t) == dc._parse_tree(t)[1]
+                 == dc._build_param_code(t)[1] for t in taus.values())
+        check('every walker agrees on intpower const slots', ok)
+
+        rng = np.random.default_rng(0)
+        X = rng.normal(size=(7, 2 * N_DOF))
+        X[0, 0] = -1.5                        # make sure a negative base is seen
+        cols = [X[:, k] for k in range(2 * N_DOF)]
+        devs = []
+        for n in (1, 2, 3):
+            consts = [-0.7, float(n), 1.0]
+            a = np.asarray(dc.compile_to_numpy(['intpower', 'x1'], consts)(*cols),
+                           float)
+            b = dc.evaluate(['intpower', 'x1'],
+                            torch.tensor(X, dtype=torch.float64), consts).numpy()
+            devs.append(max(float(np.abs(a - (-0.7) * X[:, 0] ** n).max()),
+                            float(np.abs(a - b).max())))
+        check('intpower is c * u**n exactly, odd powers keeping the sign',
+              max(devs) < 1e-12, f"max deviation {max(devs):.2e}")
+
+        # A slot value that drifted in an optimiser must still evaluate as an
+        # integer power in EVERY walker, or the fit and the score disagree.
+        drift = [1.0, 2.7, 1.0]
+        a = np.asarray(dc.compile_to_numpy(['intpower', 'x1'], drift)(*cols), float)
+        code = dc._build_param_code(['intpower', 'x1'])[0]
+        f_par = eval(f"lambda c,{','.join(dc.VARIABLES)}: {code}",
+                     {'np': np, '_itp': dc._intpower_np})
+        p = np.asarray(f_par(np.array(drift), *cols), float)
+        check('a drifted exponent (2.7) evaluates as u**3 in every walker',
+              np.allclose(a, X[:, 0] ** 3) and np.allclose(p, X[:, 0] ** 3)
+              and dc.expr_to_str(['intpower', 'x1'], drift).endswith('^3'))
+
+        m = dc._expand_monomials(dc._parse_tree(['intpower', 'x1'])[0])
+        check('intpower of a variable is ONE closed-form monomial (no parity twin)',
+              m is not None and len(m) == 1
+              and m[0]['factors'][0][0] == 'intpower')
+        check('its grid is the positive integers; power keeps its own',
+              dc.exp_slot_grid('intpower') == [1.0, 2.0, 3.0]
+              and dc.exp_slot_grid('abspower') == list(dc.POWER_EXP_GRID))
+
+        mask = dp.term_valid_mask(['intpower'], 1, TERM_LEN,
+                                  term_grammar='varpro').numpy()
+        allowed = {t for t, mv in zip(dc.ALL_TOKENS, mask) if mv > 0}
+        check('varpro restricts an intpower child to bare variables',
+              allowed == set(dc.VARIABLES), f"{sorted(allowed)}")
+        under_int = dp.term_valid_mask(['intpower'], 1, TERM_LEN).numpy()
+        under_pow = dp.term_valid_mask(['power'], 1, TERM_LEN).numpy()
+        check('no power op may sit directly under another (nesting is degenerate)',
+              all(under_int[dc.tok2idx(t)] == 0 and under_pow[dc.tok2idx(t)] == 0
+                  for t in ('intpower', 'power')))
+
+        # sympy round trip: plain integer powers come back as intpower, the
+        # Abs / sign forms as power, and the value is unchanged
+        x1, x2 = dc.SYMS['x1'], dc.SYMS['x2']
+        expr = -0.5 * x1 ** 3 + x1 ** 2 * x2 + 2.0 * sp.Abs(x1) ** 1.5
+        rt = dc.sympy_to_tau(expr)
+        ok = rt is not None
+        if ok:
+            tau, consts = rt
+            ref = sp.lambdify([dc.SYMS[v] for v in dc.VARIABLES], expr,
+                              'numpy')(*cols)
+            got = dc.compile_to_numpy(tau, consts)(*cols)
+            ok = (tau.count('intpower') == 2 and tau.count('power') == 1
+                  and np.allclose(got, ref))
+        check('sympy_to_tau maps x**n to intpower and Abs(x)**p to power',
+              ok, f"{rt[0] if rt else rt}")
+
+        # The promise itself, through the real closed-form fitter.
+        load(get_sdof_system('duffing'), n_traj=2, n_pts=600, t_end=12.0)
+        tau = ['add', 'x1', 'x2', 'intpower', 'x1', 'end']
+        c = dc.optimise_consts_energy(tau, 0)
+        r = dc.energy_reward([(tau, c)])
+        phys = dc.denormalize_expr(tau, c, 0)
+        check('the closed form fits Duffing with the exponent EXACTLY 3',
+              c[3] == 3.0 and r > 0.999, f"n = {c[3]!r}, r = {r:.6f}")
+        check('...and it prints as a standard power, no Abs / sign',
+              'x**3' in phys and 'Abs' not in phys and 'sign' not in phys, phys)
+
+        # ...and through the nonlinear fallback, which intpower(dleaf) takes.
+        ns = load(get_mdof_system('cubic_coupled'), directional_leaves=True,
+                  n_traj=2, n_pts=1000, t_end=20.0)
+        tau = ['add', 'x1', 'x2', 'intpower', 'dleaf', 'end']
+        check('intpower(dleaf) leaves the closed form',
+              dc._expand_monomials(dc._parse_tree(tau)[0]) is None)
+        c = dc.optimise_consts_energy(tau, 0)
+        r = dc.energy_reward([(tau, c), None])
+        X_std = ns[1]
+        ratio = (c[5] / X_std[2]) / (c[4] / X_std[0])  # physical q2 : q1 weight
+        check('the nonlinear fit lands on exponent EXACTLY 3 and on q1 - q2',
+              c[3] == 3.0 and abs(ratio + 1.0) < 0.01 and r > 0.999,
+              f"n = {c[3]!r}, q2/q1 = {ratio:+.4f}, r = {r:.6f}")
+    finally:
+        dc.configure_grammar(N_DOF)
+        (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+         dc.MAX_TRAJ, dc.W_ACC) = saved
+
+
 def main():
     dc.configure_grammar(N_DOF)
     print(f"grammar: {dc.ALL_TOKENS}  (N_TOKENS={dc.N_TOKENS})")
@@ -634,6 +775,7 @@ def main():
     test_term_pe_band()
     test_directional_leaves()
     test_blend()
+    test_intpower()
 
     print(f"\n{'=' * 60}")
     print(f"{len(_PASS)} passed, {len(_FAIL)} failed")

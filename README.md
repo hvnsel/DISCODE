@@ -175,4 +175,6 @@ cycle of the fastest mode; `identity_ceiling` checks and warns.
 For `truth_taus`, the state layout is `x1 = q1`, `x2 = qd1`, `x3 = q2`, ... Every
 variable leaf carries an implicit fitted coefficient, so `['add','x1','x2','end']`
 is `c1*q1 + c2*qd1`. Powers come from `intpower` (coefficient + integer exponent):
-`q1**3` is `['intpower','x1']`.
+`q1**3` is `['intpower','x1']`. Fractional, signed or asymmetric powers come from
+`power` (even amplitude, odd amplitude, exponent); its exponent is polished
+continuously, so it is not the way to write a clean integer power.

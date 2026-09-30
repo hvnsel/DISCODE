@@ -63,7 +63,7 @@ leading coefficient**) and free constants.  With
     vleaf = a_1 qd_1 + a_2 qd_2 + ... + a_N qd_N      N_DOF fitted weights
 
 A directional leaf is a fitted DIRECTION in one block of the state rather than
-a choice of one channel, which is what lets ``power(dleaf)`` express
+a choice of one channel, which is what lets ``intpower(dleaf)`` express
 ``(q_1 - q_2)^3`` as a single term instead of the four monomials its expansion
 needs.  Measured on ``cubic_coupled``: 3 terms and 6 constants against 6 terms
 and 16 constants for the same reward.  A bare directional leaf is still linear
@@ -71,24 +71,35 @@ in its own weights, so it keeps the closed-form fit; under a power op the
 weights are nonlinear and the fit falls back to the optimiser, where the
 integer exponent is gridded rather than optimised through.
 
-Powers are the unary operators::
+Powers are two unary operators::
 
-    power(u) = |u|^p * (c1 + c2 * sign(u))     p searched on POWER_EXP_GRID
+    intpower(u) = c * u^n                       n on INTPOWER_GRID = (1, 2, 3)
+    power(u)    = |u|^p * (c1 + c2 * sign(u))   p searched on POWER_EXP_GRID
 
-``|u|^p`` is the EVEN part and ``sign(u)|u|^p`` the ODD part, so one operator
-covers the whole family: ``c2 = 0`` is a pure ``|u|^p``, ``c1 = 0`` is a pure
-``sign(u)|u|^p`` (and at ``p = 1`` that is just ``u``, at ``p = 0`` it is
-``sign(u)``), an integer ``p`` recovers ``u^n``, and both amplitudes nonzero
-gives an ASYMMETRIC response -- stiffness differing in tension and compression,
-which no single-parity operator can express at one exponent.
+``intpower`` is the STANDARD integer power: one amplitude and an exact integer
+exponent, searched on the integer grid and never polished, so the fitted term
+is ``c * x**3`` and nothing else.  Polynomial truths -- Duffing's ``x^3``, van
+der Pol's ``x^2 * xdot`` -- are written with it.
+
+``power`` is the general family.  ``|u|^p`` is the EVEN part and
+``sign(u)|u|^p`` the ODD part, so one operator covers it all: ``c2 = 0`` is a
+pure ``|u|^p``, ``c1 = 0`` is a pure ``sign(u)|u|^p`` (and at ``p = 1`` that is
+just ``u``, at ``p = 0`` it is ``sign(u)``), and both amplitudes nonzero gives
+an ASYMMETRIC response -- stiffness differing in tension and compression, which
+no single-parity operator can express at one exponent.  An integer ``p`` is
+only a special case of it, and one the fit never lands on exactly: the polish
+moves the exponent off the integer (Duffing's cube fits as 2.9998) and the
+wrong-parity amplitude comes back small but nonzero.  That is why ``intpower``
+is its own token.
 
 ``c1`` and ``c2`` are fitted LINEARLY, so parity is decided by the fitter and is
-not a token the search has to guess.  ``p`` is searched on a grid, never freely
-optimised: a free exponent runs away under noise (measured 13.4 on duffing and
-14.7 on cubic_coupled at 5% NSR), and a bounded grid cannot.
+not a token the search has to guess.  ``p`` is searched on a grid and then
+polished within [MIN_EXP, MAX_EXP]; the bound is what stops the runaway a free
+exponent shows under noise (measured 13.4 on duffing and 14.7 on cubic_coupled
+at 5% NSR).
 
-``power`` consumes **three** constant slots (c1, c2, p) in pre-order, *before*
-its child's constants.
+``intpower`` consumes **two** constant slots (c, n) and ``power`` **three**
+(c1, c2, p), in pre-order, *before* the child's constants.
 
 State layout for an N-DOF system::
 
@@ -114,13 +125,29 @@ from sympy.parsing.sympy_parser import parse_expr
 DEVICE = torch.device('cpu')
 
 # ── Static grammar constants ────────────────────────────────────────────────
-# ONE power operator, replacing the old abspower / sgnpower / intpower trio::
+# The STANDARD integer power::
+#
+#     intpower(u) = c * u^n                   2 const slots: (c, n)
+#
+# n is searched on INTPOWER_GRID and never polished, so a fitted intpower is
+# exactly ``c * x**3``: an integer exponent, one amplitude, no parity twin.
+# ``power`` below contains u^n only as a special case it never fits exactly --
+# measured on the registry truths its exponents come back as 2.9998 / 1.9997
+# with a 1e-6 wrong-parity amplitude, so duffing's ``-0.5*x^3`` printed as
+# ``-0.5001*Abs(x)**3.0*sign(x) + 9.1e-6*Abs(x)**3.0``.
+#
+# Positive exponents only, on BOTH fit paths: u^-n is singular at the origin,
+# which is where an oscillator spends its time.  INTPOWER_MAX = 3 also keeps a
+# four-cube expansion at 3^4 = 81 grid combos, exhaustive and exact.
+INTPOWER_OP   = 'intpower'
+INTPOWER_MAX  = 3
+INTPOWER_GRID = tuple(float(n) for n in range(1, INTPOWER_MAX + 1))
+# The general power, which replaced the old abspower / sgnpower pair::
 #
 #     power(u) = |u|^p * (c1 + c2*sgn(u))     3 const slots: (c1, c2, p)
 #
-# It subsumes all three exactly.  |u|^p is the EVEN part and sgn(u)|u|^p the
-# ODD part, so c2 = 0 is the old abspower, c1 = 0 is the old sgnpower, and an
-# integer p recovers intpower (u^n is |u|^n for even n, sgn(u)|u|^n for odd).
+# It subsumes both exactly.  |u|^p is the EVEN part and sgn(u)|u|^p the ODD
+# part, so c2 = 0 is the old abspower and c1 = 0 is the old sgnpower.
 #
 # Parity is not a dial and cannot be one: every function decomposes uniquely
 # into even + odd, so any "blend" of the two is a linear combination, which the
@@ -140,7 +167,7 @@ POWER_OPS    = ('power',)
 # the bare variables stay in the table, so nothing that worked before changes.
 DIR_LEAVES   = ('dleaf', 'vleaf')
 BINARY_OPS   = ['add', 'mul']            # ['add', 'sub', 'mul']
-UNARY_OPS    = list(POWER_OPS)
+UNARY_OPS    = [INTPOWER_OP] + list(POWER_OPS)     # every power operator
 N_ARY_OPS    = ['add', 'sub', 'mul']
 CONSTANTS    = ['const']
 # Depth 5 (not 4): the root ``add`` of a sum-of-terms costs a whole level, and
@@ -216,9 +243,10 @@ MAX_EXP      = 3.0
 # Tokens that carry an implicit leading coefficient / extra constants.
 # COEFF_TOKENS is rebuilt in configure_grammar (it is the variable set).
 COEFF_TOKENS      = set()
-# Kept as a name for "a power op's const block"; ``power`` takes THREE slots
-# (even amplitude, odd amplitude, exponent), so read the count from
-# ``CONST_SLOTS`` and never assume two.
+# Per-operator const-block sizes.  ``intpower`` takes TWO slots (amplitude,
+# exponent) and ``power`` THREE (even amplitude, odd amplitude, exponent), so
+# read the count from ``CONST_SLOTS`` and never assume either.
+INTPOWER_CONST_SLOTS = 2
 POWER_CONST_SLOTS = 3
 BLEND_CONST_SLOTS = 4        # c1, c2, a, b
 # token -> number of const slots it consumes, in pre-order.  Rebuilt by
@@ -228,8 +256,9 @@ CONST_SLOTS       = {}
 _OP_TOKENS         = set(BINARY_OPS + UNARY_OPS) | {BLEND_OP}
 _FORBIDDEN_NESTING = {
     'add': {'add'}, 'sub': {'add'}, 'mul': {'mul'},
-    # nested fitted powers are degenerate ((|u|^p)^q == |u|^(p*q)) — forbid
-    **{p: set(POWER_OPS) for p in POWER_OPS},
+    # nested fitted powers are degenerate ((|u|^p)^q == |u|^(p*q), and the same
+    # for u^n under either op) — forbid any power op directly under another
+    **{p: set(UNARY_OPS) for p in UNARY_OPS},
     # a blend of a blend is not degenerate but is uninterpretable and blows the
     # exponent-slot budget, so forbid it too
     BLEND_OP: {BLEND_OP},
@@ -296,8 +325,9 @@ def configure_grammar(n_dof: int, var_names=None, directional_leaves=False,
     """Initialise the global token table for an ``n_dof`` system (2*n_dof vars).
 
     Leaf tokens are the bare state variables (each with an implicit leading
-    coefficient) plus ``const``.  The single power operator is ``power``,
-    consuming (even amplitude, odd amplitude, exponent).
+    coefficient) plus ``const``.  The power operators are ``intpower``,
+    consuming (amplitude, integer exponent), and ``power``, consuming (even
+    amplitude, odd amplitude, exponent).
 
     ``directional_leaves`` adds ``dleaf`` and ``vleaf``, each a fitted linear
     combination over one block of state channels::
@@ -307,7 +337,7 @@ def configure_grammar(n_dof: int, var_names=None, directional_leaves=False,
 
     They are leaves (arity 0) and are legal anywhere a bare variable is,
     including as a power op's child -- which is the point, since
-    ``power(dleaf)`` is how ``(q_1 - q_2)^3`` becomes ONE term instead of
+    ``intpower(dleaf)`` is how ``(q_1 - q_2)^3`` becomes ONE term instead of
     the four monomials its expansion needs.  Bare variables are kept, so the
     default table is unchanged when this is off.
     """
@@ -339,6 +369,7 @@ def configure_grammar(n_dof: int, var_names=None, directional_leaves=False,
     CONST_SLOTS = {}
     for t in VARIABLES: CONST_SLOTS[t] = 1
     for t in CONSTANTS: CONST_SLOTS[t] = 1
+    CONST_SLOTS[INTPOWER_OP] = INTPOWER_CONST_SLOTS
     for t in POWER_OPS: CONST_SLOTS[t] = POWER_CONST_SLOTS
     for t in TRANSCENDENTAL_OPS: CONST_SLOTS[t] = BLEND_CONST_SLOTS
     for t in dir_toks: CONST_SLOTS[t] = N_DOF
@@ -412,6 +443,23 @@ def _var_display_map():
 
 
 # ── Numeric power helpers ───────────────────────────────────────────────────
+def _snap_int_power(p):
+    """``intpower``'s exponent as the integer it evaluates at: rounded and
+    clipped to [1, INTPOWER_MAX].  Every walker snaps through here, so a slot
+    value that drifted in an optimiser can never evaluate as a fractional
+    power."""
+    p = float(p)
+    if not np.isfinite(p):
+        return 1
+    return int(round(float(np.clip(p, 1, INTPOWER_MAX))))
+
+
+def _intpower_np(a, n):
+    """``a ** n`` at the snapped integer exponent -- the plain power, so odd
+    ``n`` keeps the sign of ``a`` and even ``n`` drops it."""
+    return a ** _snap_int_power(n)
+
+
 def _clip_exp(p):
     return float(np.clip(float(p), MIN_EXP, MAX_EXP))
 
@@ -420,15 +468,19 @@ def exp_slot_grid(kind):
     """Search grid for an exponent-like slot, by its factor kind."""
     if kind == 'blend_a': return list(BLEND_A_GRID)
     if kind == 'blend_b': return list(BLEND_B_GRID)
+    if kind == INTPOWER_OP: return list(INTPOWER_GRID)
     return list(POWER_EXP_GRID)
 
 
 def exp_slot_bound(kind):
     """Polish bound for an exponent-like slot.  ``blend``'s decay rate must be
     allowed NEGATIVE (that is what decay means), where a power's exponent must
-    not go below zero at all -- |u|^p is singular at the origin."""
+    not go below zero at all -- |u|^p is singular at the origin.  An
+    ``intpower`` exponent is never polished; its bound only has to contain the
+    integer grid."""
     if kind == 'blend_a': return BLEND_A_BOUND
     if kind == 'blend_b': return BLEND_B_BOUND
+    if kind == INTPOWER_OP: return (1.0, float(INTPOWER_MAX))
     return (MIN_EXP, MAX_EXP)
 
 
@@ -443,8 +495,9 @@ def dir_leaf_terms(tok):
 
 def count_total_consts(tau):
     """Constant slots in pre-order, from ``CONST_SLOTS``: variables and
-    ``const`` take 1, power operators take 2 (coefficient, exponent), and a
-    directional leaf takes ``N_DOF`` (one weight per channel it spans)."""
+    ``const`` take 1, ``intpower`` 2 (amplitude, exponent), ``power`` 3 (even
+    amplitude, odd amplitude, exponent), ``blend`` 4, and a directional leaf
+    ``N_DOF`` (one weight per channel it spans)."""
     return sum(CONST_SLOTS.get(t, 0) for t in tau)
 
 
@@ -471,6 +524,11 @@ def expr_to_sympy_str(tau: list, consts: list) -> str:
         if tok == 'const':
             v = _next_const()
             return f"({v})"
+        if tok == INTPOWER_OP:
+            c = _next_const()
+            n = _snap_int_power(_next_const(2.0))
+            child = node_to_str()
+            return f"(({c})*(({child})**({n})))"
         if tok in POWER_OPS:
             c1 = _next_const()
             c2 = _next_const(0.0)
@@ -503,13 +561,15 @@ def sympy_to_tau(expr):
 
     Handles numbers, bare symbols (with optional numeric coefficient), powers of
     a symbol, ``Abs(sym)**p`` and ``sign(sym)*Abs(sym)**p``, and Add/Mul of the
-    above.  All three power forms emit the single ``power`` token, choosing which
-    of its two amplitudes carries the coefficient by PARITY:
+    above.  A plain integer power of a symbol is the standard ``intpower``;
+    every other power form emits ``power``, choosing which of its two
+    amplitudes carries the coefficient by PARITY:
 
-        Abs(s)**p           -> even, so c1 = coeff, c2 = 0
-        sign(s)*Abs(s)**p   -> odd,  so c1 = 0,     c2 = coeff
-        s**n, n even        -> even (s**n == Abs(s)**n)
-        s**n, n odd         -> odd  (s**n == sign(s)*Abs(s)**n)
+        s**n, n in INTPOWER_GRID  -> intpower, c = coeff
+        Abs(s)**p                 -> even, so c1 = coeff, c2 = 0
+        sign(s)*Abs(s)**p         -> odd,  so c1 = 0,     c2 = coeff
+        s**p, other even integer  -> even (s**p == Abs(s)**p)
+        s**p, anything else       -> odd  (s**p == sign(s)*Abs(s)**p)
 
     Returns ``None`` on anything unsupported.
     """
@@ -522,14 +582,19 @@ def sympy_to_tau(expr):
         tau.append(name); consts.append(float(coeff))
 
     def _emit_power(op, sym, p, coeff):
-        """``op`` is 'even' or 'odd' -- which amplitude of ``power`` gets ``coeff``."""
+        """``op`` is 'int' for ``intpower``, else 'even' or 'odd' -- which
+        amplitude of ``power`` gets ``coeff``."""
         name = str(sym)
         if name not in VAR_SET:
             raise ValueError(f"Unknown symbol: {name}")
-        c1 = float(coeff) if op == 'even' else 0.0
-        c2 = 0.0 if op == 'even' else float(coeff)
-        tau.append(POWER_OPS[0])
-        consts.extend([c1, c2, float(p)])
+        if op == 'int':
+            tau.append(INTPOWER_OP)
+            consts.extend([float(coeff), float(p)])
+        else:
+            c1 = float(coeff) if op == 'even' else 0.0
+            c2 = 0.0 if op == 'even' else float(coeff)
+            tau.append(POWER_OPS[0])
+            consts.extend([c1, c2, float(p)])
         tau.append(name); consts.append(1.0)     # inner variable coefficient
 
     def _as_signed_abs_power(e):
@@ -552,11 +617,15 @@ def sympy_to_tau(expr):
         if isinstance(e, sp.Pow):
             base, ex = e.args
             if isinstance(ex, sp.Number) and isinstance(base, sp.Symbol):
-                # s**n is Abs(s)**n for even n and sign(s)*Abs(s)**n for odd n;
-                # a non-integer exponent of a bare symbol is only real for s >= 0,
-                # so treat it as the odd branch (sign(s)|s|^p), which agrees there.
                 e = float(ex)
-                is_even = (abs(e - round(e)) < 1e-12) and (int(round(e)) % 2 == 0)
+                is_int = abs(e - round(e)) < 1e-12
+                if is_int and float(round(e)) in INTPOWER_GRID:
+                    return ('int', base, float(round(e)))
+                # Outside intpower's range, s**n is Abs(s)**n for even n and
+                # sign(s)*Abs(s)**n for odd n; a non-integer exponent of a bare
+                # symbol is only real for s >= 0, so treat it as the odd branch
+                # (sign(s)|s|^p), which agrees there.
+                is_even = is_int and (int(round(e)) % 2 == 0)
                 return ('even' if is_even else 'odd', base, e)
             if isinstance(ex, sp.Number):
                 if isinstance(base, sp.Abs) and isinstance(base.args[0], sp.Symbol):
@@ -750,7 +819,7 @@ def get_valid_tokens(tau, position, max_len, max_consts=20,
         if tok in _OP_TOKENS and depth >= MAX_TREE_DEPTH: continue
         if tok in forbidden_child_ops: continue
         if (power_child_vars_only
-                and (parent_op in POWER_OPS or parent_op in TRANSCENDENTAL_OPS)
+                and (parent_op in UNARY_OPS or parent_op in TRANSCENDENTAL_OPS)
                 and tok not in VAR_SET and tok not in DIR_LEAF_SET): continue
 
         if tok in _OP_TOKENS:
@@ -907,6 +976,13 @@ def evaluate(tau, x, consts):
         if tok == 'const':
             v = _next_const()
             return torch.full((x.shape[0],), v, dtype=x.dtype, device=x.device)
+        if tok == INTPOWER_OP:
+            c = _next_const()
+            n = _snap_int_power(_next_const(2.0))
+            child = parse_node()
+            if child is None: return None
+            r = c * torch.clamp(torch.pow(child, n), -1e15, 1e15)
+            return None if torch.any(~torch.isfinite(r)) else r
         if tok in POWER_OPS:
             c1 = _next_const()
             c2 = _next_const(0.0)
@@ -966,10 +1042,13 @@ def _build_param_code(tau):
     """Return (code_str, n_consts, grid_exp_indices, grid_exp_kinds).
 
     ``code_str`` is a numpy expression in ``c`` (constant vector) and the state
-    variables ``x1..x{2N}`` implementing the candidate's *normalised* output.
-    ``grid_exp_indices`` holds the const slots that are ``power`` exponents.
-    They are searched on ``POWER_EXP_GRID`` rather than optimised through, so
-    the caller pins each one and fits the rest (see ``optimise_consts_energy``).
+    variables ``x1..x{2N}`` implementing the candidate's *normalised* output;
+    it calls ``_itp`` (:func:`_intpower_np`), so eval it with that in scope.
+    ``grid_exp_indices`` holds the exponent-like const slots and
+    ``grid_exp_kinds`` which grid each is searched on (:func:`exp_slot_grid`)
+    rather than optimised through, so the caller pins each one and fits the
+    rest (see ``optimise_consts_energy``).  An ``intpower`` exponent is also
+    snapped inside the code, so even an unpinned one evaluates as an integer.
     """
     const_indices = []; grid_exp_indices = []; grid_exp_kinds = []
     pos = [0]
@@ -989,6 +1068,12 @@ def _build_param_code(tau):
         if tok == 'const':
             ci = len(const_indices); const_indices.append(ci)
             return f'c[{ci}]'
+        if tok == INTPOWER_OP:
+            ci = len(const_indices); const_indices.append(ci)
+            pi = len(const_indices); const_indices.append(pi)
+            grid_exp_indices.append(pi); grid_exp_kinds.append(INTPOWER_OP)
+            child = build()
+            return f'c[{ci}]*np.clip(_itp({child},c[{pi}]),-1e15,1e15)'
         if tok in POWER_OPS:
             c1 = len(const_indices); const_indices.append(c1)
             c2 = len(const_indices); const_indices.append(c2)
@@ -1052,6 +1137,11 @@ def expr_to_str(tau, consts=None):
         if tok == 'const':
             v = _next_const()
             return f"{v:.4f}"
+        if tok == INTPOWER_OP:
+            c = _next_const()
+            n = _snap_int_power(_next_const(2.0))
+            child = n2s()
+            return f"{c:.4g}*({child})^{n}"
         if tok in POWER_OPS:
             c1 = _next_const()
             c2 = _next_const(0.0)
@@ -1119,6 +1209,12 @@ def compile_to_numpy(tau, consts):
         if tok == 'const':
             v = _next_const()
             return repr(v)
+        if tok == INTPOWER_OP:
+            c = _next_const()
+            n = _snap_int_power(_next_const(2.0))
+            child = build()
+            if child is None: return None
+            return f'({c!r}*np.clip(({child})**{n},-1e15,1e15))'
         if tok in POWER_OPS:
             c1 = _next_const()
             c2 = _next_const(0.0)
@@ -1387,8 +1483,8 @@ def _energy_contexts(target_dof, other_exprs, max_traj, horizon):
 
 def _parse_tree(tau):
     """Parse ``tau`` into a nested node tree, assigning const slots in the same
-    pre-order the evaluator/compiler consume them (power ops consume
-    coefficient then exponent *before* their child)."""
+    pre-order the evaluator/compiler consume them (power ops consume their
+    amplitudes then exponent *before* their child)."""
     pos = [0]; slot = [0]
 
     def parse():
@@ -1406,6 +1502,11 @@ def _parse_tree(tau):
         if tok == 'const':
             s = slot[0]; slot[0] += 1
             return {'op': 'const', 'val': s}
+        if tok == INTPOWER_OP:
+            s0 = slot[0]; slot[0] += 1     # amplitude       c
+            s1 = slot[0]; slot[0] += 1     # exponent        n
+            child = parse()
+            return {'op': tok, 'coeff': s0, 'exp': s1, 'child': child}
         if tok in POWER_OPS:
             s0 = slot[0]; slot[0] += 1     # even amplitude  c1
             s1 = slot[0]; slot[0] += 1     # odd amplitude   c2
@@ -1450,12 +1551,20 @@ def _expand_monomials(node):
         # A directional leaf is a SUM of singly-weighted channels, so at degree
         # one it is linear in its own weights and the closed form still applies
         # -- exactly as if the term had been written ``add(x1, x3, ...)``.  Under
-        # a power op the weights appear nonlinearly; the POWER_OPS branch below
-        # rejects any non-``var`` child, which routes those to the optimiser.
+        # a power op the weights appear nonlinearly; the power-op branches below
+        # reject any non-``var`` child, which routes those to the optimiser.
         return [{'factors': [('var', c)], 'amp': {sl}, 'exps': set()}
                 for c, sl in zip(node['cols'], node['coeffs'])]
     if op == 'const':
         return [{'factors': [], 'amp': {node['val']}, 'exps': set()}]
+    if op == INTPOWER_OP:
+        ch = node['child']
+        if ch.get('op') != 'var':
+            return None          # power of a non-variable subtree -> nonlinear
+        # ONE monomial, the plain u^n: a single amplitude, so unlike ``power``
+        # there is no other-parity twin for the fit to hand a nonzero value.
+        return [{'factors': [(INTPOWER_OP, ch['col'], node['exp'])],
+                 'amp': {node['coeff']}, 'exps': {node['exp']}}]
     if op in POWER_OPS:
         ch = node['child']
         if ch.get('op') != 'var':
@@ -1528,6 +1637,11 @@ def _eval_monomial(mono, cols, exp_val, n):
             e  = np.clip(np.exp(av * u), -1e15, 1e15)
             phi = phi * (e * (np.sin(bv * u) if kind == 'blendsin'
                               else np.cos(bv * u)))
+        elif f[0] == INTPOWER_OP:
+            # (INTPOWER_OP, col, exp_slot) -- the plain u^n, integer exponent.
+            _kind, col, slot = f
+            phi = phi * np.clip(_intpower_np(cols[col], exp_val[slot]),
+                                -1e15, 1e15)
         else:
             # ('abspower'|'sgnpower', col, exp_slot) -- the EVEN and ODD parts of
             # one ``power`` op.  These are internal factor names now, not tokens.
@@ -1684,17 +1798,16 @@ def _fit_consts_linear(tau, contexts, ym_t, ys_t, n_consts):
         return None
 
     # ── exponent search, then polish continuous slots (VARPRO) ──────────────
-    # intpower slots get the exact integer grid (the fit is then *exact* per
-    # combination — no polish needed); abspower/sgnpower slots get the coarse
-    # float grid and a least-squares polish afterwards.
-    # Every exponent slot now belongs to a ``power`` op, whose factor kinds are
-    # the internal 'abspower'/'sgnpower' names.  They all share one grid.
-    # NOTE: this grid is positive-only, while the NONLINEAR fallback in
-    # ``optimise_consts_energy`` searches the same ``POWER_EXP_GRID``.  The two
-    # paths therefore agree -- unlike the old intpower pair, where the
-    # closed-form grid ran range(1, INTPOWER_MAX+1) (positive only) while the
-    # docstring promised |n| <= INTPOWER_MAX.  Negative exponents are reachable
-    # from neither path by design: |u|^p is singular at the origin.
+    # Each slot is searched on its own kind's grid (``exp_slot_grid``):
+    # ``intpower`` on the exact integer grid (the fit is then *exact* per
+    # combination, and it is never polished -- see below), ``power`` on
+    # POWER_EXP_GRID (its factor kinds are the internal 'abspower'/'sgnpower'
+    # names), ``blend`` on its (a, b) grids.  The NONLINEAR fallback in
+    # ``optimise_consts_energy`` reads the same grids, so the two paths agree --
+    # unlike the old intpower pair, whose closed-form grid ran 1..INTPOWER_MAX
+    # while its nonlinear grid also searched the negative exponents.  Negative
+    # exponents are reachable from neither path by design: u^-n and |u|^-p are
+    # singular at the origin.
     def _slot_grid(s):
         return exp_slot_grid(slot_kind.get(s))
 
@@ -1728,7 +1841,7 @@ def _fit_consts_linear(tau, contexts, ym_t, ys_t, n_consts):
         best_ev = {}
         for s in exp_slots:
             g = _slot_grid(s)
-            best_ev[s] = float(np.median(g))       # 1.5 on POWER_EXP_GRID
+            best_ev[s] = float(np.median(g))  # 1.5 on POWER_EXP_GRID, 2 on INTPOWER_GRID
         _c, _r, best_cost = _solve(best_ev)
         for _pass in range(MAX_CD_PASSES):
             improved = False
@@ -1752,7 +1865,12 @@ def _fit_consts_linear(tau, contexts, ym_t, ys_t, n_consts):
     # BOUND, not the grid: the polish is clipped to [MIN_EXP, MAX_EXP] = [0, 3],
     # and the runaway measured under noise (13.4 on duffing, 14.7 on
     # cubic_coupled at 5% NSR) needed room above 3 to happen.
-    cont_slots = list(exp_slots)
+    #
+    # ``intpower`` exponents are NOT polished.  Their grid is exhaustive, and
+    # the polish is exactly what moves an integer exponent off the integer --
+    # duffing's cube polishes from 3 to 2.9998 -- which is the whole difference
+    # between ``intpower`` and ``power``.
+    cont_slots = [s for s in exp_slots if slot_kind.get(s) != INTPOWER_OP]
     if cont_slots:
         def _resid(p):
             ev = dict(best_ev)
@@ -1802,9 +1920,10 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
     their errors cannot contaminate its constants).  ``max_traj=None`` uses the
     configured ``MAX_TRAJ`` — the same trajectories the reward scores on.
 
-    Fast path: for expressions that are linear in their coefficients (with 0-2
-    power exponents) the fit is a closed-form least-squares / variable
-    projection; ``power`` exponents are searched on ``POWER_EXP_GRID`` and then
+    Fast path: for expressions that are linear in their coefficients given the
+    exponents, the fit is a closed-form least-squares / variable projection;
+    ``intpower`` exponents are searched on the exact integer grid and never
+    polished, ``power`` exponents are searched on ``POWER_EXP_GRID`` and then
     polished within [MIN_EXP, MAX_EXP].
     Anything the fast path can't handle — powers of non-variable subtrees,
     over-large expansions — falls back to the general multi-start nonlinear
@@ -1833,7 +1952,8 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
         n_consts = n_c
     sig = ','.join(VARIABLES)
     try:
-        fn_param = eval(f'lambda c,{sig}: {code}', {'np': np})
+        fn_param = eval(f'lambda c,{sig}: {code}',
+                        {'np': np, '_itp': _intpower_np})
     except Exception:
         return [1.0] * n_consts
 
@@ -1896,9 +2016,10 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
     def _make_smart(cs, pv, direction='unit'):
         """Initial const vector in pre-order.
 
-        coefficient=cs for variables and consts; (coefficient=cs, exponent=pv)
-        for power operators; and for a directional leaf, a whole ``N_DOF``-long
-        weight block seeded by ``direction``:
+        coefficient=cs for variables and consts; (amplitude=cs, exponent=pv)
+        for ``intpower`` and (0, cs, pv) for ``power``; a pure oscillation for
+        ``blend``; and for a directional leaf, a whole ``N_DOF``-long weight
+        block seeded by ``direction``:
 
             'unit'   (1, 0, 0, ...)   the leaf starts as a bare variable
             'sum'    (1, 1, 1, ...)   every channel equally
@@ -1919,6 +2040,8 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
                     init.extend([1.0 if i % 2 == 0 else -1.0 for i in range(k)])
                 else:
                     init.extend([1.0] + [0.0] * (k - 1))
+            elif t == INTPOWER_OP:
+                init.extend([cs, pv])
             elif t in POWER_OPS:
                 # (even amplitude, odd amplitude, exponent).  The odd part
                 # carries the amplitude by default because an odd restoring
@@ -1953,14 +2076,17 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
     for init in inits:
         if len(init) != n_consts:
             continue
-        for pi in grid_exp_indices:
-            init[pi] = float(np.clip(init[pi], MIN_EXP, MAX_EXP))
+        # per-kind, like the bounds: an init outside its slot's bound makes
+        # least_squares reject the start as infeasible
+        for pi, kd in zip(grid_exp_indices, grid_exp_kinds):
+            init[pi] = float(np.clip(init[pi], *exp_slot_bound(kd)))
     inits = [i for i in inits if len(i) == n_consts][:n_inits]
 
-    # Grid the ``power`` exponents instead of optimising through them: pin each
-    # to a grid point with a hairline bound and fit everything else.  This is the
-    # same exhaustive-grid guarantee the closed-form path gives, and it is what
-    # makes ``power(dleaf)`` land on exponent 3 rather than on the local slope.
+    # Grid the exponent slots instead of optimising through them: pin each to a
+    # grid point of its kind with a hairline bound and fit everything else.
+    # This is the same exhaustive-grid guarantee the closed-form path gives, and
+    # it is what makes ``intpower(dleaf)`` land on exponent 3 rather than on the
+    # local slope.
     per_slot = [exp_slot_grid(kd) for kd in grid_exp_kinds]
     n_combos = 1
     for g in per_slot:
@@ -2001,7 +2127,16 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
                     best_cost, best_c = res.cost, res.x.tolist()
             except Exception:
                 pass
-    return best_c if best_c is not None else [1.0] * n_consts
+    if best_c is None:
+        return [1.0] * n_consts
+    # A pinned slot comes back within its 1e-6 hairline (3.000000000000105), and
+    # an unpinned one wherever it started.  ``_itp`` already evaluated both as
+    # the snapped integer, so storing that integer changes no value -- it only
+    # makes the constant say what the fit actually used.
+    for pi, kd in zip(grid_exp_indices, grid_exp_kinds):
+        if kd == INTPOWER_OP:
+            best_c[pi] = float(_snap_int_power(best_c[pi]))
+    return best_c
 
 
 def get_traj_horizon(epoch, n_epochs, t_end):
