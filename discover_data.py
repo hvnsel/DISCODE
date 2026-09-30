@@ -428,13 +428,16 @@ def identity_ceiling(system, verbose=True, warn=False):
 
 def print_truth_rewards(system, max_traj=None, w_acc=None,
                         energy_normalize=True, directional_leaves=False,
-                        transcendental=False):
-    """Score the known truth structure of each DOF with the standard reward.
+                        transcendental=False, reward='energy',
+                        sim_window=None, sim_w_vel=0.0):
+    """Score the known truth structure of each DOF with the training reward.
 
     Requires ``system.truth_taus``.  Constants are fitted by the same
-    :func:`discover_core.optimise_consts_energy` the trainer uses, so the number
-    printed is exactly what the search would score if it proposed the truth
-    structure — the target it should converge to.
+    :func:`discover_core.optimise_consts_energy` the trainer uses and scored by
+    the same reward (``reward`` / ``sim_window`` / ``sim_w_vel`` as passed to
+    ``DISCOVER_TRAIN``), so the number printed is exactly what the search
+    would score if it proposed the truth structure — the target it should
+    converge to.
 
     Caveat: the exponents in ``truth_taus`` are FITTED, not pinned.  At small
     amplitudes an exponent is weakly identifiable and the grid can settle away
@@ -450,12 +453,13 @@ def print_truth_rewards(system, max_traj=None, w_acc=None,
     dc.configure_grammar(system.n_dof, system.var_names, directional_leaves,
                          transcendental)
     _X, _y, raw, ns = generate_dataset(system, device=None)
-    # w_acc MUST match the training run or the printed target is not the number
-    # the search is chasing.
+    # w_acc and the reward MUST match the training run or the printed target
+    # is not the number the search is chasing.
     dc.set_problem_data(ns, raw, energy_normalize, max_traj, w_acc)
+    dc.set_reward(reward, sim_window, sim_w_vel)
 
-    print(f"\n[truth] reward of the known structure "
-          f"(max_traj={max_traj}, w_acc={dc.W_ACC:.2f}):")
+    print(f"\n[truth] reward of the known structure (max_traj={max_traj}; "
+          f"{dc.describe_reward()}):")
     out = []
     for d in range(system.n_dof):
         tau = system.truth_taus[d]
@@ -467,7 +471,7 @@ def print_truth_rewards(system, max_traj=None, w_acc=None,
         consts = dc.optimise_consts_energy(tau, d, max_traj=max_traj)
         exprs  = [None] * system.n_dof
         exprs[d] = (tau, consts)
-        r = dc.energy_reward(exprs, max_traj=max_traj, horizon=None)
+        r = dc.candidate_reward(exprs, max_traj=max_traj, horizon=None)
         out.append(r)
         print(f"    DOF {d}: r_truth = {r:.4f}    "
               f"{dc.denormalize_expr(tau, consts, d)}", flush=True)

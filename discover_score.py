@@ -2,7 +2,8 @@
 discover_score.py
 ================
 Score discovered equations with the SAME reward the training loop uses.
-No simulation, no plots — paste expressions in, get the number out.
+No plots — paste expressions in, get the number out.  ``REWARD`` picks which
+of the two training rewards is reproduced.
 
 Paste one physical (denormalised) expression per DOF into ``EXPRS`` — the
 trainer prints a paste-ready ``DISCOVERED_EXPRS`` block when it finishes — point
@@ -29,6 +30,13 @@ What it reports
              can only happen when the disp/vel/acc channels are mutually
              inconsistent (e.g. filtered a different number of times each).
 
+With ``REWARD = 'simulation'`` it reports ``r_sim`` instead: each DOF
+integrated forward on its own from the measured initial state, the other DOFs'
+states read off the record, scored by the NRMSE of its displacement (see
+:mod:`discover_rollout`).  There is no ceiling for that reward.  Use the trials
+the run trained on (its first ``max_traj``) and the same ``SIM_WINDOW`` /
+``SIM_W_VEL`` to get the trained number back.
+
 Note the reward convention: ``1/(1 + mean_d res_d)``, the reward of the mean
 residual, NOT ``mean_d [ 1/(1+res_d) ]``.  The second is always the larger of
 the two.  The per-DOF columns below are printed in the second form for
@@ -43,7 +51,7 @@ import numpy as np
 
 sys.path.insert(0, '.')
 
-from discover_analysis import score_system
+from discover_analysis import score_system, simulation_scores
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ── CONFIG ─────────────────────────────────────────────────────────────────
@@ -67,6 +75,9 @@ SIM_OVERRIDES = {}               # e.g. {'n_traj': 2, 'n_pts': 4000}
 # ── common ─────────────────────────────────────────────────────────────────
 TRIALS           = None          # None = every trial; or e.g. [1, 2]
 ENERGY_NORMALIZE = True
+REWARD           = 'energy'      # 'energy' | 'simulation' — as in the run
+SIM_WINDOW       = None          # simulation: None = one free run per trial
+SIM_W_VEL        = 0.0           # simulation: velocity weight in the NRMSE
 
 # One physical expression per DOF.
 EXPRS = [
@@ -107,7 +118,8 @@ def build_system():
 
 
 def score(exprs=None, system=None, trials=TRIALS, normalize=ENERGY_NORMALIZE,
-          verbose=True):
+          verbose=True, reward=REWARD, sim_window=SIM_WINDOW,
+          sim_w_vel=SIM_W_VEL):
     exprs = EXPRS if exprs is None else exprs
     if not exprs or not any(str(e).strip() for e in exprs):
         print(__doc__.split('What it reports')[0])
@@ -133,6 +145,10 @@ def score(exprs=None, system=None, trials=TRIALS, normalize=ENERGY_NORMALIZE,
             s = s if len(s) <= 88 else s[:88] + ' ...'
             print(f"  DOF{d} ({system.var_names[d]}): {s}")
 
+    if reward == 'simulation':
+        return score_simulation(system, exprs, keep, sim_window, sim_w_vel,
+                                verbose)
+
     r_pred, r_ceil, rows = score_system(system, exprs, normalize=normalize,
                                         trials=keep, verbose=verbose)
 
@@ -156,6 +172,26 @@ def score(exprs=None, system=None, trials=TRIALS, normalize=ENERGY_NORMALIZE,
                   "not the equation")
         print()
     return r_pred, r_ceil
+
+
+def score_simulation(system, exprs, trials, window, w_vel, verbose=True):
+    """The simulation reward, per trial and DOF.  Returns ``(r_sim, None)``."""
+    N = system.n_dof
+    r_sim, rows = simulation_scores(system, exprs, trials=trials,
+                                    window=window, w_vel=w_vel)
+    if verbose:
+        how = ('one free run per trial' if window is None else
+               f'restarted every {window:g} s')
+        print(f"\n  forward simulation, {how}, velocity weight {w_vel:g}")
+        print(f"\n{'trial':>6}"
+              + ''.join(f"{'r DOF'+str(d):>12}" for d in range(N))
+              + f"{'r trial':>11}")
+        for tr, res in rows:
+            print(f"{tr:>6}"
+                  + ''.join(f"{1/(1+res[d]):>12.4f}" for d in range(N))
+                  + f"{1/(1+np.mean(res)):>11.4f}")
+        print(f"\n  r_sim = {r_sim:.4f}      (NRMSE {1/r_sim - 1:.4g})\n")
+    return r_sim, None
 
 
 if __name__ == '__main__':

@@ -448,6 +448,49 @@ def plot_discovered(system, exprs, trial=0, t_end=None, solver='LSODA',
     return {'sol': sol, 'nrmse': nrmse, 'per_dof_rewards': rewards}
 
 
+def simulation_scores(system, exprs, trials=None, window=None, w_vel=0.0):
+    """Score expressions with the SIMULATION reward (``reward='simulation'``),
+    through the same :mod:`discover_rollout` integrator the trainer uses.
+
+    Each DOF is integrated on its own from the measured initial state, the
+    other DOFs' states read off the record.  Pass the trials the run trained
+    on (its first ``max_traj``) to get the trained number back.
+
+    Returns ``(r_sim, rows)`` with ``r_sim = 1 / (1 + mean residual)`` and one
+    ``(trial, residual_per_dof)`` row per trial.
+    """
+    import discover_rollout as ro
+
+    t = np.asarray(system.time, dtype=float)
+    keep = list(range(system.n_trials)) if trials is None else list(trials)
+    N = system.n_dof
+    cleans = clean_exprs(exprs, system.var_names)
+    states = np.stack([
+        np.vstack([row for d in range(N)
+                   for row in (system.disp[:, d, tr], system.vel[:, d, tr])])
+        for tr in keep])                                       # (P, 2N, m)
+    accs = np.stack([system.acc[:, :, tr].T for tr in keep])   # (P, N, m)
+    stride, substeps = ro.auto_steps(t, states, accs)
+
+    per_dof = []
+    for clean in cleans:
+        code = compile(clean, '<expr>', 'eval')
+
+        def accel(S, code=code):
+            ns = dict(_NS_BASE)
+            for d, nm in enumerate(system.var_names):
+                ns[nm] = S[2 * d]
+                ns[nm + 'dot'] = S[2 * d + 1]
+            return eval(code, ns)                              # noqa: S307
+
+        per_dof.append(ro.rollout_residuals(accel, t, states, len(per_dof),
+                                            window=window, stride=stride,
+                                            substeps=substeps, w_vel=w_vel))
+    res = np.array(per_dof).T                                  # (P, N)
+    r_sim = 1.0 / (1.0 + float(np.mean(res)))
+    return r_sim, [(tr, list(res[i])) for i, tr in enumerate(keep)]
+
+
 def score_system(system, exprs, normalize=True, trials=None, verbose=True):
     """Score a set of expressions against a ``SystemData`` with the training
     reward, alongside the ceiling set by the measured acceleration.

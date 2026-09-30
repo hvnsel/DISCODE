@@ -758,6 +758,133 @@ def test_intpower():
          dc.MAX_TRAJ, dc.W_ACC) = saved
 
 
+def test_simulation_reward():
+    """``reward='simulation'``: integrate the candidate forward, score its
+    displacement against the record.
+
+    Every failure here is silent.  A phase error in the integrator reads as a
+    worse equation; a DOF simulated against the wrong partner motion loses its
+    coupling term; a NaN from a diverging candidate poisons the batch ranking;
+    and a pool that scores by a different reward than the parent configured
+    trains on a number nobody sees.  Each is asserted through the real path.
+    """
+    import contextlib
+    import io
+
+    import discover_rollout as ro
+    from discover_analysis import simulation_scores
+    from discover_data import build_truth_system, generate_dataset
+    from discover_mdof_sim import get_mdof_system
+    from discover_sdof_sim import get_sdof_system
+
+    def load(spec, **kw):
+        with contextlib.redirect_stdout(io.StringIO()):
+            system = build_truth_system(spec, **kw)
+        dc.configure_grammar(system.n_dof, system.var_names)
+        _X, _y, raw, _ns = generate_dataset(system, device=None)
+        dc.set_problem_data(_ns, raw, True, None, 0.5)
+        t = raw[0][0]
+        return (system, t, np.stack([r[2] for r in raw]),
+                np.stack([r[3] for r in raw]))
+
+    print("\nsimulation reward")
+    saved = (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+             dc.MAX_TRAJ, dc.W_ACC, dc.REWARD_MODE, dc.SIM_WINDOW, dc.SIM_W_VEL)
+    try:
+        # The integrator alone, on the exact truth function.
+        spec = get_sdof_system('duffing')
+        system, t, states, accs = load(spec, n_traj=2, n_pts=600, t_end=12.0)
+        stride, sub = ro.auto_steps(t, states, accs)
+        res_auto = ro.rollout_residuals(spec.accel_fns[0], t, states, 0,
+                                        stride=stride, substeps=sub)
+        res_each = ro.rollout_residuals(spec.accel_fns[0], t, states, 0)
+        check('RK4 reproduces the record from the exact truth, auto and '
+              'per-sample steps', max(res_auto.max(), res_each.max()) < 1e-4,
+              f"stride={stride} substeps={sub}  residual "
+              f"{res_auto.max():.1e} / {res_each.max():.1e}")
+
+        # Through the engine: the fitted truth against a missing cubic.
+        truth, wrong = (['add', 'x1', 'x2', 'intpower', 'x1', 'end'],
+                        ['add', 'x1', 'x2', 'end'])
+        ct, cw = dc.optimise_consts_energy(truth, 0), dc.optimise_consts_energy(wrong, 0)
+        dc.set_reward('simulation')
+        r_t = dc.candidate_reward([(truth, ct)])
+        r_w = dc.candidate_reward([(wrong, cw)])
+        check('the fitted Duffing truth simulates to r ~ 1, the linear model '
+              'clearly below', r_t > 0.999 and r_w < r_t - 0.05,
+              f"truth {r_t:.6f}  linear {r_w:.4f}")
+        dc.set_reward('simulation', sim_window=2.0)
+        r_tw = dc.candidate_reward([(truth, ct)])
+        r_ww = dc.candidate_reward([(wrong, cw)])
+        check('2 s windows keep the truth at ~1 and forgive part of the '
+              'linear model\'s phase drift', r_tw > 0.999 and r_w < r_ww < r_tw,
+              f"truth {r_tw:.6f}  linear {r_ww:.4f}")
+
+        # The mode switch reaches the worker's scoring path.
+        dc.set_reward('energy')
+        ok_e = abs(dc.candidate_reward([(truth, ct)])
+                   - dc.energy_reward([(truth, ct)])) < 1e-12
+        dc.set_reward('simulation')
+        out = dc.energy_worker((0, truth, None, None))
+        ok_s = (out is not None and
+                abs(out[1] - dc.simulation_reward([(truth, out[3])])) < 1e-12)
+        check('candidate_reward and the pool worker follow set_reward',
+              ok_e and ok_s)
+        try:
+            dc.set_reward('bogus')
+            ok = False
+        except ValueError:
+            ok = True
+        check('an unknown reward name is refused', ok)
+
+        # A diverging equation: a large finite residual, not a NaN.
+        r_bad = dc.candidate_reward([(wrong, [3.0, 2.0])])
+        check('a diverging equation scores small but finite',
+              np.isfinite(r_bad) and 0.0 < r_bad < 0.3, f"r = {r_bad:.4f}")
+
+        # The scoring script reproduces the engine from the printed equation.
+        phys = dc.denormalize_expr(truth, ct, 0)
+        r_an, _rows = simulation_scores(system, [phys])
+        check('discover_score reproduces the trained simulation reward',
+              abs(r_an - r_t) < 1e-3, f"engine {r_t:.6f}  printed {r_an:.6f}")
+
+        # Coupled: each DOF against the partner's MEASURED motion.
+        spec = get_mdof_system('coupled_duffing')
+        system, t, states, accs = load(spec, n_traj=2, n_pts=1000, t_end=10.0)
+        stride, sub = ro.auto_steps(t, states, accs)
+        worst = max(ro.rollout_residuals(spec.accel_fns[d], t, states, d,
+                                         stride=stride, substeps=sub).max()
+                    for d in range(2))
+        check('each DOF of coupled Duffing reproduces the record against the '
+              'measured partner', worst < 1e-3, f"worst residual {worst:.1e}")
+        tau = system.truth_taus[0]
+        c = dc.optimise_consts_energy(tau, 0)
+        r_c = dc.candidate_reward([(tau, c), None])
+        # the coupling term is the bare x3 (= q2) leaf; flip its coefficient
+        slot = sum(dc.CONST_SLOTS.get(tk, 0) for tk in tau[:tau.index('x3')])
+        flipped = list(c)
+        flipped[slot] = -flipped[slot]
+        r_f = dc.candidate_reward([(tau, flipped), None])
+        check('...and a flipped coupling sign is punished',
+              r_c > 0.999 and r_f < r_c - 0.05,
+              f"truth {r_c:.6f}  flipped {r_f:.4f}")
+
+        # A record trimmed at the front starts at t > 0; the full-record
+        # horizon (its duration) must still keep every sample.
+        tt = 0.5 + 0.01 * np.arange(100)
+        traj = (tt, np.zeros(2), np.zeros((2, 100)))
+        n_full = len(dc._slice_traj(traj, tt[-1] - tt[0])[0])
+        n_half = len(dc._slice_traj(traj, 0.5)[0])
+        check('the horizon is measured from the record start, not from t = 0',
+              n_full == 100 and n_half == 51, f"{n_full}, {n_half}")
+    finally:
+        dc.configure_grammar(N_DOF)
+        (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+         dc.MAX_TRAJ, dc.W_ACC) = saved[:5]
+        dc.set_reward(*saved[5:])
+        dc._SIM_DATA.clear()
+
+
 def main():
     dc.configure_grammar(N_DOF)
     print(f"grammar: {dc.ALL_TOKENS}  (N_TOKENS={dc.N_TOKENS})")
@@ -776,6 +903,7 @@ def main():
     test_directional_leaves()
     test_blend()
     test_intpower()
+    test_simulation_reward()
 
     print(f"\n{'=' * 60}")
     print(f"{len(_PASS)} passed, {len(_FAIL)} failed")

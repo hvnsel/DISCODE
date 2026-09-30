@@ -16,8 +16,10 @@ Per epoch:
   1. The policy samples a batch of candidate token sequences per DOF (plus a
      beam-search batch every ``beam_interval`` epochs).
   2. Every candidate has its constants fitted to that DOF's own work-energy
-     balance and is scored by the reward (see :mod:`discover_core`).  The fit
-     and the score are the same closed-form VARPRO path wherever possible.
+     balance and is scored by the chosen reward (``reward='energy'``, the
+     work-energy / acceleration blend, or ``reward='simulation'``, a forward
+     simulation against the record -- see :mod:`discover_core`).  The fit is
+     the same closed-form VARPRO path wherever possible under both.
   3. The top-``alpha`` fraction is promoted into the DOF's replay buffer,
      ranked by a novelty-scaled score but STORED as the raw reward.
   4. The critic and the J-GRPO objective are trained on that buffer.
@@ -38,7 +40,7 @@ rewards incomparable across epochs.  See the docstring of
 :func:`discover_core.energy_worker`.  Only the *policy* is shared; advantages
 are still z-scored within a single DOF's batch.
 
-Buffer entries are ``(energy_reward, tau, consts, context)``.  ``tau`` is the
+Buffer entries are ``(reward, tau, consts, context)``.  ``tau`` is the
 flat assembled sum.  The context records the slice order, this slice's slot,
 and the slices that preceded it — everything the sample could see — so the
 entry stays reproducible in isolation and comparable across epochs.
@@ -80,7 +82,7 @@ class DOFState:
         self.critic     = dc.ExprCritic(vocab_size=dc.VOCAB_SIZE, max_len=max_len, d=64).to(device)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=3e-4)
 
-        # buffer entry: (energy_reward, tau, consts, context)
+        # buffer entry: (reward, tau, consts, context)
         self.buffer     = []
         self.R_alpha    = 0.0
         self.best_r     = -np.inf
@@ -256,6 +258,14 @@ def DISCOVER_TRAIN(
     w_acc            = 0.5,    # 0 = pure work-energy
                                # 1 = pure acceleration NRMSE
                                # blend: residual = (1-w)*energy + w*accel_NRMSE
+                               # (under reward='simulation' it only steers the
+                               # constant fit)
+    reward           = 'energy',   # 'energy' | 'simulation'
+    sim_window       = None,   # simulation: None = one free run per trial,
+                               # a number = restart from the record every
+                               # sim_window seconds
+    sim_w_vel        = 0.0,    # simulation: weight of velocity NRMSE against
+                               # displacement NRMSE
     use_pool         = True,
     center_features  = False,  # see generate_dataset(): scale-only by default
     # ── policy (see discover_policy) ───────────────────────────────────────
@@ -276,6 +286,15 @@ def DISCOVER_TRAIN(
 
     Returns a list of ``(reward, tau, consts, context)`` — the best entry per
     DOF, or ``None`` for a DOF where nothing survived.
+
+    ``reward`` picks what candidates are scored by.  ``'energy'`` is the
+    work-energy residual blended with acceleration NRMSE by ``w_acc``.
+    ``'simulation'`` integrates each candidate forward from the measured
+    initial state -- one DOF at a time, the other DOFs' states read off the
+    record -- and scores the NRMSE of the simulated displacement against the
+    measured one (``sim_w_vel`` blends in velocity; ``sim_window`` restarts
+    the simulation from the record every that many seconds instead of one
+    free run per trial).  Constants are fitted the same way under both.
 
     Two knobs isolate two hypotheses and are worth tracking separately:
 
@@ -308,7 +327,7 @@ def DISCOVER_TRAIN(
     if transcendental:
         print(f"[vocab]  blend(u) = e^(a u)(c1 cos(b u) + c2 sin(b u)): "
               f"a grid {dc.BLEND_A_GRID}, b grid {dc.BLEND_B_GRID}")
-    print(f"[config] System='{system.name}'  N_DOF={N}  reward=work-energy")
+    print(f"[config] System='{system.name}'  N_DOF={N}  reward={reward}")
     print(f"[config] {len(system.time)} pts  {system.t_end:.4g} s  "
           f"{(len(system.time)-1)/system.t_end:.0f} Hz eff  "
           f"{system.n_trials} trials")
@@ -316,12 +335,12 @@ def DISCOVER_TRAIN(
     X_torch, y_list, raw_trajs, norm_stats = generate_dataset(
         system, device, center=center_features)
     dc.set_problem_data(norm_stats, raw_trajs, energy_normalize, max_traj, w_acc)
-    print(f"[config] reward blend: w_acc={dc.W_ACC:.2f} "
-          f"({(1-dc.W_ACC):.2f} work-energy + {dc.W_ACC:.2f} accel-NRMSE)")
+    dc.set_reward(reward, sim_window, sim_w_vel)
+    print(f"[config] reward: {dc.describe_reward()}")
     print(f"[config] trajectories used per fit/score: {dc.MAX_TRAJ} "
           f"of {len(raw_trajs)} available\n")
 
-    # Energy-scoring pool (static data injected once).
+    # Scoring pool (static data injected once).
     pool = None
     if use_pool:
         pool = ProcessPoolExecutor(
@@ -329,9 +348,9 @@ def DISCOVER_TRAIN(
             initializer=dc.init_energy_worker,
             initargs=(N, system.var_names, norm_stats, raw_trajs,
                       energy_normalize, max_traj, w_acc, directional_leaves,
-                      transcendental),
+                      transcendental, reward, sim_window, sim_w_vel),
         )
-        print(f"Energy-scoring pool : {N_WORKERS} workers\n")
+        print(f"Scoring pool : {N_WORKERS} workers\n")
 
     states = [DOFState(max_len, device) for _ in range(N)]
     ps = PolicyState(N, lr, n_epochs, device,
@@ -371,7 +390,7 @@ def DISCOVER_TRAIN(
         print(f"  [1-sample]   {batch_size} exprs/DOF  ({time.time()-t1:.2f}s)")
         sys.stdout.flush()
 
-        # ── Step 2: Energy scoring (each DOF scored in isolation) ───────────
+        # ── Step 2: Scoring (each DOF scored in isolation) ──────────────────
         # Contexts never go to the workers — they have no policy and no use for
         # them, and shipping them would inflate the pickling cost per
         # candidate.  ``pool.map`` preserves order, so they zip back by index.
@@ -382,7 +401,8 @@ def DISCOVER_TRAIN(
                 tasks.append((i, tau, None, horizon))
                 ctxs.append(ctx)
         n_tasks = len(tasks)
-        print(f"  [2-energy]   {n_tasks} candidates queued "
+        stage = f"2-{dc.reward_label()}"
+        print(f"  [{stage}]   {n_tasks} candidates queued "
               f"({'pool' if pool else 'serial'}) ...", flush=True)
 
         report_every = max(1, n_tasks // 20)  # ~5% granularity
@@ -396,7 +416,7 @@ def DISCOVER_TRAIN(
                 elapsed = time.time() - t_score0
                 rate = k / elapsed if elapsed > 0 else 0.0
                 eta = (n_tasks - k) / rate if rate > 0 else 0.0
-                print(f"    [2-energy]   {k}/{n_tasks} scored "
+                print(f"    [{stage}]   {k}/{n_tasks} scored "
                       f"({100.0*k/n_tasks:5.1f}%)  "
                       f"{rate:6.1f} eq/s  ETA {eta:6.1f}s", flush=True)
 
@@ -406,7 +426,7 @@ def DISCOVER_TRAIN(
                 continue
             tgt, r, tau, c = res
             per_dof[tgt].append((r, tau, c, ctxs[k]))
-        print(f"  [2-energy]   scored  ({time.time()-t1:.2f}s)", flush=True)
+        print(f"  [{stage}]   scored  ({time.time()-t1:.2f}s)", flush=True)
 
         # ── Step 3: promotion + buffer update + train ───────────────────────
         # Promotion and the critic are per-DOF; the policy update is not (the
@@ -487,9 +507,10 @@ def DISCOVER_TRAIN(
         print(f"\n  [EPOCH TOTAL]  {time.time() - t0_ep:.1f}s")
         for i, st in enumerate(states):
             if st.best_entry is None:
-                print(f"   DOF {i}: (no energy survivor yet)"); continue
+                print(f"   DOF {i}: (no survivor yet)"); continue
             be = st.best_entry
-            print(f"   DOF {i}: best_energy={st.best_r:.4f}  {dc.expr_to_str(be[1], be[2])}")
+            print(f"   DOF {i}: best_{dc.reward_label()}={st.best_r:.4f}  "
+                  f"{dc.expr_to_str(be[1], be[2])}")
             d = dc.denormalize_expr(be[1], be[2], i)
             if d:
                 print(f"          denorm: {d}")
@@ -505,7 +526,7 @@ def DISCOVER_TRAIN(
         best_per_dof.append(best)
         print(f"\nDOF {i}")
         print(f"  Expr (normalised) : {dc.expr_to_str(best[1], best[2])}")
-        print(f"  energy_reward     : {best[0]:.6f}")
+        print(f"  {dc.reward_label() + '_reward':<18}: {best[0]:.6f}")
         if system.truth_strs[i] != 'unknown':
             print(f"  Truth             : {system.truth_strs[i]}")
         d = dc.denormalize_expr(best[1], best[2], i)
@@ -514,7 +535,7 @@ def DISCOVER_TRAIN(
         print(f"  --- Hall of Fame (top {len(st.hof)}) ---")
         for rank, hof in enumerate(st.hof, 1):
             dh = dc.denormalize_expr(hof[1], hof[2], i)
-            print(f"    #{rank}: energy={hof[0]:.4f}  "
+            print(f"    #{rank}: {dc.reward_label()}={hof[0]:.4f}  "
                   f"{dh if dh else dc.expr_to_str(hof[1], hof[2])}")
 
     # Paste-ready block for discover_score.py / discover_plot_*.py
