@@ -53,7 +53,10 @@ def DISCOVER_EDIT_SIM(
                             w_acc=train_kwargs.get('w_acc', 0.5),
                             energy_normalize=train_kwargs.get('energy_normalize', True),
                             directional_leaves=train_kwargs.get('directional_leaves', False),
-                            transcendental=train_kwargs.get('transcendental', False))
+                            transcendental=train_kwargs.get('transcendental', False),
+                            reward=train_kwargs.get('reward', 'energy'),
+                            sim_window=train_kwargs.get('sim_window'),
+                            sim_w_vel=train_kwargs.get('sim_w_vel', 0.0))
     return DISCOVER_EDIT_TRAIN(system, seed=seed_policy, **train_kwargs)
 
 

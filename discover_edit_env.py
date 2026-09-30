@@ -54,8 +54,9 @@ Reward
 ------
     score(s) = -log(E(s)) - lam * n_consts(s)            r = 1 / (1 + E)
 
-``E`` is the residual behind the standard reward, so ``-log E`` is
-:func:`discover_core.log_residual_score` in closed form.  It spreads the near-1
+``E`` is the residual behind the configured reward (the work-energy blend by
+default, the forward-simulation NRMSE under ``reward='simulation'``), so
+``-log E`` is :func:`discover_core.log_residual_score` in closed form.  It spreads the near-1
 end of ``r``, where every useful comparison lives: on duffing the linear part
 scores 1.33 and the truth 10.52.  Each move is paid ``score(s') - score(s)``,
 which telescopes, so with gamma = 1 an episode's return is its final score
@@ -387,6 +388,9 @@ def score_job(job):
 
     ``job = (dof, canonical_bag, want_features)``.  The empty bag is the mean
     model -- normalised prediction 0, i.e. the mean measured acceleration.
+    ``E`` is the residual of whichever reward :func:`discover_core.set_reward`
+    chose -- work-energy, or forward-simulation NRMSE -- recovered from
+    ``r = 1/(1 + E)``.
     """
     dof, canon, want_feats = job
     if canon:
@@ -397,7 +401,7 @@ def score_job(job):
         tau, consts, n_consts = ['const'], [0.0], 0
     exprs = [None] * dc.N_DOF
     exprs[dof] = (tau, consts)
-    r = dc.energy_reward(exprs)
+    r = dc.candidate_reward(exprs)
     E = (1.0 / r - 1.0) if r > 0.0 else np.inf
     feats = residual_features(tau, consts, dof) if want_feats else None
     return dof, canon, float(E), int(n_consts), tau, consts, feats

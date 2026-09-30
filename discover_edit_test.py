@@ -354,10 +354,31 @@ def test_smoke_training():
           out['best'][0]['expr'] if out['best'][0] else '')
 
 
+def test_simulation_reward():
+    """``reward='simulation'`` reaches the edit objective: the scorer's ``E``
+    is the forward-simulation residual, not the energy one."""
+    print("\nsimulation reward")
+    system = load(get_sdof_system, 'duffing', n_traj=2, n_pts=600, t_end=12.0)
+    try:
+        dc.set_reward('simulation')
+        sc = ee.Scorer(ee.EditSpec())
+        truth = ee.bag_from_tau(system.truth_taus[0])
+        s = sc.get(0, truth)
+        r = dc.simulation_reward([(s.tau, s.consts)])
+        check("under reward='simulation' the scorer's E is the simulation "
+              "residual", abs(s.E - (1.0 / r - 1.0)) < 1e-12, f"E = {s.E:.2e}")
+        t_score, l_score = sc.value(0, truth), sc.value(0, (('x1',), ('x2',)))
+        check('...and the truth still outscores the linear model',
+              t_score > l_score + 1.0, f"{t_score:.2f} vs {l_score:.2f}")
+    finally:
+        dc.set_reward('energy')
+
+
 def main():
     test_moves()
     test_canonical()
     test_scoring()
+    test_simulation_reward()
     test_truth_reachable()
     test_policy()
     test_gae()
