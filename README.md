@@ -28,7 +28,7 @@ committed for the others. See [Policy architecture](#policy-architecture).
 | file | what it does |
 |---|---|
 | `discover_sdof_sim.py` | 1-DOF demo on a synthetic system (Duffing / linear / Van der Pol) |
-| `discover_mdof_sim.py` | N-DOF demo on a synthetic system (coupled Duffing, 3-mass chain, cubic-coupled) |
+| `discover_mdof_sim.py` | N-DOF demo on a synthetic system (coupled Duffing, 3-mass chain, cubic-coupled, coupled beats) |
 | `discover_sdof_exp.py` | one channel of an experimental `.mat` record |
 | `discover_mdof_exp.py` | the full experimental record — the real target |
 

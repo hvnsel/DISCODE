@@ -8,8 +8,9 @@ the same ``SystemData`` and leaves the existing trainer untouched.
 
 One iteration
 -------------
-1. Rollout.  ``n_envs`` episodes in lockstep, DOFs dealt round-robin, each
-   starting from the empty equation.  At every step the policy picks a legal
+1. Rollout.  ``n_envs`` episodes in lockstep, DOFs dealt round-robin, most
+   starting from the empty equation and ``restart_frac`` of them from one of
+   the DOF's best equations so far.  At every step the policy picks a legal
    move for every live episode, the new equations are fitted and scored in one
    batch (cache first, then the worker pool), and each move is paid the change
    in score (:mod:`discover_edit_env`).  An episode ends on STOP or after
@@ -158,19 +159,20 @@ class EliteBuffer:
 
 
 # ── rollout ─────────────────────────────────────────────────────────────────
-def rollout(policy, spec, scorer, dofs, greedy=False):
-    """Play one episode per entry of ``dofs`` (the DOF each episode edits).
+def rollout(policy, spec, scorer, dofs, greedy=False, starts=None):
+    """Play one episode per entry of ``dofs`` (the DOF each episode edits),
+    each from the empty equation or from its entry in ``starts``.
 
     Returns ``(episodes, finals, visited)``: per episode the list of its
     transitions ``{'obs', 'action', 'logp', 'value', 'reward'}``, the bag each
     episode ended on, and every ``(dof, bag)`` any move produced.
     """
     n = len(dofs)
-    terms = [()] * n
+    terms = [tuple(s) for s in starts] if starts is not None else [()] * n
     alive = [True] * n
     episodes = [[] for _ in range(n)]
     visited = []
-    scorer.score_many([(d, ()) for d in sorted(set(dofs))])
+    scorer.score_many([(dofs[b], terms[b]) for b in range(n)])
     for t in range(spec.max_steps):
         idx = [b for b in range(n) if alive[b]]
         if not idx:
@@ -242,6 +244,20 @@ def make_batch(episodes, lam):
             torch.tensor(rets, dtype=torch.float32))
 
 
+def normalise_per_dof(adv, dof):
+    """Standardise advantages within each DOF, never across DOFs -- the same
+    rule DISCOVER_TRAIN follows.  Once one DOF finds its truth its returns are
+    ~6 while an unsolved DOF's are ~0, and a pooled normalisation hands the
+    solved DOF the whole gradient: coupled Duffing's DOF 0 stalled on
+    ``xddot = -0.04*xdot`` for 80 iterations after DOF 1 converged."""
+    adv = adv.clone()
+    for d in torch.unique(dof):
+        m = dof == d
+        if int(m.sum()) > 1:
+            adv[m] = (adv[m] - adv[m].mean()) / (adv[m].std() + 1e-8)
+    return adv
+
+
 def ppo_update(policy, opt, batch, epochs=4, minibatch_size=256, clip_eps=0.2,
                vf_coef=0.5, ent_coef=0.01, max_grad_norm=0.5, elite=None,
                sil_coef=1.0, sil_value_coef=0.01, sil_batch=64, rng=None):
@@ -250,7 +266,7 @@ def ppo_update(policy, opt, batch, epochs=4, minibatch_size=256, clip_eps=0.2,
     ``(policy_loss, value_loss, entropy, approx_kl, clip_fraction, sil_loss)``."""
     obs, acts, old_logp, adv, ret = batch
     n = len(acts)
-    adv = (adv - adv.mean()) / (adv.std() + 1e-8) if n > 1 else adv
+    adv = normalise_per_dof(adv, obs[3])
     rng = np.random.default_rng() if rng is None else rng
     stats = []
     for _ in range(epochs):
@@ -341,6 +357,9 @@ def DISCOVER_EDIT_TRAIN(
     sil_value_coef     = 0.01,
     sil_batch          = 64,
     sil_episodes       = 16,      # best episodes kept per DOF
+    # restarts: this fraction of episodes starts from a hall-of-fame equation
+    restart_frac       = 0.25,
+    restart_top        = 8,       # ...drawn from the DOF's best this many
     # policy
     d_model            = 64,
     n_heads            = 4,
@@ -406,7 +425,18 @@ def DISCOVER_EDIT_TRAIN(
         for it in range(n_iters):
             t0 = time.time()
             fits_before = scorer.n_fits
-            episodes, finals, visited = rollout(policy, spec, scorer, dofs)
+            # Restarts.  An equation already found stays in the hall of fame,
+            # but nothing edits it again unless an episode starts there:
+            # coupled Duffing's DOF 0 kept x + xdot + y plus junk as its best
+            # for 80 iterations without ever cleaning it up.  Starting a share
+            # of episodes from the best few equations refines them directly.
+            starts = []
+            for d in dofs:
+                top = hofs[d].top(restart_top) if hofs[d].best else []
+                starts.append(top[rng.integers(len(top))][0]
+                              if top and rng.random() < restart_frac else ())
+            episodes, finals, visited = rollout(policy, spec, scorer, dofs,
+                                                starts=starts)
             for d, bag in visited:
                 hofs[d].add(bag, scorer.value(d, bag))
             elite.add(episodes, finals, dofs, scorer)
@@ -417,9 +447,11 @@ def DISCOVER_EDIT_TRAIN(
                 sil_value_coef, sil_batch, rng)
 
             ret = float(np.mean([sum(s['reward'] for s in ep) for ep in episodes]))
+            # the policy's own level: episodes that started from scratch
             final = []
             for d in range(N):
-                v = [scorer.value(d, f) for f, dd in zip(finals, dofs) if dd == d]
+                v = [scorer.value(d, f) for f, dd, s0 in zip(finals, dofs, starts)
+                     if dd == d and not s0]
                 final.append(float(np.mean(v)) if v else float('nan'))
             best = [hofs[d].top(1)[0][1] if hofs[d].best else -np.inf
                     for d in range(N)]

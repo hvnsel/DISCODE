@@ -198,7 +198,8 @@ def test_truth_reachable():
     for fn, key in ((get_sdof_system, 'duffing'), (get_sdof_system, 'vanderpol'),
                     (get_mdof_system, 'coupled_duffing'),
                     (get_mdof_system, 'duffing_chain3'),
-                    (get_mdof_system, 'cubic_coupled')):
+                    (get_mdof_system, 'cubic_coupled'),
+                    (get_mdof_system, 'coupled_beats')):
         sysd = fn(key)
         dc.configure_grammar(len(sysd.accel_fns), sysd.var_names)
         sp = ee.EditSpec()
@@ -282,6 +283,36 @@ def test_gae():
     check('lambda = 1 gives the Monte-Carlo return-to-go', np.allclose(ret1, [3.0, 2.0]))
 
 
+def test_per_dof_advantages():
+    print("\nper-DOF advantage normalisation")
+    adv = torch.tensor([6.0, 7.0, 8.0, 0.01, 0.02, 0.03])
+    dof = torch.tensor([1, 1, 1, 0, 0, 0])
+    out = et.normalise_per_dof(adv, dof)
+    ok = all(abs(float(out[dof == d].mean())) < 1e-6
+             and abs(float(out[dof == d].std()) - 1.0) < 1e-4 for d in (0, 1))
+    check("each DOF's advantages are standardised on their own", ok,
+          f"{out.numpy().round(3)}")
+    check("...so the unsolved DOF keeps a full-size gradient",
+          abs(float(out[3]) - float(out[0])) < 1e-4)
+
+
+def test_restarts():
+    print("\nrestarts")
+    load(get_sdof_system, 'duffing', n_traj=2, n_pts=600, t_end=12.0)
+    spec = ee.EditSpec()
+    sc = ee.Scorer(spec)
+    torch.manual_seed(0)
+    pol = EditPolicy.for_spec(spec, dc.N_TOKENS, ee.n_global_features(True),
+                              d_model=32, n_layers=1)
+    start = (('x1',), ('x2',))
+    eps, finals, _v = et.rollout(pol, spec, sc, [0, 0], starts=[start, ()])
+    first = [e[0]['obs'][1].sum() for e in eps]
+    check('an episode can start from a given equation, the others from empty',
+          int(first[0]) == len(start) and int(first[1]) == 0, f"{first}")
+    check('...and every episode still ends on a legal equation',
+          all(spec.reachable(f) for f in finals))
+
+
 def test_elite_buffer():
     print("\nself-imitation buffer")
 
@@ -331,6 +362,8 @@ def main():
     test_policy()
     test_gae()
     test_elite_buffer()
+    test_per_dof_advantages()
+    test_restarts()
     test_smoke_training()
     print(f"\n{'=' * 60}")
     print(f"{len(_PASS)} passed, {len(_FAIL)} failed")

@@ -3,10 +3,10 @@ discover_edit_sim.py
 ====================
 
 PROTOTYPE ADD-ON.  Runs the move-based PPO agent (:mod:`discover_edit_train`)
-on a simulated system from the EXISTING libraries -- ``duffing``, ``linear``
-and ``vanderpol`` from :mod:`discover_sdof_sim`, ``coupled_duffing``,
-``duffing_chain3`` and ``cubic_coupled`` from :mod:`discover_mdof_sim` -- so
-its results line up one-for-one with the term-bag trainer's on the same data.
+on a simulated system from the EXISTING libraries -- any key of
+:mod:`discover_sdof_sim`'s or :mod:`discover_mdof_sim`'s registry (``duffing``,
+``vanderpol``, ``coupled_duffing``, ``coupled_beats``, ...) -- so its results
+line up one-for-one with the term-bag trainer's on the same data.
 
     python discover_edit_sim.py
 
@@ -17,22 +17,19 @@ paste-ready ``DISCOVERED_EXPRS`` block as the other drivers.
 
 from __future__ import annotations
 
+import discover_mdof_sim
+import discover_sdof_sim
 from discover_data import build_truth_system, print_truth_rewards
 from discover_edit_train import DISCOVER_EDIT_TRAIN
-from discover_mdof_sim import get_mdof_system
-from discover_sdof_sim import get_sdof_system
-
-SDOF_KEYS = ('duffing', 'linear', 'vanderpol')
-MDOF_KEYS = ('coupled_duffing', 'duffing_chain3', 'cubic_coupled')
 
 
 def get_system(key):
-    if key in SDOF_KEYS:
-        return get_sdof_system(key)
-    if key in MDOF_KEYS:
-        return get_mdof_system(key)
+    """A system spec from either registry, so new systems need no change here."""
+    for lib in (discover_sdof_sim, discover_mdof_sim):
+        if key in lib._REGISTRY:
+            return lib._REGISTRY[key]()
     raise ValueError(f"Unknown system '{key}'. Choose from "
-                     f"{sorted(SDOF_KEYS + MDOF_KEYS)}.")
+                     f"{sorted(discover_sdof_sim._REGISTRY) + sorted(discover_mdof_sim._REGISTRY)}.")
 
 
 def DISCOVER_EDIT_SIM(
@@ -41,7 +38,8 @@ def DISCOVER_EDIT_SIM(
     n_traj      = None,
     t_end       = None,
     n_pts       = None,
-    seed        = None,
+    seed        = None,       # the DATA seed, as in the other drivers
+    seed_policy = 0,          # the training seed (policy init, sampling)
     show_truth  = True,
     # everything else goes straight to DISCOVER_EDIT_TRAIN
     **train_kwargs,
@@ -56,7 +54,7 @@ def DISCOVER_EDIT_SIM(
                             energy_normalize=train_kwargs.get('energy_normalize', True),
                             directional_leaves=train_kwargs.get('directional_leaves', False),
                             transcendental=train_kwargs.get('transcendental', False))
-    return DISCOVER_EDIT_TRAIN(system, **train_kwargs)
+    return DISCOVER_EDIT_TRAIN(system, seed=seed_policy, **train_kwargs)
 
 
 if __name__ == '__main__':
