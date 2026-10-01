@@ -33,12 +33,14 @@ stacked least-squares solve, so it keeps the closed-form constant fit.
 ``reward='simulation'``
 -----------------------
 Instead of the balance, each candidate is integrated forward from the measured
-initial state and scored by the NRMSE of its displacement against the record
-(:mod:`discover_rollout`).  That needs no derivative relation between the
-channels, only the initial velocity, so it is the reward to try when the
-ceiling is low.  The ceiling bounds the energy reward only and is not printed
-under it.  ``sim_window`` restarts the simulation from the record every that
-many seconds instead of one free run per trial.
+initial state and scored by the NRMSEs of its simulated displacement, velocity
+and acceleration against the record, weighted by ``sim_weights`` (summing to
+1; displacement only by default -- see :mod:`discover_rollout`).  Scored on
+displacement it needs no derivative relation between the channels, only the
+initial velocity, so it is the reward to try when the ceiling is low.  The
+ceiling bounds the energy reward only and is not printed under it.
+``sim_window`` restarts the simulation from the record every that many seconds
+instead of one free run per trial.
 """
 
 from __future__ import annotations
@@ -78,7 +80,8 @@ def DISCOVER_MDOF_EXP(
     reward           = 'energy',   # 'energy' | 'simulation'
     sim_window       = None,       # simulation: None = one free run per trial,
                                    #   else restart from the record every N s
-    sim_w_vel        = 0.0,        # simulation: velocity weight in the NRMSE
+    sim_weights      = (1.0, 0.0, 0.0),  # simulation: (disp, vel, acc) NRMSE
+                                   #   weights, summing to 1
     use_pool         = True,
     # policy (see DISCOVER_TRAIN)
     cross_slice_attention = True,
@@ -135,7 +138,7 @@ def DISCOVER_MDOF_EXP(
         w_acc            = w_acc,
         reward           = reward,
         sim_window       = sim_window,
-        sim_w_vel        = sim_w_vel,
+        sim_weights      = sim_weights,
         use_pool         = use_pool,
         cross_slice_attention = cross_slice_attention,
         n_layers              = n_layers,

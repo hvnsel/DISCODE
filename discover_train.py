@@ -264,8 +264,9 @@ def DISCOVER_TRAIN(
     sim_window       = None,   # simulation: None = one free run per trial,
                                # a number = restart from the record every
                                # sim_window seconds
-    sim_w_vel        = 0.0,    # simulation: weight of velocity NRMSE against
-                               # displacement NRMSE
+    sim_weights      = (1.0, 0.0, 0.0),  # simulation: NRMSE weights of
+                               # (displacement, velocity, acceleration),
+                               # non-negative and summing to 1
     use_pool         = True,
     center_features  = False,  # see generate_dataset(): scale-only by default
     # ── policy (see discover_policy) ───────────────────────────────────────
@@ -291,10 +292,12 @@ def DISCOVER_TRAIN(
     work-energy residual blended with acceleration NRMSE by ``w_acc``.
     ``'simulation'`` integrates each candidate forward from the measured
     initial state -- one DOF at a time, the other DOFs' states read off the
-    record -- and scores the NRMSE of the simulated displacement against the
-    measured one (``sim_w_vel`` blends in velocity; ``sim_window`` restarts
-    the simulation from the record every that many seconds instead of one
-    free run per trial).  Constants are fitted the same way under both.
+    record -- and scores ``w_q*NRMSE(q) + w_v*NRMSE(qdot) + w_a*NRMSE(a)``
+    against the record, ``sim_weights = (w_q, w_v, w_a)`` summing to 1 (the
+    acceleration is the equation's own along its simulated trajectory).
+    ``sim_window`` restarts the simulation from the record every that many
+    seconds instead of one free run per trial.  Constants are fitted the same
+    way under both.
 
     Two knobs isolate two hypotheses and are worth tracking separately:
 
@@ -335,7 +338,7 @@ def DISCOVER_TRAIN(
     X_torch, y_list, raw_trajs, norm_stats = generate_dataset(
         system, device, center=center_features)
     dc.set_problem_data(norm_stats, raw_trajs, energy_normalize, max_traj, w_acc)
-    dc.set_reward(reward, sim_window, sim_w_vel)
+    dc.set_reward(reward, sim_window, sim_weights)
     print(f"[config] reward: {dc.describe_reward()}")
     print(f"[config] trajectories used per fit/score: {dc.MAX_TRAJ} "
           f"of {len(raw_trajs)} available\n")
@@ -348,7 +351,7 @@ def DISCOVER_TRAIN(
             initializer=dc.init_energy_worker,
             initargs=(N, system.var_names, norm_stats, raw_trajs,
                       energy_normalize, max_traj, w_acc, directional_leaves,
-                      transcendental, reward, sim_window, sim_w_vel),
+                      transcendental, reward, sim_window, sim_weights),
         )
         print(f"Scoring pool : {N_WORKERS} workers\n")
 

@@ -429,12 +429,12 @@ def identity_ceiling(system, verbose=True, warn=False):
 def print_truth_rewards(system, max_traj=None, w_acc=None,
                         energy_normalize=True, directional_leaves=False,
                         transcendental=False, reward='energy',
-                        sim_window=None, sim_w_vel=0.0):
+                        sim_window=None, sim_weights=(1.0, 0.0, 0.0)):
     """Score the known truth structure of each DOF with the training reward.
 
     Requires ``system.truth_taus``.  Constants are fitted by the same
     :func:`discover_core.optimise_consts_energy` the trainer uses and scored by
-    the same reward (``reward`` / ``sim_window`` / ``sim_w_vel`` as passed to
+    the same reward (``reward`` / ``sim_window`` / ``sim_weights`` as passed to
     ``DISCOVER_TRAIN``), so the number printed is exactly what the search
     would score if it proposed the truth structure — the target it should
     converge to.
@@ -456,7 +456,7 @@ def print_truth_rewards(system, max_traj=None, w_acc=None,
     # w_acc and the reward MUST match the training run or the printed target
     # is not the number the search is chasing.
     dc.set_problem_data(ns, raw, energy_normalize, max_traj, w_acc)
-    dc.set_reward(reward, sim_window, sim_w_vel)
+    dc.set_reward(reward, sim_window, sim_weights)
 
     print(f"\n[truth] reward of the known structure (max_traj={max_traj}; "
           f"{dc.describe_reward()}):")
