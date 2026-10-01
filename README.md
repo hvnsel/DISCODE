@@ -98,7 +98,7 @@ Every driver and `DISCOVER_TRAIN` take `reward`:
 | `reward` | a candidate is scored by |
 |---|---|
 | `'energy'` (default) | the work-energy residual blended with acceleration NRMSE by `w_acc`, on the measured states (above) |
-| `'simulation'` | integrating it forward from the measured initial state and taking the NRMSE of its simulated displacement against the measured one |
+| `'simulation'` | integrating it forward from the measured initial state and taking the weighted NRMSEs of its simulated displacement, velocity and acceleration against the measured ones (displacement only by default) |
 
 Both map a residual `e` to `r = 1/(1+e)` and both are per DOF, so everything
 after the score — buffers, GRPO, the hall of fame — is shared. The constants are
@@ -118,7 +118,7 @@ Two more knobs, used only by `'simulation'`:
 | knob | default | what it does |
 |---|---|---|
 | `sim_window` | `None` | `None` is one free run per trial, from its first sample to its last. A number restarts the simulation from the measured state every that many seconds (multiple shooting). A small frequency error then costs a bounded phase error per window instead of one that grows over the whole record, and it runs faster |
-| `sim_w_vel` | `0.0` | blends velocity NRMSE into the displacement NRMSE: `(1-w)*NRMSE(q) + w*NRMSE(qdot)` |
+| `sim_weights` | `(1.0, 0.0, 0.0)` | the NRMSE weights of (displacement, velocity, acceleration): `w_q*NRMSE(q) + w_v*NRMSE(qdot) + w_a*NRMSE(qddot)`. Non-negative and summing to 1, or the run refuses to start. The acceleration is the equation's own along its simulated trajectory, its right-hand side at the simulated state, compared with the measured acceleration |
 
 The integrator is RK4 on the record's own samples. The step is sized from the
 data: at least 50 steps per cycle of the fastest measured motion, so an
@@ -132,7 +132,7 @@ reward. Both rewards share the constant fit, which usually costs more: on an
 untrained policy's free-grammar candidates its median was 0.3 s.
 
 To score pasted equations with it afterwards, set `REWARD = 'simulation'` (and
-the same `SIM_WINDOW` / `SIM_W_VEL`) in `discover_score.py`.
+the same `SIM_WINDOW` / `SIM_WEIGHTS`) in `discover_score.py`.
 
 ## Policy architecture
 

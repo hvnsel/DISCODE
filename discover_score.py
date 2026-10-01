@@ -35,7 +35,7 @@ integrated forward on its own from the measured initial state, the other DOFs'
 states read off the record, scored by the NRMSE of its displacement (see
 :mod:`discover_rollout`).  There is no ceiling for that reward.  Use the trials
 the run trained on (its first ``max_traj``) and the same ``SIM_WINDOW`` /
-``SIM_W_VEL`` to get the trained number back.
+``SIM_WEIGHTS`` to get the trained number back.
 
 Note the reward convention: ``1/(1 + mean_d res_d)``, the reward of the mean
 residual, NOT ``mean_d [ 1/(1+res_d) ]``.  The second is always the larger of
@@ -77,7 +77,8 @@ TRIALS           = None          # None = every trial; or e.g. [1, 2]
 ENERGY_NORMALIZE = True
 REWARD           = 'energy'      # 'energy' | 'simulation' — as in the run
 SIM_WINDOW       = None          # simulation: None = one free run per trial
-SIM_W_VEL        = 0.0           # simulation: velocity weight in the NRMSE
+SIM_WEIGHTS      = (1.0, 0.0, 0.0)   # simulation: (disp, vel, acc) NRMSE
+                                     # weights, summing to 1
 
 # One physical expression per DOF.
 EXPRS = [
@@ -119,7 +120,7 @@ def build_system():
 
 def score(exprs=None, system=None, trials=TRIALS, normalize=ENERGY_NORMALIZE,
           verbose=True, reward=REWARD, sim_window=SIM_WINDOW,
-          sim_w_vel=SIM_W_VEL):
+          sim_weights=SIM_WEIGHTS):
     exprs = EXPRS if exprs is None else exprs
     if not exprs or not any(str(e).strip() for e in exprs):
         print(__doc__.split('What it reports')[0])
@@ -146,7 +147,7 @@ def score(exprs=None, system=None, trials=TRIALS, normalize=ENERGY_NORMALIZE,
             print(f"  DOF{d} ({system.var_names[d]}): {s}")
 
     if reward == 'simulation':
-        return score_simulation(system, exprs, keep, sim_window, sim_w_vel,
+        return score_simulation(system, exprs, keep, sim_window, sim_weights,
                                 verbose)
 
     r_pred, r_ceil, rows = score_system(system, exprs, normalize=normalize,
@@ -174,15 +175,16 @@ def score(exprs=None, system=None, trials=TRIALS, normalize=ENERGY_NORMALIZE,
     return r_pred, r_ceil
 
 
-def score_simulation(system, exprs, trials, window, w_vel, verbose=True):
+def score_simulation(system, exprs, trials, window, weights, verbose=True):
     """The simulation reward, per trial and DOF.  Returns ``(r_sim, None)``."""
     N = system.n_dof
     r_sim, rows = simulation_scores(system, exprs, trials=trials,
-                                    window=window, w_vel=w_vel)
+                                    window=window, weights=weights)
     if verbose:
         how = ('one free run per trial' if window is None else
                f'restarted every {window:g} s')
-        print(f"\n  forward simulation, {how}, velocity weight {w_vel:g}")
+        print(f"\n  forward simulation, {how}, NRMSE weights "
+              f"(disp, vel, acc) = {tuple(weights)}")
         print(f"\n{'trial':>6}"
               + ''.join(f"{'r DOF'+str(d):>12}" for d in range(N))
               + f"{'r trial':>11}")

@@ -789,7 +789,8 @@ def test_simulation_reward():
 
     print("\nsimulation reward")
     saved = (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
-             dc.MAX_TRAJ, dc.W_ACC, dc.REWARD_MODE, dc.SIM_WINDOW, dc.SIM_W_VEL)
+             dc.MAX_TRAJ, dc.W_ACC, dc.REWARD_MODE, dc.SIM_WINDOW,
+             dc.SIM_WEIGHTS)
     try:
         # The integrator alone, on the exact truth function.
         spec = get_sdof_system('duffing')
@@ -802,6 +803,40 @@ def test_simulation_reward():
               'per-sample steps', max(res_auto.max(), res_each.max()) < 1e-4,
               f"stride={stride} substeps={sub}  residual "
               f"{res_auto.max():.1e} / {res_each.max():.1e}")
+        res_v = ro.rollout_residuals(spec.accel_fns[0], t, states, 0,
+                                     stride=stride, substeps=sub,
+                                     weights=(0, 1, 0))
+        res_a = ro.rollout_residuals(spec.accel_fns[0], t, states, 0,
+                                     stride=stride, substeps=sub,
+                                     weights=(0, 0, 1), accs=accs)
+        check('...its simulated velocity and acceleration match the record '
+              'too', max(res_v.max(), res_a.max()) < 1e-4,
+              f"velocity {res_v.max():.1e}  acceleration {res_a.max():.1e}")
+
+        # The weights: three, non-negative, summing to 1 -- and the residual
+        # is exactly their weighted sum of the per-channel NRMSEs.
+        bad_ok = True
+        for bad in ((0.5, 0.5, 0.5), (1.2, -0.2, 0.0), (1.0, 0.0), (0.5, 0.5, None)):
+            try:
+                dc.set_reward('simulation', sim_weights=bad)
+                bad_ok = False
+            except ValueError:
+                pass
+        check('sim_weights that are not three non-negatives summing to 1 '
+              'are refused', bad_ok)
+        def lin(S):                                    # the linear model
+            return -1.0 * S[0] - 0.3 * S[1]
+        parts = [ro.rollout_residuals(lin, t, states, 0, stride=stride,
+                                      substeps=sub, weights=w, accs=accs)
+                 for w in ((1, 0, 0), (0, 1, 0), (0, 0, 1))]
+        mix = ro.rollout_residuals(lin, t, states, 0, stride=stride,
+                                   substeps=sub, weights=(0.5, 0.3, 0.2),
+                                   accs=accs)
+        check('the residual is the weighted sum of the channel NRMSEs',
+              np.allclose(mix, 0.5 * parts[0] + 0.3 * parts[1] + 0.2 * parts[2],
+                          rtol=0, atol=1e-12),
+              f"disp {parts[0].mean():.3f}  vel {parts[1].mean():.3f}  "
+              f"acc {parts[2].mean():.3f}")
 
         # Through the engine: the fitted truth against a missing cubic.
         truth, wrong = (['add', 'x1', 'x2', 'intpower', 'x1', 'end'],
@@ -830,6 +865,17 @@ def test_simulation_reward():
                 abs(out[1] - dc.simulation_reward([(truth, out[3])])) < 1e-12)
         check('candidate_reward and the pool worker follow set_reward',
               ok_e and ok_s)
+        dc.set_reward('simulation', sim_weights=(0.4, 0.3, 0.3))
+        r_tm = dc.candidate_reward([(truth, ct)])
+        r_wm = dc.candidate_reward([(wrong, cw)])
+        check('with all three channels weighted the truth stays at ~1',
+              r_tm > 0.999 and r_wm < r_tm - 0.05,
+              f"truth {r_tm:.6f}  linear {r_wm:.4f}")
+        r_an3, _rows = simulation_scores(system, [dc.denormalize_expr(truth, ct, 0)],
+                                         weights=(0.4, 0.3, 0.3))
+        check('...and discover_score reproduces it', abs(r_an3 - r_tm) < 1e-3,
+              f"engine {r_tm:.6f}  printed {r_an3:.6f}")
+        dc.set_reward('simulation')                    # back to displacement
         try:
             dc.set_reward('bogus')
             ok = False

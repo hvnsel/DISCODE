@@ -5,10 +5,16 @@ discover_rollout.py
 Forward simulation of ONE DOF's equation against a measured record -- the
 integrator behind the simulation reward (``reward='simulation'``)::
 
-    residual_d = (1 - w_vel) * NRMSE(q_d_sim, q_d)  +  w_vel * NRMSE(qd_d_sim, qd_d)
+    residual_d = w_q * NRMSE(q_d_sim, q_d)
+               + w_v * NRMSE(qd_d_sim, qd_d)
+               + w_a * NRMSE(a_d_sim, a_d)
 
-per trial, where NRMSE is the RMS error over the simulated samples divided by
-the measured channel's standard deviation over that trial.
+per trial, with ``weights = (w_q, w_v, w_a)`` non-negative and summing to 1.
+NRMSE is the RMS error over the simulated samples divided by the measured
+channel's standard deviation over that trial.  ``a_d_sim`` is the equation's
+own acceleration along its simulated trajectory -- its right-hand side
+evaluated at the simulated state -- not a finite difference of the simulated
+velocity.
 
 Torch-free, so the engine (:func:`discover_core.simulation_reward`, used in
 training) and the scoring script (:mod:`discover_score`) run this one
@@ -70,6 +76,22 @@ def _scale(x):
     return s
 
 
+def check_weights(weights):
+    """``(w_q, w_v, w_a)`` as floats -- the displacement, velocity and
+    acceleration weights -- or a ValueError unless they are three
+    non-negative numbers summing to 1."""
+    try:
+        w = tuple(float(x) for x in weights)
+    except (TypeError, ValueError):
+        w = ()
+    if (len(w) != 3 or not all(np.isfinite(x) and x >= 0.0 for x in w)
+            or abs(sum(w) - 1.0) > 1e-6):
+        raise ValueError("sim_weights must be three non-negative weights "
+                         "(displacement, velocity, acceleration) summing to 1, "
+                         f"got {weights!r}")
+    return w
+
+
 def auto_steps(t, states, accs=None, per_cycle=SIM_STEPS_PER_CYCLE):
     """``(stride, substeps)`` giving ``per_cycle`` RK4 steps per cycle of the
     fastest measured motion.
@@ -107,7 +129,7 @@ def auto_steps(t, states, accs=None, per_cycle=SIM_STEPS_PER_CYCLE):
 
 
 def rollout(accel, t, states, dof, window=None, stride=1, substeps=1,
-            blowup=SIM_BLOWUP):
+            blowup=SIM_BLOWUP, with_acc=True):
     """Integrate DOF ``dof`` of every trial in ``states``.
 
     Parameters
@@ -127,9 +149,15 @@ def rollout(accel, t, states, dof, window=None, stride=1, substeps=1,
                both from the data.
     blowup   : the divergence limit, in multiples of each channel's largest
                measured magnitude.
+    with_acc : also return the equation's acceleration along the simulated
+               trajectory (one more evaluation per sample).
 
-    Returns ``(q_sim, qd_sim, simulated)``, each (P, m).  ``simulated`` marks
-    the samples that hold a prediction; the others hold the measured state.
+    Returns ``(q_sim, qd_sim, a_sim, simulated)``, each (P, m).  ``simulated``
+    marks the samples that hold a prediction; at the others ``q_sim`` and
+    ``qd_sim`` hold the measured state.  ``a_sim`` is the equation evaluated at
+    ``(q_sim, qd_sim)`` and the measured partner states, at every predicted
+    sample and at each trial's first one (NaN elsewhere, and everywhere when
+    ``with_acc`` is False).
     """
     states = np.asarray(states, dtype=float)
     t = np.asarray(t, dtype=float)
@@ -140,6 +168,7 @@ def rollout(accel, t, states, dof, window=None, stride=1, substeps=1,
 
     q_sim = states[:, iq, :].copy()
     v_sim = states[:, iv, :].copy()
+    a_sim = np.full((P, m), np.nan)
     simulated = np.zeros((P, m), dtype=bool)
 
     if window is None:
@@ -152,7 +181,7 @@ def rollout(accel, t, states, dof, window=None, stride=1, substeps=1,
         else:
             starts, n_rec = np.arange(0, m - 1, n), n // stride
     if n_rec < 1:
-        return q_sim, v_sim, simulated
+        return q_sim, v_sim, a_sim, simulated
 
     trial = np.repeat(np.arange(P), len(starts))        # (W,) window -> trial
     start = np.tile(starts, P)                           # (W,) window -> sample
@@ -187,6 +216,9 @@ def rollout(accel, t, states, dof, window=None, stride=1, substeps=1,
         return a_out.copy()
 
     with np.errstate(all='ignore'):
+        if with_acc:
+            a_sim[trial, start] = f(q, v, part[trial, :, start].T
+                                    if part is not None else None)
         for j in range(n_rec):
             base = start + stride * j
             # windows running past the record end read clipped samples; their
@@ -225,32 +257,53 @@ def rollout(accel, t, states, dof, window=None, stride=1, substeps=1,
             q_sim[trial[keep], tgt[keep]] = q[keep]
             v_sim[trial[keep], tgt[keep]] = v[keep]
             simulated[trial[keep], tgt[keep]] = True
-    return q_sim, v_sim, simulated
+            if with_acc:
+                # pts[-1] is the partner state at this very sample
+                a_now = f(q, v, pts[-1])
+                a_sim[trial[keep], tgt[keep]] = a_now[keep]
+    return q_sim, v_sim, a_sim, simulated
 
 
 def rollout_residuals(accel, t, states, dof, window=None, stride=1, substeps=1,
-                      w_vel=0.0, blowup=SIM_BLOWUP):
+                      weights=(1.0, 0.0, 0.0), accs=None, blowup=SIM_BLOWUP):
     """Simulation residual of DOF ``dof`` for every trial: a (P,) array.
 
-    ``(1 - w_vel) * NRMSE(q) + w_vel * NRMSE(qd)``, each NRMSE taken over the
+    ``w_q * NRMSE(q) + w_v * NRMSE(qd) + w_a * NRMSE(a)`` with ``weights =
+    (w_q, w_v, w_a)`` (see :func:`check_weights`), each NRMSE taken over the
     simulated samples and normalised by that trial's measured std of the
-    channel.  See :func:`rollout` for the arguments.
+    channel.  ``accs`` is the measured acceleration, (P, N, m); it is needed
+    only when ``w_a > 0``.  The simulated acceleration of a window that blew
+    up is clipped at ``blowup`` times the largest measured one, so it too
+    scores large but finite.  See :func:`rollout` for the other arguments.
     """
+    w_q, w_v, w_a = check_weights(weights)
+    if w_a > 0.0 and accs is None:
+        raise ValueError("an acceleration weight needs the measured "
+                         "acceleration (accs)")
     states = np.asarray(states, dtype=float)
-    q_sim, v_sim, sim = rollout(accel, t, states, dof, window, stride,
-                                substeps, blowup)
+    q_sim, v_sim, a_sim, sim = rollout(accel, t, states, dof, window, stride,
+                                       substeps, blowup, with_acc=w_a > 0.0)
     iq, iv = 2 * dof, 2 * dof + 1
+    if w_a > 0.0:
+        a_meas = np.asarray(accs, dtype=float)[:, dof, :]
+        a_lim = blowup * float(np.max(np.abs(a_meas))) + 1e-12
+        a_sim = np.clip(np.where(np.isfinite(a_sim), a_sim, a_lim), -a_lim, a_lim)
+
+    def nrmse(sim_x, meas_x, mk):
+        return (np.sqrt(np.mean((sim_x[mk] - meas_x[mk]) ** 2))
+                / _scale(meas_x))
+
     out = np.full(states.shape[0], np.nan)
     for p in range(states.shape[0]):
         mk = sim[p]
         if not mk.any():
             continue
-        e_q = (np.sqrt(np.mean((q_sim[p, mk] - states[p, iq, mk]) ** 2))
-               / _scale(states[p, iq]))
-        if w_vel > 0.0:
-            e_v = (np.sqrt(np.mean((v_sim[p, mk] - states[p, iv, mk]) ** 2))
-                   / _scale(states[p, iv]))
-            out[p] = (1.0 - w_vel) * e_q + w_vel * e_v
-        else:
-            out[p] = e_q
+        res = 0.0
+        if w_q > 0.0:
+            res += w_q * nrmse(q_sim[p], states[p, iq], mk)
+        if w_v > 0.0:
+            res += w_v * nrmse(v_sim[p], states[p, iv], mk)
+        if w_a > 0.0:
+            res += w_a * nrmse(a_sim[p], a_meas[p], mk)
+        out[p] = res
     return out
