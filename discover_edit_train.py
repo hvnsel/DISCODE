@@ -370,7 +370,8 @@ def DISCOVER_EDIT_TRAIN(
     w_acc              = 0.5,
     reward             = 'energy',  # 'energy' | 'simulation'
     sim_window         = None,      # simulation: None = one free run per trial
-    sim_w_vel          = 0.0,       # simulation: velocity weight in the NRMSE
+    sim_weights        = (1.0, 0.0, 0.0),  # simulation: (disp, vel, acc)
+                                    # NRMSE weights, summing to 1
     center_features    = False,
     directional_leaves = False,
     transcendental     = False,
@@ -391,7 +392,7 @@ def DISCOVER_EDIT_TRAIN(
     _X, _y, raw_trajs, norm_stats = generate_dataset(system, None,
                                                      center=center_features)
     dc.set_problem_data(norm_stats, raw_trajs, energy_normalize, max_traj, w_acc)
-    dc.set_reward(reward, sim_window, sim_w_vel)
+    dc.set_reward(reward, sim_window, sim_weights)
     spec = ee.EditSpec(max_terms, max_term_len, max_steps, lam, closed_form)
 
     print(f"[edit] System='{system.name}'  N_DOF={N}  tokens={dc.ALL_TOKENS}")
@@ -408,7 +409,7 @@ def DISCOVER_EDIT_TRAIN(
         pool, saved_env = make_pool((N, system.var_names, norm_stats, raw_trajs,
                                      energy_normalize, max_traj, w_acc,
                                      directional_leaves, transcendental,
-                                     reward, sim_window, sim_w_vel))
+                                     reward, sim_window, sim_weights))
     try:
         scorer = ee.Scorer(spec, pool, residual_features)
         _print_truth(system, spec, scorer)
