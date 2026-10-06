@@ -1212,6 +1212,102 @@ def test_coupled_scoring():
         dc._TF_DATA.clear()
 
 
+def test_trial_decay():
+    """``trial_decay``: each candidate's trials combined worst-fit first.
+
+    At 1 it must be the plain mean, or every existing number moves.  Below 1
+    the trial a candidate fits worst must count most -- so an equation that
+    misses one trial badly loses to one that is uniformly fair, which is the
+    point of it -- and the engine, the scoring script and the workers must all
+    combine the trials the same way.
+    """
+    import contextlib
+    import io
+
+    import discover_rollout as ro
+    from discover_analysis import simulation_scores, trainer_reward
+    from discover_data import build_truth_system, generate_dataset
+    from discover_mdof_sim import get_mdof_system
+
+    print("\ntrial weighting")
+    r3 = [0.1, 0.4, 0.2]
+    check('1 is the plain mean, 0 the worst trial, 0.5 halves per rank; the '
+          'order of the trials does not matter',
+          ro.combine_trials(r3, 1.0) == float(np.mean(r3))
+          and ro.combine_trials(r3, 0.0) == 0.4
+          and abs(ro.combine_trials(r3, 0.5) - 0.3) < 1e-12
+          and ro.combine_trials(r3[::-1], 0.5) == ro.combine_trials(r3, 0.5)
+          and abs(ro.combine_trials([r3, r3], 0.5) - 0.3) < 1e-12)
+    fair, miss = [0.3] * 5, [0.1, 0.1, 0.1, 0.1, 0.9]
+    check('an equation that misses one trial badly beats a uniformly fair one '
+          'on the mean, and loses to it at 0.5',
+          ro.combine_trials(miss, 1.0) < ro.combine_trials(fair, 1.0)
+          and ro.combine_trials(miss, 0.5) > ro.combine_trials(fair, 0.5),
+          f"mean {ro.combine_trials(miss, 1.0):.2f} vs 0.30; "
+          f"halving {ro.combine_trials(miss, 0.5):.3f} vs 0.300")
+
+    saved = (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+             dc.MAX_TRAJ, dc.W_ACC, dc.REWARD_MODE, dc.SIM_WINDOW,
+             dc.SIM_WEIGHTS, dc.TRIAL_DECAY)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            system = build_truth_system(get_mdof_system('coupled_duffing'),
+                                        n_traj=4, n_pts=1000, t_end=10.0)
+        dc.configure_grammar(2, system.var_names)
+        _X, _y, raw, ns = generate_dataset(system, device=None)
+        dc.set_problem_data(ns, raw, True, None, 0.5)
+        w = (0.4, 0.3, 0.3)
+        T0, T1 = system.truth_taus
+        wrong = dc.assemble_terms([['x1'], ['x2']])
+        cw = dc.optimise_consts_energy(wrong, 0)
+        c0, c1 = dc.optimise_consts_energy(T0, 0), dc.optimise_consts_energy(T1, 1)
+
+        rs = {}
+        for mode in ('energy', 'simulation'):
+            for decay in (1.0, 0.5):
+                dc.set_reward(mode, sim_weights=w, trial_decay=decay)
+                rs[mode, decay] = (dc.candidate_reward([(T0, c0), None]),
+                                   dc.candidate_reward([(wrong, cw), None]))
+        check('the truth still scores ~1 at 0.5, and a wrong equation scores '
+              'lower than on the mean, under both rewards',
+              all(rs[m, 0.5][0] > 0.99 and rs[m, 0.5][1] < rs[m, 1.0][1]
+                  for m in ('energy', 'simulation')),
+              ', '.join(f"{m}: {rs[m, 1.0][1]:.4f} -> {rs[m, 0.5][1]:.4f}"
+                        for m in ('energy', 'simulation')))
+
+        dc.set_reward('simulation', sim_weights=w, trial_decay=0.5)
+        r_eng = dc.candidate_reward([(wrong, cw), (T1, c1)])
+        r_an, _rows = simulation_scores(
+            system, [dc.denormalize_expr(wrong, cw, 0),
+                     dc.denormalize_expr(T1, c1, 1)],
+            weights=w, trial_decay=0.5)
+        check('discover_score combines the trials as the engine does',
+              abs(r_an - r_eng) < 1e-3
+              and abs(trainer_reward([[0.1], [0.4], [0.2]], 0.5) - 1 / 1.3) < 1e-12,
+              f"engine {r_eng:.6f}  printed {r_an:.6f}")
+
+        dc.set_reward('energy')
+        dc.init_energy_worker(2, system.var_names, ns, raw, True, None, 0.5,
+                              False, False, 'simulation', None, w, 0.5)
+        check('a pool worker is configured with the run\'s trial weighting',
+              dc.TRIAL_DECAY == 0.5 and 'x0.5 per rank' in dc.describe_reward())
+
+        refused = 0
+        for bad in (1.5, -0.1, float('nan'), 'half'):
+            try:
+                dc.set_reward('simulation', trial_decay=bad)
+            except ValueError:
+                refused += 1
+        check('a trial_decay outside [0, 1] is refused', refused == 4)
+    finally:
+        dc.configure_grammar(N_DOF)
+        (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+         dc.MAX_TRAJ, dc.W_ACC) = saved[:5]
+        dc.set_reward(*saved[5:])
+        dc._SIM_DATA.clear()
+        dc._TF_DATA.clear()
+
+
 def test_scoring_pool():
     """The scoring pool (:func:`discover_core.make_pool`).
 
@@ -1289,6 +1385,7 @@ def main():
     test_simulation_reward()
     test_tf_term()
     test_coupled_scoring()
+    test_trial_decay()
     test_scoring_pool()
 
     print(f"\n{'=' * 60}")

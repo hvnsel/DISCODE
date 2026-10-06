@@ -261,14 +261,18 @@ def mean_residuals(t, vel, acc_pred, normalize=True):
     return [float(np.mean(r)) for r in per_res]
 
 
-def trainer_reward(res_per_trial):
+def trainer_reward(res_per_trial, trial_decay=1.0):
     """The training reward from a list (per trial) of per-DOF mean residuals.
 
     ``1 / (1 + mean_trials mean_dofs res)`` — reward of the mean residual, not
-    the mean of per-DOF rewards.
+    the mean of per-DOF rewards.  With ``trial_decay < 1`` the trials are
+    combined worst-fit first, as in training
+    (:func:`discover_rollout.combine_trials`).
     """
+    import discover_rollout as ro
+
     per_trial = [float(np.mean(r)) for r in res_per_trial]
-    return 1.0 / (1.0 + float(np.mean(per_trial)))
+    return 1.0 / (1.0 + ro.combine_trials(per_trial, trial_decay))
 
 
 def per_dof_rewards(res_per_trial):
@@ -449,7 +453,8 @@ def plot_discovered(system, exprs, trial=0, t_end=None, solver='LSODA',
 
 
 def simulation_scores(system, exprs, trials=None, window=None,
-                      weights=(1.0, 0.0, 0.0, 0.0), coupled=False):
+                      weights=(1.0, 0.0, 0.0, 0.0), coupled=False,
+                      trial_decay=1.0):
     """Score expressions with the SIMULATION reward (``reward='simulation'``),
     through the same :mod:`discover_rollout` integrator the trainer uses.
 
@@ -459,6 +464,7 @@ def simulation_scores(system, exprs, trials=None, window=None,
     ``coupled=True`` every DOF is integrated together instead, each driven by
     the others' simulated states -- the full system, as the plot scripts run
     it, and what the trainer's ``sim_coupling`` scores part of each batch on.
+    ``trial_decay`` combines the trials as the run did (``1`` = plain mean).
 
     Returns ``(r_sim, rows)`` with ``r_sim = 1 / (1 + mean residual)`` and one
     ``(trial, residual_per_dof)`` row per trial.
@@ -503,11 +509,12 @@ def simulation_scores(system, exprs, trials=None, window=None,
                                         tf=tfs.get(d))
                    for d in range(N)]
     res = np.array(per_dof).T                                  # (P, N)
-    r_sim = 1.0 / (1.0 + float(np.mean(res)))
+    r_sim = 1.0 / (1.0 + ro.combine_trials(res.T, trial_decay))
     return r_sim, [(tr, list(res[i])) for i, tr in enumerate(keep)]
 
 
-def score_system(system, exprs, normalize=True, trials=None, verbose=True):
+def score_system(system, exprs, normalize=True, trials=None, verbose=True,
+                 trial_decay=1.0):
     """Score a set of expressions against a ``SystemData`` with the training
     reward, alongside the ceiling set by the measured acceleration.
 
@@ -533,8 +540,8 @@ def score_system(system, exprs, normalize=True, trials=None, verbose=True):
         res_pred.append(rp)
         res_ceil.append(rc)
 
-    r_pred = trainer_reward(res_pred)
-    r_ceil = trainer_reward(res_ceil)
+    r_pred = trainer_reward(res_pred, trial_decay)
+    r_ceil = trainer_reward(res_ceil, trial_decay)
 
     if verbose and bad_total:
         print(f"  [warn] {bad_total} non-finite predicted samples were zeroed "

@@ -312,6 +312,10 @@ def DISCOVER_TRAIN(
                                # (under reward='simulation' it only steers the
                                # constant fit)
     reward           = 'energy',   # 'energy' | 'simulation'
+    trial_decay      = 1.0,    # how a candidate's trials are combined, either
+                               # reward: ranked worst-fit first, the k-th worst
+                               # weighted trial_decay**(k-1); 1 = plain mean,
+                               # 0.5 = halve per rank, 0 = worst trial only
     sim_window       = None,   # simulation: None = one free run per trial,
                                # a number = restart from the record every
                                # sim_window seconds
@@ -362,6 +366,15 @@ def DISCOVER_TRAIN(
     ``sim_window`` restarts the simulation from the record every that many
     seconds instead of one free run per trial.  Constants are fitted the same
     way under both.
+
+    ``trial_decay`` sets how each candidate's trials are combined into its
+    reward, under either scheme.  The trials are ranked by how badly the
+    candidate fits them and the k-th worst is weighted ``trial_decay**(k-1)``
+    (normalised): 1 is the plain mean, 0.5 halves the weight at each rank (52,
+    26, 13, 6, 3% over five trials), 0 keeps the worst trial alone.  A
+    behaviour only one trial shows -- beats, say -- then counts most until it
+    is captured, without anyone choosing that trial.  The constant fit is
+    untouched (:func:`discover_rollout.combine_trials`).
 
     ``sim_coupling = (f_top, f_peer)`` lets the simulation reward see the
     coupled system.  Each epoch a fraction ``f_top`` of every DOF's equations
@@ -427,7 +440,7 @@ def DISCOVER_TRAIN(
     X_torch, y_list, raw_trajs, norm_stats = generate_dataset(
         system, device, center=center_features)
     dc.set_problem_data(norm_stats, raw_trajs, energy_normalize, max_traj, w_acc)
-    dc.set_reward(reward, sim_window, sim_weights)
+    dc.set_reward(reward, sim_window, sim_weights, trial_decay)
     print(f"[config] reward: {dc.describe_reward()}")
     if coupled and sim_coupling_mode == 'split':
         print(f"[config] coupling (split): per DOF, {f_top:.0%} of equations "
@@ -449,7 +462,7 @@ def DISCOVER_TRAIN(
         pool, saved_env = dc.make_pool(
             (N, system.var_names, norm_stats, raw_trajs, energy_normalize,
              max_traj, w_acc, directional_leaves, transcendental, reward,
-             sim_window, sim_weights), N_WORKERS)
+             sim_window, sim_weights, trial_decay), N_WORKERS)
         print(f"Scoring pool : {N_WORKERS} single-threaded workers\n")
 
     states = [DOFState(max_len, device) for _ in range(N)]
