@@ -82,13 +82,10 @@ def DISCOVER_MDOF_EXP(
     energy_normalize = True,
     max_traj         = 10,
     w_acc            = 0.9,
-    reward           = 'energy',   # 'energy' | 'simulation'
-    trial_decay      = 1.0,        # trials ranked worst-fit first, the k-th
-                                   #   worst weighted trial_decay**(k-1):
-                                   #   1 = plain mean, 0.5 = halve per rank
+    reward           = 'simulation',   # 'energy' | 'simulation'
     sim_window       = None,       # simulation: None = one free run per trial,
                                    #   else restart from the record every N s
-    sim_weights      = (1.0, 0.0, 0.0, 0.0),  # simulation: (disp, vel, acc,
+    sim_weights      = (0.2, 0.2, 0.2, 0.4),  # simulation: (disp, vel, acc,
                                    #   time-frequency) weights, summing to 1
     sim_coupling     = (0.0, 0.0),  # simulation: fractions of each DOF's
                                    #   equations simulated (with the other
@@ -97,6 +94,9 @@ def DISCOVER_MDOF_EXP(
     sim_coupling_mode = 'split',   # 'split': each equation scored one of
                                    #   those ways; 'blend': all three ways,
                                    #   rewards weighted by the fractions
+    trial_decay      = 0.5,        # trials ranked worst-fit first, the k-th
+                                   #   worst weighted trial_decay**(k-1):
+                                   #   1 = plain mean, 0.5 = halve per rank
     use_pool         = True,
     # policy (see DISCOVER_TRAIN)
     cross_slice_attention = True,
@@ -152,11 +152,11 @@ def DISCOVER_MDOF_EXP(
         max_traj         = max_traj,
         w_acc            = w_acc,
         reward           = reward,
-        trial_decay      = trial_decay,
         sim_window       = sim_window,
         sim_weights      = sim_weights,
         sim_coupling     = sim_coupling,
         sim_coupling_mode = sim_coupling_mode,
+        trial_decay      = trial_decay,
         use_pool         = use_pool,
         cross_slice_attention = cross_slice_attention,
         n_layers              = n_layers,
