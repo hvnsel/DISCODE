@@ -129,6 +129,9 @@ any models, and :func:`set_problem_data` once the training data exist.
 
 from __future__ import annotations
 
+import multiprocessing as _mp
+import os
+from concurrent.futures import ProcessPoolExecutor
 from itertools import product as _iproduct
 
 import numpy as np
@@ -2413,6 +2416,53 @@ def energy_worker(args):
     if r <= 1e-6:
         return None
     return (target_dof, r, cand_tau, consts)
+
+
+_THREAD_VARS = ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS',
+                'VECLIB_MAXIMUM_THREADS')
+
+
+def make_pool(initargs, n_workers):
+    """A scoring pool of SINGLE-THREADED workers running
+    :func:`init_energy_worker` with ``initargs``; returns ``(pool, saved_env)``
+    -- hand both to :func:`close_pool`.
+
+    Left alone, every worker starts numpy's and scipy's OpenBLAS (and torch's
+    OpenMP) with one thread per core, and each BLAS thread commits its own
+    work buffer.  On Windows, which does not overcommit, a run with three
+    such workers died on its first fits with "OpenBLAS error: Memory
+    allocation still failed after 10 retries".  They are also slower:
+    measured on 90 duffing bags, three workers at the default took 34.5 s,
+    three times SLOWER than fitting the same bags serially (11.0 s), because
+    3 x 4 BLAS threads fight over 4 cores on small least-squares solves; with
+    one BLAS thread each the pool takes 4.4 s.
+
+    The thread count is read when numpy loads, so the workers are SPAWNED --
+    fresh interpreters that see the setting -- rather than forked, which would
+    inherit this process's already-initialised thread pool.  And the setting
+    must hold for the pool's whole life, not just its creation: a spawn pool
+    starts workers on demand, and one started after the variables were
+    restored came up with 7 threads.  This process's own torch thread count
+    is pinned first, so the variables cannot reach its policy updates.
+    """
+    torch.set_num_threads(torch.get_num_threads())
+    saved = {k: os.environ.get(k) for k in _THREAD_VARS}
+    os.environ.update({k: '1' for k in _THREAD_VARS})
+    pool = ProcessPoolExecutor(max_workers=n_workers,
+                               mp_context=_mp.get_context('spawn'),
+                               initializer=init_energy_worker,
+                               initargs=initargs)
+    return pool, saved
+
+
+def close_pool(pool, saved):
+    """Shut the pool down, then restore the thread variables it needed."""
+    pool.shutdown(wait=True, cancel_futures=True)
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
 
 
 # ── J-GRPO ──────────────────────────────────────────────────────────────────

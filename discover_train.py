@@ -52,7 +52,6 @@ import copy
 import os
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import torch
@@ -348,16 +347,13 @@ def DISCOVER_TRAIN(
           f"of {len(raw_trajs)} available\n")
 
     # Scoring pool (static data injected once).
-    pool = None
+    pool = saved_env = None
     if use_pool:
-        pool = ProcessPoolExecutor(
-            max_workers=N_WORKERS,
-            initializer=dc.init_energy_worker,
-            initargs=(N, system.var_names, norm_stats, raw_trajs,
-                      energy_normalize, max_traj, w_acc, directional_leaves,
-                      transcendental, reward, sim_window, sim_weights),
-        )
-        print(f"Scoring pool : {N_WORKERS} workers\n")
+        pool, saved_env = dc.make_pool(
+            (N, system.var_names, norm_stats, raw_trajs, energy_normalize,
+             max_traj, w_acc, directional_leaves, transcendental, reward,
+             sim_window, sim_weights), N_WORKERS)
+        print(f"Scoring pool : {N_WORKERS} single-threaded workers\n")
 
     states = [DOFState(max_len, device) for _ in range(N)]
     ps = PolicyState(N, lr, n_epochs, device,
@@ -556,5 +552,5 @@ def DISCOVER_TRAIN(
     print("]\n", flush=True)
 
     if pool is not None:
-        pool.shutdown(wait=False)
+        dc.close_pool(pool, saved_env)
     return best_per_dof

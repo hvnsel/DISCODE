@@ -1064,6 +1064,62 @@ def test_tf_term():
           f"no coupling {r_nobeat:.3f}")
 
 
+def test_scoring_pool():
+    """The scoring pool (:func:`discover_core.make_pool`).
+
+    Its workers must run single-threaded BLAS -- at one thread per core, three
+    of them ran a Windows machine out of memory on their first fits -- yet
+    score exactly as this process does; and closing it must put the thread
+    variables back, with this process's torch threads never touched.
+    """
+    import contextlib
+    import io
+    import os
+
+    from discover_data import build_truth_system, generate_dataset
+    from discover_sdof_sim import get_sdof_system
+
+    print("\nscoring pool")
+    saved = (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+             dc.MAX_TRAJ, dc.W_ACC, dc.REWARD_MODE, dc.SIM_WINDOW,
+             dc.SIM_WEIGHTS)
+    env0 = {k: os.environ.get(k) for k in dc._THREAD_VARS}
+    n_torch = torch.get_num_threads()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            system = build_truth_system(get_sdof_system('duffing'), n_traj=2,
+                                        n_pts=600, t_end=12.0)
+        dc.configure_grammar(1, system.var_names)
+        _X, _y, raw, ns = generate_dataset(system, device=None)
+        dc.set_problem_data(ns, raw, True, None, 0.5)
+        dc.set_reward('energy')
+        truth = system.truth_taus[0]
+        local = dc.energy_worker((0, truth, None, None))
+        pool, env = dc.make_pool((1, system.var_names, ns, raw, True, None, 0.5,
+                                  False, False, 'energy', None,
+                                  (1.0, 0.0, 0.0, 0.0)), 2)
+        try:
+            seen = set(pool.map(os.getenv, ['OPENBLAS_NUM_THREADS'] * 4))
+            remote = pool.submit(dc.energy_worker, (0, truth, None, None)).result()
+        finally:
+            dc.close_pool(pool, env)
+        check("the pool's workers run single-threaded BLAS", seen == {'1'},
+              str(seen))
+        check('...and score a candidate as this process does',
+              remote is not None and abs(remote[1] - local[1]) < 1e-9,
+              f"{remote[1]:.10f} vs {local[1]:.10f}" if remote else 'None')
+        check("closing it restores the thread variables; this process's "
+              "torch threads are untouched",
+              {k: os.environ.get(k) for k in dc._THREAD_VARS} == env0
+              and torch.get_num_threads() == n_torch,
+              f"torch threads {torch.get_num_threads()} (was {n_torch})")
+    finally:
+        dc.configure_grammar(N_DOF)
+        (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+         dc.MAX_TRAJ, dc.W_ACC) = saved[:5]
+        dc.set_reward(*saved[5:])
+
+
 def main():
     dc.configure_grammar(N_DOF)
     print(f"grammar: {dc.ALL_TOKENS}  (N_TOKENS={dc.N_TOKENS})")
@@ -1084,6 +1140,7 @@ def main():
     test_intpower()
     test_simulation_reward()
     test_tf_term()
+    test_scoring_pool()
 
     print(f"\n{'=' * 60}")
     print(f"{len(_PASS)} passed, {len(_FAIL)} failed")
