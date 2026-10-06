@@ -277,6 +277,13 @@ def DISCOVER_MDOF_SIM(
                                    #   else restart from the record every N s
     sim_weights      = (1.0, 0.0, 0.0, 0.0),  # simulation: (disp, vel, acc,
                                    #   time-frequency) weights, summing to 1
+    sim_coupling     = (0.0, 0.0),  # simulation: fractions of each DOF's
+                                   #   equations simulated (with the other
+                                   #   DOFs' top, with the other DOFs'
+                                   #   equations from the same sample)
+    sim_coupling_mode = 'split',   # 'split': each equation scored one of
+                                   #   those ways; 'blend': all three ways,
+                                   #   rewards weighted by the fractions
     use_pool         = True,
     # policy (see DISCOVER_TRAIN)
     cross_slice_attention = True,
@@ -327,6 +334,8 @@ def DISCOVER_MDOF_SIM(
         reward           = reward,
         sim_window       = sim_window,
         sim_weights      = sim_weights,
+        sim_coupling     = sim_coupling,
+        sim_coupling_mode = sim_coupling_mode,
         use_pool         = use_pool,
         cross_slice_attention = cross_slice_attention,
         n_layers              = n_layers,

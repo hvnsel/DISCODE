@@ -233,6 +233,58 @@ def _train_critic(st, max_len, device):
     return c_loss.item() if c_loss is not None else None
 
 
+# ── Coupled scoring (reward='simulation', sim_coupling) ─────────────────────
+_MODE_LABEL = {'alone': 'alone', 'top': 'with top', 'peer': 'with peers'}
+
+
+def check_coupling(sim_coupling, reward, n_dof, mode='split'):
+    """``(f_top, f_peer)`` as floats, or a ValueError unless they are two
+    non-negative fractions summing to at most 1 -- and, when either is
+    nonzero, the reward is ``'simulation'`` and there are two DOFs or more --
+    and ``mode`` is ``'split'`` or ``'blend'``."""
+    if mode not in ('split', 'blend'):
+        raise ValueError("sim_coupling_mode must be 'split' or 'blend', "
+                         f"got {mode!r}")
+    try:
+        f = tuple(float(x) for x in sim_coupling)
+    except (TypeError, ValueError):
+        f = ()
+    if (len(f) != 2 or not all(np.isfinite(x) and x >= 0.0 for x in f)
+            or sum(f) > 1.0 + 1e-9):
+        raise ValueError("sim_coupling must be two non-negative fractions "
+                         "(with top, with peers) summing to at most 1, "
+                         f"got {sim_coupling!r}")
+    if sum(f) > 0.0 and reward != 'simulation':
+        raise ValueError("sim_coupling needs reward='simulation'")
+    if sum(f) > 0.0 and n_dof < 2:
+        raise ValueError("sim_coupling needs at least two DOFs")
+    return f
+
+
+def coupling_plan(n_rows, n_cands, f_top, f_peer, rng):
+    """Which candidates are simulated with other DOFs' equations this epoch.
+
+    Index ``b < n_rows`` of every DOF's candidate list is row ``b`` of one
+    joint sample; ``n_cands[d]`` is the length of DOF ``d``'s list (its rows
+    plus any beam extras).  Returns ``(peer_rows, top)``: the
+    ``round(f_peer * n_rows)`` rows whose equations are simulated together,
+    and per DOF the set of ``round(f_top * n_cands[d])`` of its other
+    candidates to simulate with the other DOFs' top equations.
+    """
+    n_peer = min(n_rows, int(round(f_peer * n_rows)))
+    peer_rows = sorted(int(b) for b in rng.choice(n_rows, size=n_peer,
+                                                  replace=False))
+    taken = set(peer_rows)
+    top = []
+    for n_d in n_cands:
+        free = [k for k in range(n_d) if k >= n_rows or k not in taken]
+        n_top = min(len(free), int(round(f_top * n_d)))
+        top.append(set(int(k) for k in rng.choice(free, size=n_top,
+                                                  replace=False))
+                   if n_top else set())
+    return peer_rows, top
+
+
 # ── Main loop ───────────────────────────────────────────────────────────────
 def DISCOVER_TRAIN(
     system_data,               # a discover_data.SystemData
@@ -267,6 +319,15 @@ def DISCOVER_TRAIN(
                                # (displacement, velocity, acceleration,
                                # time-frequency), non-negative, summing to 1;
                                # time-frequency needs sim_window=None
+    sim_coupling     = (0.0, 0.0),  # simulation, 2+ DOFs: the fractions of
+                               # each DOF's equations simulated with the other
+                               # DOFs' top equations, and with the other DOFs'
+                               # equations from the same sample; the rest are
+                               # simulated alone, partners read off the record
+    sim_coupling_mode = 'split',  # 'split': each equation scored ONE of those
+                               # ways, drawn with those fractions; 'blend':
+                               # each scored all three ways, rewards weighted
+                               # by them
     use_pool         = True,
     center_features  = False,  # see generate_dataset(): scale-only by default
     # ── policy (see discover_policy) ───────────────────────────────────────
@@ -302,6 +363,29 @@ def DISCOVER_TRAIN(
     seconds instead of one free run per trial.  Constants are fitted the same
     way under both.
 
+    ``sim_coupling = (f_top, f_peer)`` lets the simulation reward see the
+    coupled system.  Each epoch a fraction ``f_top`` of every DOF's equations
+    is integrated together with the other DOFs' top equations (each one's best
+    so far), and a fraction ``f_peer`` of the jointly sampled rows is
+    integrated whole: each DOF's equation with the other DOFs' equations from
+    the same sample.  Each equation is still scored on its own channel, but a
+    set that blows up charges every equation in it.  The rest are simulated
+    alone as before (:func:`discover_core.coupled_worker`).
+
+    ``sim_coupling_mode`` says how the fractions apply.  ``'split'`` scores
+    each equation ONE way, drawn with those fractions, and its reward is
+    whatever that way scored.  Promotion and the GRPO advantage compare raw
+    rewards across the whole batch, so an equation that only works against
+    the measured partner still wins whenever it is drawn alone, and since a
+    peer score mostly reflects the row-mate, a peer-mode equation reaches the
+    buffer only when its whole row is good.  ``'blend'`` scores every
+    equation all three ways and takes ``(1 - f_top - f_peer) * r_alone
+    + f_top * r_top + f_peer * r_peer``, so an equation that fails coupled
+    pays every time -- but the peer lottery then enters every reward;
+    ``sim_coupling=(f, 0)`` with ``'blend'`` penalises coupled failure
+    without it.  ``'blend'`` costs one alone and one with-top simulation per
+    equation plus one joint simulation per row.
+
     Two knobs isolate two hypotheses and are worth tracking separately:
 
     ``term_position_encoding``
@@ -322,6 +406,8 @@ def DISCOVER_TRAIN(
     device = dc.DEVICE
     system = system_data
     N = system.n_dof
+    f_top, f_peer = check_coupling(sim_coupling, reward, N, sim_coupling_mode)
+    coupled = f_top + f_peer > 0.0
 
     dc.configure_grammar(N, system.var_names, directional_leaves,
                          transcendental)
@@ -343,6 +429,17 @@ def DISCOVER_TRAIN(
     dc.set_problem_data(norm_stats, raw_trajs, energy_normalize, max_traj, w_acc)
     dc.set_reward(reward, sim_window, sim_weights)
     print(f"[config] reward: {dc.describe_reward()}")
+    if coupled and sim_coupling_mode == 'split':
+        print(f"[config] coupling (split): per DOF, {f_top:.0%} of equations "
+              f"simulated with the other DOFs' top, {f_peer:.0%} with the other "
+              f"DOFs' equations from the same sample, "
+              f"{1.0 - f_top - f_peer:.0%} alone")
+    elif coupled:
+        ways = [(m_, w) for m_, w in (('alone', 1.0 - f_top - f_peer),
+                                      ('top', f_top), ('peer', f_peer)) if w > 0]
+        print("[config] coupling (blend): every equation scored "
+              + ", ".join(_MODE_LABEL[m_] for m_, _w in ways) + "; reward = "
+              + " + ".join(f"{w:.2f} {_MODE_LABEL[m_]}" for m_, w in ways))
     print(f"[config] trajectories used per fit/score: {dc.MAX_TRAJ} "
           f"of {len(raw_trajs)} available\n")
 
@@ -393,43 +490,114 @@ def DISCOVER_TRAIN(
         print(f"  [1-sample]   {batch_size} exprs/DOF  ({time.time()-t1:.2f}s)")
         sys.stdout.flush()
 
-        # ── Step 2: Scoring (each DOF scored in isolation) ──────────────────
-        # Contexts never go to the workers — they have no policy and no use for
-        # them, and shipping them would inflate the pickling cost per
-        # candidate.  ``pool.map`` preserves order, so they zip back by index.
+        # ── Step 2: Scoring ─────────────────────────────────────────────────
+        # Each candidate is scored alone -- its DOF simulated or balanced in
+        # isolation, the partners read off the record -- unless sim_coupling
+        # sends it to be simulated with its row's other equations ('peer') or
+        # with the other DOFs' top equations ('top'), or, under 'blend', all
+        # three ways (one task per row: the row's equations are fitted once).
+        # Row b of every DOF's list is one joint sample (PolicyState.sample);
+        # beam extras come after the rows.  Contexts never go to the
+        # workers -- they have no policy and no use for them, and shipping them
+        # would inflate the pickling cost per candidate; every task carries
+        # the (dof, index) slots its results belong to instead.
         t1 = time.time()
-        tasks, ctxs = [], []
+        mode, tops, top_sets = {}, {}, [set() for _ in range(N)]
+        iso_tasks, iso_slots, cpl_tasks, cpl_slots = [], [], [], []
+        if coupled:
+            n_rows = min([batch_size] + [len(c) for c in all_exprs])
+            tops = {j: (st.best_entry[1], st.best_entry[2])
+                    for j, st in enumerate(states) if st.best_entry is not None}
+            if sim_coupling_mode == 'blend':
+                blend = {'alone': 1.0 - f_top - f_peer, 'top': f_top,
+                         'peer': f_peer}
+                for b in range(n_rows):
+                    cpl_tasks.append(([(i, all_exprs[i][b][0])
+                                       for i in range(N)], tops, horizon, blend))
+                    cpl_slots.append([(i, b) for i in range(N)])
+                for i in range(N):              # beam extras have no row
+                    for k in range(n_rows, len(all_exprs[i])):
+                        cpl_tasks.append(([(i, all_exprs[i][k][0])], tops,
+                                          horizon, blend))
+                        cpl_slots.append([(i, k)])
+                mode.update({key: 'blend' for sl in cpl_slots for key in sl})
+            else:
+                peer_rows, top_sets = coupling_plan(
+                    n_rows, [len(c) for c in all_exprs], f_top, f_peer, ps.rng)
+                for b in peer_rows:
+                    cpl_tasks.append(([(i, all_exprs[i][b][0])
+                                       for i in range(N)], {}, horizon,
+                                      {'peer': 1.0}))
+                    cpl_slots.append([(i, b) for i in range(N)])
+                    mode.update({(i, b): 'peer' for i in range(N)})
         for i in range(N):
-            for tau, ctx in all_exprs[i]:
-                tasks.append((i, tau, None, horizon))
-                ctxs.append(ctx)
-        n_tasks = len(tasks)
+            has_top = any(j != i for j in tops)
+            for k, (tau, _ctx) in enumerate(all_exprs[i]):
+                if (i, k) in mode:
+                    continue
+                if has_top and k in top_sets[i]:
+                    cpl_tasks.append(([(i, tau)], tops, horizon, {'top': 1.0}))
+                    cpl_slots.append([(i, k)])
+                    mode[(i, k)] = 'top'
+                else:
+                    iso_tasks.append((i, tau, None, horizon))
+                    iso_slots.append([(i, k)])
+                    mode[(i, k)] = 'alone'
+        n_tasks = len(mode)
         stage = f"2-{dc.reward_label()}"
         print(f"  [{stage}]   {n_tasks} candidates queued "
               f"({'pool' if pool else 'serial'}) ...", flush=True)
 
         report_every = max(1, n_tasks // 20)  # ~5% granularity
         t_score0 = time.time()
-        results = []
-        iterator = (pool.map(dc.energy_worker, tasks) if pool is not None
-                    else (dc.energy_worker(tk) for tk in tasks))
-        for k, res in enumerate(iterator, start=1):
-            results.append(res)
-            if k % report_every == 0 or k == n_tasks:
-                elapsed = time.time() - t_score0
-                rate = k / elapsed if elapsed > 0 else 0.0
-                eta = (n_tasks - k) / rate if rate > 0 else 0.0
-                print(f"    [{stage}]   {k}/{n_tasks} scored "
-                      f"({100.0*k/n_tasks:5.1f}%)  "
-                      f"{rate:6.1f} eq/s  ETA {eta:6.1f}s", flush=True)
+        if pool is not None:      # both submitted at once: no idle workers
+            runs = [(pool.map(dc.energy_worker, iso_tasks), iso_slots, False),
+                    (pool.map(dc.coupled_worker, cpl_tasks), cpl_slots, True)]
+        else:
+            runs = [(map(dc.energy_worker, iso_tasks), iso_slots, False),
+                    (map(dc.coupled_worker, cpl_tasks), cpl_slots, True)]
+        results, k = {}, 0
+        for iterator, slots, many in runs:
+            for slot, res in zip(slots, iterator):
+                results.update(zip(slot, res if many else [res]))
+                k_prev, k = k, k + len(slot)
+                if k // report_every > k_prev // report_every or k == n_tasks:
+                    elapsed = time.time() - t_score0
+                    rate = k / elapsed if elapsed > 0 else 0.0
+                    eta = (n_tasks - k) / rate if rate > 0 else 0.0
+                    print(f"    [{stage}]   {k}/{n_tasks} scored "
+                          f"({100.0*k/n_tasks:5.1f}%)  "
+                          f"{rate:6.1f} eq/s  ETA {eta:6.1f}s", flush=True)
 
         per_dof = [[] for _ in range(N)]
-        for k, res in enumerate(results):
-            if res is None:
-                continue
-            tgt, r, tau, c = res
-            per_dof[tgt].append((r, tau, c, ctxs[k]))
+        for i in range(N):
+            for k, (_tau, ctx) in enumerate(all_exprs[i]):
+                res = results.get((i, k))
+                if res is not None:
+                    _tgt, r, tau, c = res[:4]
+                    per_dof[i].append((r, tau, c, ctx))
         print(f"  [{stage}]   scored  ({time.time()-t1:.2f}s)", flush=True)
+        if coupled and sim_coupling_mode == 'blend':
+            for i in range(N):
+                got = [results[key] for key in mode
+                       if key[0] == i and results.get(key) is not None]
+                if got:
+                    best = max(got, key=lambda z: z[1])
+                    print(f"    DOF {i}  best {best[1]:.4f} = "
+                          + "  ".join(f"{_MODE_LABEL[m_]} {best[4][m_]:.4f}"
+                                      for m_ in ('alone', 'top', 'peer')
+                                      if m_ in best[4]))
+        elif coupled:
+            for i in range(N):
+                parts = []
+                for m_ in ('alone', 'top', 'peer'):
+                    keys = [key for key, md in mode.items()
+                            if key[0] == i and md == m_]
+                    rs = [results[key][1] for key in keys
+                          if results.get(key) is not None]
+                    parts.append(f"{_MODE_LABEL[m_]} {len(keys)}: "
+                                 + (f"best {max(rs):.4f}" if rs else "-"))
+                print(f"    DOF {i}  " + "  |  ".join(parts))
 
         # ── Step 3: promotion + buffer update + train ───────────────────────
         # Promotion and the critic are per-DOF; the policy update is not (the
@@ -540,6 +708,18 @@ def DISCOVER_TRAIN(
             dh = dc.denormalize_expr(hof[1], hof[2], i)
             print(f"    #{rank}: {dc.reward_label()}={hof[0]:.4f}  "
                   f"{dh if dh else dc.expr_to_str(hof[1], hof[2])}")
+
+    # The best equations integrated together -- what the plot scripts do.
+    if reward == 'simulation' and sum(b is not None for b in best_per_dof) > 1:
+        together = dc.coupled_simulation_rewards(
+            [(b[1], b[2]) if b is not None else None for b in best_per_dof],
+            [i for i, b in enumerate(best_per_dof) if b is not None],
+            horizon=dc.get_traj_horizon(n_epochs - 1, n_epochs, system.t_end))
+        print(f"\n{'=' * 64}\nBest equations simulated together "
+              f"(reward as trained, partners simulated, not measured):")
+        for i, r in together.items():
+            print(f"  DOF {i}: {r:.6f}   (its training score "
+                  f"{best_per_dof[i][0]:.6f})")
 
     # Paste-ready block for discover_score.py / discover_plot_*.py
     print(f"\n{'=' * 64}\nDISCOVERED_EXPRS = [")
