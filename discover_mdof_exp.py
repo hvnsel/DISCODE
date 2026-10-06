@@ -41,7 +41,11 @@ displacement it needs no derivative relation between the channels, only the
 initial velocity, so it is the reward to try when the ceiling is low.  The
 ceiling bounds the energy reward only and is not printed under it.
 ``sim_window`` restarts the simulation from the record every that many seconds
-instead of one free run per trial.
+instead of one free run per trial.  Each DOF is simulated alone, the others read
+off the record, unless ``sim_coupling = (f_top, f_peer)`` sends those fractions
+of each DOF's equations to be simulated together with the other DOFs' top
+equations, or with the other DOFs' equations from the same sample -- so an
+equation that only works against the measured partner is caught in training.
 """
 
 from __future__ import annotations
@@ -83,6 +87,13 @@ def DISCOVER_MDOF_EXP(
                                    #   else restart from the record every N s
     sim_weights      = (1.0, 0.0, 0.0, 0.0),  # simulation: (disp, vel, acc,
                                    #   time-frequency) weights, summing to 1
+    sim_coupling     = (0.0, 0.0),  # simulation: fractions of each DOF's
+                                   #   equations simulated (with the other
+                                   #   DOFs' top, with the other DOFs'
+                                   #   equations from the same sample)
+    sim_coupling_mode = 'split',   # 'split': each equation scored one of
+                                   #   those ways; 'blend': all three ways,
+                                   #   rewards weighted by the fractions
     use_pool         = True,
     # policy (see DISCOVER_TRAIN)
     cross_slice_attention = True,
@@ -140,6 +151,8 @@ def DISCOVER_MDOF_EXP(
         reward           = reward,
         sim_window       = sim_window,
         sim_weights      = sim_weights,
+        sim_coupling     = sim_coupling,
+        sim_coupling_mode = sim_coupling_mode,
         use_pool         = use_pool,
         cross_slice_attention = cross_slice_attention,
         n_layers              = n_layers,

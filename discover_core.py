@@ -1526,6 +1526,22 @@ def _tf_setup(max_traj, horizon, dof, data):
     return _TF_DATA[key]
 
 
+def _accel_fn(d, expr):
+    """DOF ``d``'s ``(tau, consts)`` as the rollout's ``accel(S)``: physical
+    states in, physical acceleration out (the expression itself works in
+    normalised units).  None if it does not compile."""
+    fn = compile_to_numpy(*expr)
+    if fn is None:
+        return None
+    X_mean, X_std, y_mean, y_std = NORM_STATS
+    xm, xs = X_mean[:, None], X_std[:, None]
+    ym, ys = float(y_mean[d]), float(y_std[d])
+
+    def accel(S):
+        return ym + ys * fn(*((S - xm) / xs))
+    return accel
+
+
 def simulation_reward(exprs, max_traj=None, horizon=None):
     """Forward-simulation reward for a set of per-DOF expressions.
 
@@ -1553,21 +1569,12 @@ def simulation_reward(exprs, max_traj=None, horizon=None):
     t, states, accs, stride, substeps = data
     if SIM_WEIGHTS[2] > 0.0 and accs is None:
         return 0.0                  # nothing measured to compare against
-    X_mean, X_std, y_mean, y_std = NORM_STATS
-    xm, xs = X_mean[:, None], X_std[:, None]
 
     per_dof = []
     for d in present:
-        fn = compile_to_numpy(*exprs[d])
-        if fn is None:
+        accel = _accel_fn(d, exprs[d])
+        if accel is None:
             return 0.0
-        ym, ys = float(y_mean[d]), float(y_std[d])
-
-        def accel(S, fn=fn, ym=ym, ys=ys):
-            # the rollout works in physical units, the expression in
-            # normalised ones
-            return ym + ys * fn(*((S - xm) / xs))
-
         tf = (_tf_setup(max_traj, horizon, d, data)
               if SIM_WEIGHTS[3] > 0.0 else None)
         res = _ro.rollout_residuals(accel, t, states, d, window=SIM_WINDOW,
@@ -1577,6 +1584,50 @@ def simulation_reward(exprs, max_traj=None, horizon=None):
             return 0.0
         per_dof.append(res)
     return 1.0 / (1.0 + float(np.mean(per_dof)))
+
+
+def coupled_simulation_rewards(exprs, score, max_traj=None, horizon=None):
+    """Simulation rewards when DOFs are integrated TOGETHER: ``{dof: r}`` for
+    every DOF in ``score``.
+
+    Every DOF with an expression in ``exprs`` (a length-N list of
+    ``(tau, consts)`` or None) is integrated as one coupled system, each
+    equation driven by the others' SIMULATED states; a DOF without one is read
+    off the record.  Each scored DOF gets ``r = 1 / (1 + mean over trials)``
+    of its own channel's residual, weighted as in :func:`simulation_reward`,
+    except that a trial where the set blew up charges every DOF the worst
+    residual in it (:func:`discover_rollout.rollout_set_residuals`).  A scored
+    DOF whose expression does not compile gets 0 and the rest are integrated
+    without it.
+    """
+    out = {int(d): 0.0 for d in score}
+    if NORM_STATS is None or not RAW_TRAJECTORIES:
+        return out
+    data = _sim_data(max_traj, horizon)
+    if data is None:
+        return out
+    t, states, accs, stride, substeps = data
+    if SIM_WEIGHTS[2] > 0.0 and accs is None:
+        return out
+    accels = {}
+    for d in range(N_DOF):
+        if exprs[d] is not None:
+            accel = _accel_fn(d, exprs[d])
+            if accel is not None:
+                accels[d] = accel
+    scored = [d for d in out if d in accels]
+    if not scored:
+        return out
+    tfs = ({d: _tf_setup(max_traj, horizon, d, data) for d in accels}
+           if SIM_WEIGHTS[3] > 0.0 else None)
+    res = _ro.rollout_set_residuals(accels, t, states, window=SIM_WINDOW,
+                                    stride=stride, substeps=substeps,
+                                    weights=SIM_WEIGHTS, accs=accs, tfs=tfs,
+                                    score=scored)
+    for d in scored:
+        if np.all(np.isfinite(res[d])):
+            out[d] = 1.0 / (1.0 + float(np.mean(res[d])))
+    return out
 
 
 def candidate_reward(exprs, max_traj=None, horizon=None):
@@ -2406,7 +2457,9 @@ def energy_worker(args):
     asymmetry (a candidate scored without a partner keeps the elite slot
     forever), stale buffer entries driving unfair pruning and R_alpha drift,
     and ``best_r`` being dethroned purely because the partner improved.
-    Scoring in isolation removes all three at once.
+    Scoring in isolation removes all three at once.  :func:`coupled_worker`
+    is the deliberate exception, for the share of a batch that the trainer's
+    ``sim_coupling`` sends to be simulated with other DOFs' equations.
     """
     target_dof, cand_tau, _elite_exprs, horizon = args
     consts = optimise_consts_energy(cand_tau, target_dof, None, horizon=horizon)
@@ -2416,6 +2469,83 @@ def energy_worker(args):
     if r <= 1e-6:
         return None
     return (target_dof, r, cand_tau, consts)
+
+
+def coupled_worker(args):
+    """Score candidates simulated with other DOFs' equations
+    (``reward='simulation'`` only).
+
+    args = (members, tops, horizon, weights)
+      members : list of ``(dof, tau)`` -- the candidates to fit and score, at
+                most one per DOF: a row of one joint sample, or one equation
+      tops    : ``{dof: (tau, consts)}`` -- each DOF's top equation (its best
+                so far); a member's own DOF's entry is ignored
+      horizon : as in :func:`energy_worker`
+      weights : ``{mode: weight}``, the ways to simulate each member --
+                ``'alone'`` on its own, the other DOFs read off the record
+                (:func:`simulation_reward`); ``'top'`` together with every
+                other DOF's top equation; ``'peer'`` together with the other
+                members.  A DOF with nothing to simulate is read off the
+                record, so with no tops ``'top'`` is ``'alone'``, and so is
+                ``'peer'`` for a lone member.
+
+    Each member's constants are fitted exactly as in :func:`energy_worker` --
+    to its own DOF's balance on the measured states -- so only the scoring
+    differs.  In a coupled mode each member is scored on its own channel, and
+    a set that blows up charges every equation in it
+    (:func:`coupled_simulation_rewards`).  Returns a list aligned with
+    ``members`` of ``(dof, reward, tau, consts, {mode: reward})`` -- the
+    reward the weighted mean over modes -- or None.
+
+    This gives up the isolation :func:`energy_worker` argues for on purpose:
+    a member's score now depends on the equations it is simulated with.  An
+    equation that fits against the measured partner but derails the coupled
+    set is caught here and nowhere else.
+    """
+    members, tops, horizon, weights = args
+    weights = {m: float(w) for m, w in weights.items() if w > 0.0}
+    fitted = [(d, tau, optimise_consts_energy(tau, d, None, horizon=horizon))
+              for d, tau in members]
+    alone = {}
+
+    def r_alone(d, tau, consts):
+        if d not in alone:
+            exprs = [None] * N_DOF
+            exprs[d] = (tau, consts)
+            alone[d] = simulation_reward(exprs, horizon=horizon)
+        return alone[d]
+
+    modes = [{} for _ in fitted]
+    if 'peer' in weights and len(fitted) > 1:
+        exprs = [None] * N_DOF
+        for d, tau, consts in fitted:
+            exprs[d] = (tau, consts)
+        rs = coupled_simulation_rewards(exprs, [d for d, _t, _c in fitted],
+                                        horizon=horizon)
+        for k, (d, _t, _c) in enumerate(fitted):
+            modes[k]['peer'] = rs[d]
+    for k, (d, tau, consts) in enumerate(fitted):
+        if 'alone' in weights:
+            modes[k]['alone'] = r_alone(d, tau, consts)
+        if 'peer' in weights and len(fitted) == 1:
+            modes[k]['peer'] = r_alone(d, tau, consts)
+        if 'top' in weights:
+            exprs = [None] * N_DOF
+            for j, top in (tops or {}).items():
+                if j != d:
+                    exprs[j] = top
+            if any(e is not None for e in exprs):
+                exprs[d] = (tau, consts)
+                modes[k]['top'] = coupled_simulation_rewards(
+                    exprs, [d], horizon=horizon)[d]
+            else:
+                modes[k]['top'] = r_alone(d, tau, consts)
+    total = sum(weights.values())
+    out = []
+    for (d, tau, consts), md in zip(fitted, modes):
+        r = sum(w * md[m] for m, w in weights.items()) / total
+        out.append(None if r <= 1e-6 else (d, r, tau, consts, md))
+    return out
 
 
 _THREAD_VARS = ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS',

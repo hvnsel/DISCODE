@@ -17,7 +17,7 @@ committed for the others. See [Policy architecture](#policy-architecture).
 | file | what it is |
 |---|---|
 | `discover_core.py` | the engine: grammar, expression evaluation, VARPRO constant fitting, the rewards, the scoring worker, the critic |
-| `discover_rollout.py` | the forward-simulation reward's integrator: one DOF at a time against the measured record (torch-free, shared with `discover_score.py`) |
+| `discover_rollout.py` | the forward-simulation reward's integrator: one DOF against the measured record, or several integrated together (torch-free, shared with `discover_score.py`) |
 | `discover_policy.py` | the terms-in-a-bag policy: model, attention mask, sampling, beam search, `jgrpo_terms` |
 | `discover_policy_test.py` | correctness invariants for the above — run it before anything long |
 | `discover_data.py` | everything that produces a `SystemData`: `.mat` loading, truth simulation, dataset prep, ceiling + truth-reward diagnostics |
@@ -106,19 +106,61 @@ fitted the same way under both: the closed-form work-energy / acceleration fit,
 steered by `w_acc`. Under `'simulation'`, `w_acc` therefore only shapes the fit;
 the simulation decides the ranking.
 
-**One DOF at a time.** In a multi-DOF run, DOF d's equation is integrated on its
-own, and the other DOFs' states are read off the measured record at every step.
-A coupling term is judged against the partner's true motion, and DOF d's score
-never depends on the partner's current expression — the same isolation the
-energy reward has. The full coupled simulation of a finished set of equations is
-what `discover_plot_sim.py` / `discover_plot_exp.py` do.
+**One DOF at a time, by default.** In a multi-DOF run, DOF d's equation is
+integrated on its own, and the other DOFs' states are read off the measured
+record at every step. A coupling term is judged against the partner's true
+motion, and DOF d's score never depends on the partner's current expression —
+the same isolation the energy reward has. The full coupled simulation of a
+finished set of equations is what `discover_plot_sim.py` / `discover_plot_exp.py`
+do, and an equation that works against the measured partner can still blow up
+there.
 
-Two more knobs, used only by `'simulation'`:
+**Coupled scoring (`sim_coupling`).** `sim_coupling = (f_top, f_peer)` sends
+part of every DOF's batch to be simulated together with other equations, each
+driven by the others' *simulated* states:
+
+- **with top** (`f_top` of each DOF's equations): integrated together with every
+  other DOF's top equation, its best so far;
+- **with peers** (`f_peer` of the batch's rows): the policy samples all DOFs'
+  equations jointly, one row at a time, and a peer row is integrated whole —
+  each DOF's equation with the other DOFs' equations from the same sample;
+- the rest are simulated alone, as above.
+
+Constants are fitted the same way in every mode. Each equation is scored on its
+own channel, but a coupled run that blows up charges every equation in it the
+worst residual in the set, because once the set diverges none of them works.
+Each epoch prints the best reward per mode, and the end of the run prints the
+best equations simulated together. The true `coupled_duffing` equations score
+above 0.999 in all three modes.
+
+`sim_coupling_mode` says how the fractions apply:
+
+| `sim_coupling_mode` | each equation is | its reward |
+|---|---|---|
+| `'split'` (default) | scored ONE way, drawn with those fractions | that way's score |
+| `'blend'` | scored all three ways | `(1 - f_top - f_peer)*r_alone + f_top*r_top + f_peer*r_peer` |
+
+Measured on `coupled_beats` (30 rows from an untrained policy, each DOF's best
+alone equation as its top), an equation's score with the top tracked its alone
+score: rank correlation 0.96 and 0.85, and the best scored 0.9985 both ways.
+Its score with peers mostly reflected its row-mate: an equation at 0.9985 alone
+scored 0.40 next to a poor partner. So under `'split'` a peer-mode equation
+reaches the buffer only when its whole row is good, and an equation that works
+only against the measured partner still wins whenever it is drawn alone.
+Under `'blend'` that equation pays every time, but the peer lottery enters
+every reward. To penalise equations that fail when coupled without that noise,
+use `sim_coupling=(0.5, 0.0), sim_coupling_mode='blend'`. `'blend'` costs one
+alone and one with-top simulation per equation, plus one joint simulation per
+row.
+
+Four more knobs, used only by `'simulation'`:
 
 | knob | default | what it does |
 |---|---|---|
 | `sim_window` | `None` | `None` is one free run per trial, from its first sample to its last. A number restarts the simulation from the measured state every that many seconds (multiple shooting). A small frequency error then costs a bounded phase error per window instead of one that grows over the whole record, and it runs faster |
 | `sim_weights` | `(1.0, 0.0, 0.0, 0.0)` | the weights of (displacement, velocity, acceleration, time-frequency): `w_q*NRMSE(q) + w_v*NRMSE(qdot) + w_a*NRMSE(qddot) + w_tf*R_tf`. Non-negative and summing to 1, or the run refuses to start; a 3-tuple means `w_tf = 0`. The acceleration is the equation's own along its simulated trajectory, its right-hand side at the simulated state, compared with the measured acceleration. `R_tf` is below; it needs `sim_window=None` |
+| `sim_coupling` | `(0.0, 0.0)` | the fractions of each DOF's equations simulated with the other DOFs' top equations and with the other DOFs' equations from the same sample (above). Non-negative, summing to at most 1; the rest are simulated alone. Needs two DOFs or more |
+| `sim_coupling_mode` | `'split'` | `'split'` scores each equation one of those ways; `'blend'` scores it all three ways and weights the rewards by the fractions (above) |
 
 The integrator is RK4 on the record's own samples. The step is sized from the
 data: at least 50 steps per cycle of the fastest measured motion, so an
@@ -161,7 +203,8 @@ reward. Both rewards share the constant fit, which usually costs more: on an
 untrained policy's free-grammar candidates its median was 0.3 s.
 
 To score pasted equations with it afterwards, set `REWARD = 'simulation'` (and
-the same `SIM_WINDOW` / `SIM_WEIGHTS`) in `discover_score.py`.
+the same `SIM_WINDOW` / `SIM_WEIGHTS`) in `discover_score.py`; `SIM_COUPLED = True`
+scores them integrated together instead.
 
 ## Policy architecture
 

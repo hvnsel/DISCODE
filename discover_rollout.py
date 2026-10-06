@@ -58,15 +58,21 @@ Torch-free, so the engine (:func:`discover_core.simulation_reward`, used in
 training) and the scoring script (:mod:`discover_score`) run this one
 implementation, and the number read after training is the number trained on.
 
-Per DOF, like the energy reward
--------------------------------
-Only DOF d's own state ``[q_d, qd_d]`` is integrated.  Every OTHER DOF's state
-is read off the measured record, linearly interpolated between samples.  A
-coupling term is therefore judged against the partner's true motion, and DOF
-d's score never depends on what the search currently believes about the
-partner -- the same isolation the energy reward has (see
-:func:`discover_core.energy_worker`).  The full coupled simulation of a
-finished set of equations is :func:`discover_analysis.forward_simulate`.
+Per DOF, like the energy reward -- or several together
+------------------------------------------------------
+:func:`rollout` integrates only DOF d's own state ``[q_d, qd_d]``.  Every
+OTHER DOF's state is read off the measured record, linearly interpolated
+between samples.  A coupling term is therefore judged against the partner's
+true motion, and DOF d's score never depends on what the search currently
+believes about the partner -- the same isolation the energy reward has (see
+:func:`discover_core.energy_worker`).
+
+:func:`rollout_set` integrates several DOFs together as one coupled system,
+each driven by the others' simulated states -- the trainer's ``sim_coupling``
+scores part of each batch this way, and :func:`rollout_set_residuals` charges
+every DOF of a set that blows up.  With one DOF it is :func:`rollout`, to the
+bit.  The full coupled simulation of a finished set of equations in the plot
+scripts is :func:`discover_analysis.forward_simulate`.
 
 Windows
 -------
@@ -222,38 +228,67 @@ def rollout(accel, t, states, dof, window=None, stride=1, substeps=1,
     sample and at each trial's first one (NaN elsewhere, and everywhere when
     ``with_acc`` is False).
     """
+    _dofs, q, v, a, sim, _blown = rollout_set({dof: accel}, t, states, window,
+                                              stride, substeps, blowup, with_acc)
+    return q[:, 0], v[:, 0], a[:, 0], sim
+
+
+def rollout_set(accels, t, states, window=None, stride=1, substeps=1,
+                blowup=SIM_BLOWUP, with_acc=True):
+    """Integrate several DOFs of every trial TOGETHER, as one coupled system.
+
+    ``accels`` maps each DOF to integrate to its ``accel(S) -> a`` (see
+    :func:`rollout`); every DOF not in it is read off ``states``.  Each
+    equation sees the other integrated DOFs' SIMULATED states, so a coupling
+    term is driven by the partner's predicted motion, not the measured one.
+    With one DOF this is :func:`rollout`, to the bit.  A window freezes as a
+    whole when any of its DOFs leaves its bound: past that point the coupled
+    state is meaningless for all of them.
+
+    Returns ``(dofs, q_sim, qd_sim, a_sim, simulated, blown)``: ``dofs`` the
+    integrated DOFs in ascending order; ``q_sim``, ``qd_sim`` and ``a_sim``
+    (P, n, m) in that order; ``simulated`` (P, m); and ``blown`` (P,), True
+    for a trial with a window that left its bounds.  The other arguments are
+    as in :func:`rollout`.
+    """
     states = np.asarray(states, dtype=float)
     t = np.asarray(t, dtype=float)
     P, n_rows, m = states.shape
-    iq, iv = 2 * dof, 2 * dof + 1
-    partners = np.array([k for k in range(n_rows) if k not in (iq, iv)], dtype=int)
+    dofs = sorted(int(d) for d in accels)
+    fns = [accels[d] for d in dofs]
+    n = len(dofs)
+    iq = np.array([2 * d for d in dofs], dtype=int)
+    iv = iq + 1
+    own = set(iq.tolist()) | set(iv.tolist())
+    partners = np.array([k for k in range(n_rows) if k not in own], dtype=int)
     stride, K = max(1, int(stride)), max(1, int(substeps))
 
     q_sim = states[:, iq, :].copy()
     v_sim = states[:, iv, :].copy()
-    a_sim = np.full((P, m), np.nan)
+    a_sim = np.full((P, n, m), np.nan)
     simulated = np.zeros((P, m), dtype=bool)
+    blown = np.zeros(P, dtype=bool)
 
     if window is None:
         starts, n_rec = np.array([0]), (m - 1) // stride
     else:
         dt = float(np.median(np.diff(t))) if m > 1 else 1.0
-        n = stride * max(1, int(round(float(window) / (dt * stride))))
-        if n >= m - 1:
+        n_win = stride * max(1, int(round(float(window) / (dt * stride))))
+        if n_win >= m - 1:
             starts, n_rec = np.array([0]), (m - 1) // stride
         else:
-            starts, n_rec = np.arange(0, m - 1, n), n // stride
+            starts, n_rec = np.arange(0, m - 1, n_win), n_win // stride
     if n_rec < 1:
-        return q_sim, v_sim, a_sim, simulated
+        return dofs, q_sim, v_sim, a_sim, simulated, blown
 
     trial = np.repeat(np.arange(P), len(starts))        # (W,) window -> trial
     start = np.tile(starts, P)                           # (W,) window -> sample
     W = trial.size
 
-    q = states[trial, iq, start].copy()
-    v = states[trial, iv, start].copy()
-    q_lim = blowup * float(np.max(np.abs(states[:, iq, :]))) + 1e-12
-    v_lim = blowup * float(np.max(np.abs(states[:, iv, :]))) + 1e-12
+    q = states[trial, :, start][:, iq].T.copy()          # (n, W)
+    v = states[trial, :, start][:, iv].T.copy()
+    q_lim = blowup * np.max(np.abs(states[:, iq, :]), axis=(0, 2))[:, None] + 1e-12
+    v_lim = blowup * np.max(np.abs(states[:, iv, :]), axis=(0, 2))[:, None] + 1e-12
     alive = np.ones(W, dtype=bool)
 
     part = states[:, partners, :] if partners.size else None     # (P, C, m)
@@ -263,25 +298,26 @@ def rollout(accel, t, states, dof, window=None, stride=1, substeps=1,
     offs = [(int(np.floor(o)), o - np.floor(o)) for o in offs]
 
     S = np.empty((n_rows, W))
-    a_out = np.empty(W)
+    a_out = np.empty((n, W))
 
     def f(qq, vv, pp):
         S[iq] = qq
         S[iv] = vv
         if pp is not None:
             S[partners] = pp
-        try:
-            # copied out: an expression that is a bare variable returns a view
-            # of S, which the next stage overwrites
-            a_out[:] = accel(S)
-        except Exception:                                   # noqa: BLE001
-            a_out[:] = np.nan
+        for k, fn in enumerate(fns):
+            try:
+                # copied out: an expression that is a bare variable returns a
+                # view of S, which the next stage overwrites
+                a_out[k] = fn(S)
+            except Exception:                               # noqa: BLE001
+                a_out[k] = np.nan
         return a_out.copy()
 
     with np.errstate(all='ignore'):
         if with_acc:
-            a_sim[trial, start] = f(q, v, part[trial, :, start].T
-                                    if part is not None else None)
+            a_sim[trial, :, start] = f(q, v, part[trial, :, start].T
+                                       if part is not None else None).T
         for j in range(n_rec):
             base = start + stride * j
             # windows running past the record end read clipped samples; their
@@ -312,19 +348,21 @@ def rollout(accel, t, states, dof, window=None, stride=1, substeps=1,
                 qn = q + (h / 6.0) * (k1q + 2.0 * k2q + 2.0 * k3q + k4q)
                 vn = v + (h / 6.0) * (k1v + 2.0 * k2v + 2.0 * k3v + k4v)
                 # a NaN fails both comparisons, so this also catches non-finite
-                alive = alive & (np.abs(qn) <= q_lim) & (np.abs(vn) <= v_lim)
+                ok = (np.abs(qn) <= q_lim) & (np.abs(vn) <= v_lim)
+                alive = alive & (ok[0] if n == 1 else ok.all(axis=0))
                 q = np.where(alive, qn, q)
                 v = np.where(alive, vn, v)
             tgt = base + stride
             keep = tgt <= m - 1
-            q_sim[trial[keep], tgt[keep]] = q[keep]
-            v_sim[trial[keep], tgt[keep]] = v[keep]
+            q_sim[trial[keep], :, tgt[keep]] = q[:, keep].T
+            v_sim[trial[keep], :, tgt[keep]] = v[:, keep].T
             simulated[trial[keep], tgt[keep]] = True
             if with_acc:
                 # pts[-1] is the partner state at this very sample
                 a_now = f(q, v, pts[-1])
-                a_sim[trial[keep], tgt[keep]] = a_now[keep]
-    return q_sim, v_sim, a_sim, simulated
+                a_sim[trial[keep], :, tgt[keep]] = a_now[:, keep].T
+    blown[trial[~alive]] = True
+    return dofs, q_sim, v_sim, a_sim, simulated, blown
 
 
 def _next_pow2(n):
@@ -506,7 +544,32 @@ def rollout_residuals(accel, t, states, dof, window=None, stride=1, substeps=1,
     times the largest measured one, so it too scores large but finite.  See
     :func:`rollout` for the other arguments.
     """
+    return rollout_set_residuals({dof: accel}, t, states, window, stride,
+                                 substeps, weights, accs,
+                                 None if tf is None else {dof: tf}, blowup)[dof]
+
+
+def rollout_set_residuals(accels, t, states, window=None, stride=1, substeps=1,
+                          weights=(1.0, 0.0, 0.0, 0.0), accs=None, tfs=None,
+                          blowup=SIM_BLOWUP, score=None):
+    """Simulation residuals of DOFs integrated together (:func:`rollout_set`):
+    ``{dof: (P,) array}`` for every DOF in ``score`` (default: all of
+    ``accels``).
+
+    Each is the DOF's own channel residual, exactly as
+    :func:`rollout_residuals` computes it -- except in a trial where the
+    coupled run blew up.  There every DOF of the set is charged the largest
+    residual among them: once the set diverges no equation in it can be said
+    to work, and one whose own channel happened to be in bounds when the
+    window froze would otherwise score as if it had been fine.  ``tfs`` maps
+    every integrated DOF to its :func:`tf_setup`; it is needed only when
+    ``w_tf > 0``.  The other arguments are as in :func:`rollout_residuals`.
+    """
     w_q, w_v, w_a, w_tf = check_weights(weights)
+    dofs = sorted(int(d) for d in accels)
+    score = dofs if score is None else sorted(int(d) for d in score)
+    if not set(score) <= set(dofs):
+        raise ValueError("only integrated DOFs can be scored")
     if w_a > 0.0 and accs is None:
         raise ValueError("an acceleration weight needs the measured "
                          "acceleration (accs)")
@@ -514,36 +577,50 @@ def rollout_residuals(accel, t, states, dof, window=None, stride=1, substeps=1,
         if window is not None:
             raise ValueError("the time-frequency weight needs free runs: "
                              "set sim_window=None")
-        if tf is None or tf['stride'] != max(1, int(stride)):
-            raise ValueError("the time-frequency weight needs this DOF's "
-                             "tf_setup at the same stride")
+        if any(tf is None or tf['stride'] != max(1, int(stride))
+               for tf in ((tfs or {}).get(d) for d in dofs)):
+            raise ValueError("the time-frequency weight needs every "
+                             "integrated DOF's tf_setup at the same stride")
     states = np.asarray(states, dtype=float)
-    q_sim, v_sim, a_sim, sim = rollout(accel, t, states, dof, window, stride,
-                                       substeps, blowup, with_acc=w_a > 0.0)
-    iq, iv = 2 * dof, 2 * dof + 1
-    if w_a > 0.0:
-        a_meas = np.asarray(accs, dtype=float)[:, dof, :]
-        a_lim = blowup * float(np.max(np.abs(a_meas))) + 1e-12
-        a_sim = np.clip(np.where(np.isfinite(a_sim), a_sim, a_lim), -a_lim, a_lim)
+    _dofs, q_sim, v_sim, a_sim, sim, blown = rollout_set(
+        accels, t, states, window, stride, substeps, blowup,
+        with_acc=w_a > 0.0)
 
     def nrmse(sim_x, meas_x, mk):
         return (np.sqrt(np.mean((sim_x[mk] - meas_x[mk]) ** 2))
                 / _scale(meas_x))
 
-    r_tf = tf_residuals(tf, q_sim) if w_tf > 0.0 else None
-    out = np.full(states.shape[0], np.nan)
-    for p in range(states.shape[0]):
-        mk = sim[p]
-        if not mk.any():
-            continue
-        res = 0.0
-        if w_q > 0.0:
-            res += w_q * nrmse(q_sim[p], states[p, iq], mk)
-        if w_v > 0.0:
-            res += w_v * nrmse(v_sim[p], states[p, iv], mk)
+    def channel(k, d):
+        iq, iv = 2 * d, 2 * d + 1
+        q_d = q_sim[:, k]
         if w_a > 0.0:
-            res += w_a * nrmse(a_sim[p], a_meas[p], mk)
-        if w_tf > 0.0:
-            res += w_tf * r_tf[p]
-        out[p] = res
-    return out
+            a_meas = np.asarray(accs, dtype=float)[:, d, :]
+            a_lim = blowup * float(np.max(np.abs(a_meas))) + 1e-12
+            a_d = np.clip(np.where(np.isfinite(a_sim[:, k]), a_sim[:, k], a_lim),
+                          -a_lim, a_lim)
+        r_tf = tf_residuals(tfs[d], q_d) if w_tf > 0.0 else None
+        out = np.full(states.shape[0], np.nan)
+        for p in range(states.shape[0]):
+            mk = sim[p]
+            if not mk.any():
+                continue
+            res = 0.0
+            if w_q > 0.0:
+                res += w_q * nrmse(q_d[p], states[p, iq], mk)
+            if w_v > 0.0:
+                res += w_v * nrmse(v_sim[p, k], states[p, iv], mk)
+            if w_a > 0.0:
+                res += w_a * nrmse(a_d[p], a_meas[p], mk)
+            if w_tf > 0.0:
+                res += w_tf * r_tf[p]
+            out[p] = res
+        return out
+
+    shared = len(dofs) > 1 and blown.any()
+    # the unscored DOFs' channels matter only for charging a blow-up
+    res = {d: channel(k, d) for k, d in enumerate(dofs)
+           if shared or d in score}
+    if shared:
+        worst = np.max(np.stack([res[d] for d in dofs]), axis=0)
+        return {d: np.where(blown, worst, res[d]) for d in score}
+    return {d: res[d] for d in score}

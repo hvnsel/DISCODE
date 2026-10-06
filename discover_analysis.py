@@ -449,13 +449,16 @@ def plot_discovered(system, exprs, trial=0, t_end=None, solver='LSODA',
 
 
 def simulation_scores(system, exprs, trials=None, window=None,
-                      weights=(1.0, 0.0, 0.0, 0.0)):
+                      weights=(1.0, 0.0, 0.0, 0.0), coupled=False):
     """Score expressions with the SIMULATION reward (``reward='simulation'``),
     through the same :mod:`discover_rollout` integrator the trainer uses.
 
     Each DOF is integrated on its own from the measured initial state, the
     other DOFs' states read off the record.  Pass the trials the run trained
-    on (its first ``max_traj``) to get the trained number back.
+    on (its first ``max_traj``) to get the trained number back.  With
+    ``coupled=True`` every DOF is integrated together instead, each driven by
+    the others' simulated states -- the full system, as the plot scripts run
+    it, and what the trainer's ``sim_coupling`` scores part of each batch on.
 
     Returns ``(r_sim, rows)`` with ``r_sim = 1 / (1 + mean residual)`` and one
     ``(trial, residual_per_dof)`` row per trial.
@@ -474,7 +477,7 @@ def simulation_scores(system, exprs, trials=None, window=None,
     stride, substeps = ro.auto_steps(t, states, accs)
     with_tf = ro.check_weights(weights)[3] > 0.0
 
-    per_dof = []
+    accels = []
     for clean in cleans:
         code = compile(clean, '<expr>', 'eval')
 
@@ -484,13 +487,21 @@ def simulation_scores(system, exprs, trials=None, window=None,
                 ns[nm] = S[2 * d]
                 ns[nm + 'dot'] = S[2 * d + 1]
             return eval(code, ns)                              # noqa: S307
+        accels.append(accel)
 
-        d = len(per_dof)
-        tf = ro.tf_setup(t, states[:, 2 * d, :], stride) if with_tf else None
-        per_dof.append(ro.rollout_residuals(accel, t, states, d,
-                                            window=window, stride=stride,
-                                            substeps=substeps,
-                                            weights=weights, accs=accs, tf=tf))
+    tfs = ({d: ro.tf_setup(t, states[:, 2 * d, :], stride) for d in range(N)}
+           if with_tf else {})
+    if coupled:
+        together = ro.rollout_set_residuals(
+            dict(enumerate(accels)), t, states, window=window, stride=stride,
+            substeps=substeps, weights=weights, accs=accs, tfs=tfs or None)
+        per_dof = [together[d] for d in range(N)]
+    else:
+        per_dof = [ro.rollout_residuals(accels[d], t, states, d, window=window,
+                                        stride=stride, substeps=substeps,
+                                        weights=weights, accs=accs,
+                                        tf=tfs.get(d))
+                   for d in range(N)]
     res = np.array(per_dof).T                                  # (P, N)
     r_sim = 1.0 / (1.0 + float(np.mean(res)))
     return r_sim, [(tr, list(res[i])) for i, tr in enumerate(keep)]

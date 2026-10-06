@@ -1064,6 +1064,154 @@ def test_tf_term():
           f"no coupling {r_nobeat:.3f}")
 
 
+def test_coupled_scoring():
+    """Several DOFs integrated together, and the trainer's ``sim_coupling``.
+
+    The single-DOF rollout must be the coupled one with one DOF, to the bit,
+    or the alone scores would move.  Integrated together the true equations
+    must reproduce the record; a set that blows up must charge every equation
+    in it; a wrong partner must cost its sound partner something; and the
+    trainer must plan, score and log both coupling schemes end to end.
+    """
+    import contextlib
+    import io
+
+    import discover_rollout as ro
+    import discover_train as dt
+    from discover_analysis import simulation_scores
+    from discover_data import build_truth_system, generate_dataset
+    from discover_mdof_sim import get_mdof_system
+
+    print("\ncoupled scoring")
+    saved = (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+             dc.MAX_TRAJ, dc.W_ACC, dc.REWARD_MODE, dc.SIM_WINDOW,
+             dc.SIM_WEIGHTS)
+    try:
+        spec = get_mdof_system('coupled_duffing')
+        with contextlib.redirect_stdout(io.StringIO()):
+            system = build_truth_system(spec, n_traj=2, n_pts=1000, t_end=10.0)
+        t = np.asarray(system.time, dtype=float)
+        states = np.stack([np.vstack([row for d in range(2) for row in
+                                      (system.disp[:, d, tr], system.vel[:, d, tr])])
+                           for tr in range(system.n_trials)])
+        accs = np.stack([system.acc[:, :, tr].T for tr in range(system.n_trials)])
+        stride, sub = ro.auto_steps(t, states, accs)
+        f0, f1 = spec.accel_fns
+        w = (0.4, 0.3, 0.3)
+
+        same = True
+        for win in (None, 2.0):
+            q, v, a, sim = ro.rollout(f0, t, states, 0, window=win,
+                                      stride=stride, substeps=sub)
+            _d, qs, vs, as_, sims, _b = ro.rollout_set({0: f0}, t, states, win,
+                                                       stride, sub)
+            same &= (np.array_equal(q, qs[:, 0]) and np.array_equal(v, vs[:, 0])
+                     and np.array_equal(a, as_[:, 0], equal_nan=True)
+                     and np.array_equal(sim, sims))
+        check('rollout is rollout_set with one DOF, to the bit', same)
+
+        tog = ro.rollout_set_residuals({0: f0, 1: f1}, t, states, stride=stride,
+                                       substeps=sub, weights=w, accs=accs)
+        check('integrated together, the true equations reproduce the record',
+              max(tog[0].max(), tog[1].max()) < 1e-3,
+              f"worst residual {max(tog[0].max(), tog[1].max()):.1e}")
+
+        def diverge(S):
+            return f1(S) + 5.0 * S[2] ** 3
+        _d, _q, _v, _a, _s, blown = ro.rollout_set({0: f0, 1: diverge}, t,
+                                                   states, None, stride, sub)
+        both = ro.rollout_set_residuals({0: f0, 1: diverge}, t, states,
+                                        stride=stride, substeps=sub, weights=w,
+                                        accs=accs)
+        only0 = ro.rollout_set_residuals({0: f0, 1: diverge}, t, states,
+                                         stride=stride, substeps=sub, weights=w,
+                                         accs=accs, score=[0])
+        check('a set that blows up charges its sound equation the worst '
+              'residual, scored or not',
+              blown.all() and np.allclose(both[0], both[1])
+              and np.allclose(only0[0], both[1]) and both[0].min() > 1.0,
+              f"sound DOF charged {both[0].mean():.2f}")
+
+        # The engine: the worker's modes on the true equations, and a wrong
+        # partner.
+        dc.configure_grammar(2, system.var_names)
+        _X, _y, raw, ns = generate_dataset(system, device=None)
+        dc.set_problem_data(ns, raw, True, None, 0.5)
+        dc.set_reward('simulation', sim_weights=w)
+        T0, T1 = system.truth_taus
+        c1 = dc.optimise_consts_energy(T1, 1)
+        all3 = {'alone': 0.5, 'top': 0.25, 'peer': 0.25}
+        row = dc.coupled_worker(([(0, T0), (1, T1)], {1: (T1, c1)}, None, all3))
+        md = row[0][4]
+        check('the true equations score ~1 alone, with the top and with peers, '
+              'and the reward is the weighted mean',
+              all(row[k][4][m] > 0.999 for k in range(2) for m in md)
+              and abs(row[0][1] - sum(all3[m] * md[m] for m in all3)) < 1e-12,
+              ', '.join(f"{m} {md[m]:.5f}" for m in ('alone', 'top', 'peer')))
+        lone = dc.coupled_worker(([(0, T0)], {}, None, all3))[0][4]
+        check('with no top and no peers, both coupled modes fall back to alone',
+              lone['top'] == lone['alone'] == lone['peer'])
+        nocoup = dc.assemble_terms([['x3'], ['x4']])
+        bad = dc.coupled_worker(([(0, T0), (1, nocoup)], {}, None,
+                                 {'alone': 0.5, 'peer': 0.5}))[0][4]
+        check('a wrong partner costs its sound partner something',
+              bad['peer'] < bad['alone'] - 0.05,
+              f"alone {bad['alone']:.4f}  with the wrong partner {bad['peer']:.4f}")
+        c0 = dc.optimise_consts_energy(T0, 0)
+        r_eng = dc.coupled_simulation_rewards([(T0, c0), (T1, c1)], [0, 1])
+        r_an, _rows = simulation_scores(
+            system, [dc.denormalize_expr(T0, c0, 0), dc.denormalize_expr(T1, c1, 1)],
+            weights=w, coupled=True)
+        check('discover_score reproduces the coupled reward',
+              abs(r_an - 1.0 / (1.0 + np.mean([1 / r_eng[d] - 1 for d in (0, 1)])))
+              < 1e-3, f"engine {r_eng}  printed {r_an:.6f}")
+
+        # The trainer's plan and validation.
+        rng = np.random.default_rng(0)
+        peer, top = dt.coupling_plan(40, [40, 45], 0.25, 0.25, rng)
+        check('the split plan draws the right counts, disjoint from the peer rows',
+              len(peer) == len(set(peer)) == 10 and max(peer) < 40
+              and [len(x) for x in top] == [10, 11]
+              and not (top[0] & set(peer)) and not (top[1] & set(peer)))
+        refused = 0
+        for args in [((0.6, 0.6), 'simulation', 2, 'split'),
+                     ((0.25, 0.0), 'energy', 2, 'split'),
+                     ((0.25, 0.0), 'simulation', 1, 'split'),
+                     ((0.25, 0.0), 'simulation', 2, 'mix'),
+                     ((0.25,), 'simulation', 2, 'split')]:
+            try:
+                dt.check_coupling(*args)
+            except ValueError:
+                refused += 1
+        check('bad couplings are refused, and none is fine anywhere',
+              refused == 5
+              and dt.check_coupling((0, 0), 'energy', 1) == (0.0, 0.0))
+
+        for scheme in ('split', 'blend'):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                best = dt.DISCOVER_TRAIN(
+                    system, n_epochs=2, batch_size=6, max_len=12, C=1,
+                    use_pool=False, reward='simulation', sim_weights=w,
+                    sim_coupling=(0.34, 0.34), sim_coupling_mode=scheme,
+                    n_layers=1, d_model=16, max_terms=2, max_term_len=4,
+                    seed=0)
+            log = buf.getvalue()
+            tag = 'with top 2:' if scheme == 'split' else ' = alone '
+            check(f"a '{scheme}' run trains end to end and logs every mode",
+                  all(b is not None for b in best) and tag in log
+                  and 'Best equations simulated together' in log,
+                  [ln.strip() for ln in log.splitlines()
+                   if 'DOF 0  ' in ln][-1:])
+    finally:
+        dc.configure_grammar(N_DOF)
+        (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+         dc.MAX_TRAJ, dc.W_ACC) = saved[:5]
+        dc.set_reward(*saved[5:])
+        dc._SIM_DATA.clear()
+        dc._TF_DATA.clear()
+
+
 def test_scoring_pool():
     """The scoring pool (:func:`discover_core.make_pool`).
 
@@ -1140,6 +1288,7 @@ def main():
     test_intpower()
     test_simulation_reward()
     test_tf_term()
+    test_coupled_scoring()
     test_scoring_pool()
 
     print(f"\n{'=' * 60}")

@@ -35,7 +35,9 @@ integrated forward on its own from the measured initial state, the other DOFs'
 states read off the record, scored by the NRMSE of its displacement (see
 :mod:`discover_rollout`).  There is no ceiling for that reward.  Use the trials
 the run trained on (its first ``max_traj``) and the same ``SIM_WINDOW`` /
-``SIM_WEIGHTS`` to get the trained number back.
+``SIM_WEIGHTS`` to get the trained number back.  ``SIM_COUPLED = True``
+integrates every DOF together instead, each driven by the others' simulated
+states: the whole set as the plot scripts run it.
 
 Note the reward convention: ``1/(1 + mean_d res_d)``, the reward of the mean
 residual, NOT ``mean_d [ 1/(1+res_d) ]``.  The second is always the larger of
@@ -79,6 +81,8 @@ REWARD           = 'energy'      # 'energy' | 'simulation' — as in the run
 SIM_WINDOW       = None          # simulation: None = one free run per trial
 SIM_WEIGHTS      = (1.0, 0.0, 0.0, 0.0)   # simulation: (disp, vel, acc,
                                      # time-frequency) weights, summing to 1
+SIM_COUPLED      = False         # simulation: True = all DOFs integrated
+                                 # together, not each against the record
 
 # One physical expression per DOF.
 EXPRS = [
@@ -120,7 +124,7 @@ def build_system():
 
 def score(exprs=None, system=None, trials=TRIALS, normalize=ENERGY_NORMALIZE,
           verbose=True, reward=REWARD, sim_window=SIM_WINDOW,
-          sim_weights=SIM_WEIGHTS):
+          sim_weights=SIM_WEIGHTS, sim_coupled=SIM_COUPLED):
     exprs = EXPRS if exprs is None else exprs
     if not exprs or not any(str(e).strip() for e in exprs):
         print(__doc__.split('What it reports')[0])
@@ -148,7 +152,7 @@ def score(exprs=None, system=None, trials=TRIALS, normalize=ENERGY_NORMALIZE,
 
     if reward == 'simulation':
         return score_simulation(system, exprs, keep, sim_window, sim_weights,
-                                verbose)
+                                verbose, coupled=sim_coupled)
 
     r_pred, r_ceil, rows = score_system(system, exprs, normalize=normalize,
                                         trials=keep, verbose=verbose)
@@ -175,14 +179,18 @@ def score(exprs=None, system=None, trials=TRIALS, normalize=ENERGY_NORMALIZE,
     return r_pred, r_ceil
 
 
-def score_simulation(system, exprs, trials, window, weights, verbose=True):
+def score_simulation(system, exprs, trials, window, weights, verbose=True,
+                     coupled=False):
     """The simulation reward, per trial and DOF.  Returns ``(r_sim, None)``."""
     N = system.n_dof
     r_sim, rows = simulation_scores(system, exprs, trials=trials,
-                                    window=window, weights=weights)
+                                    window=window, weights=weights,
+                                    coupled=coupled)
     if verbose:
         how = ('one free run per trial' if window is None else
                f'restarted every {window:g} s')
+        how += (', all DOFs integrated together' if coupled else
+                ', each DOF against the recorded others')
         print(f"\n  forward simulation, {how}, weights "
               f"(disp, vel, acc, tf) = {tuple(weights)}")
         print(f"\n{'trial':>6}"
