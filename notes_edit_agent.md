@@ -108,9 +108,10 @@ own separability test.
 workers left at OpenBLAS's default of one thread per core fitted 90 bags in
 34.5 s — three times slower than fitting them serially (11.0 s) — because
 3 × 4 BLAS threads fight over 4 cores on small least-squares solves. With one
-BLAS thread per worker the same pool takes 3.6–4.4 s. The add-on spawns
-single-threaded workers (`make_pool`). `DISCOVER_TRAIN` builds its pool the
-same default way and is not touched here; it is worth the same fix.
+BLAS thread per worker the same pool takes 3.6–4.4 s. Both trainers now spawn
+single-threaded workers through `discover_core.make_pool`. `DISCOVER_TRAIN`'s
+old default pool also ran a Windows machine out of memory ("OpenBLAS error:
+Memory allocation still failed after 10 retries").
 
 **Plain correlation is the wrong residual feature.** It is scale-free, so on
 van der Pol's fitted truth it reported 0.995 against `x` — a shape the equation

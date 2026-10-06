@@ -33,10 +33,8 @@ policy happens to stop.  The greedy policy's own answer is reported alongside.
 
 from __future__ import annotations
 
-import multiprocessing as mp
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import torch
@@ -48,41 +46,6 @@ from discover_edit_policy import EditPolicy, masked_dist
 
 
 N_WORKERS = max(1, min(os.cpu_count() or 4, 3))
-_THREAD_VARS = ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS')
-
-
-def make_pool(initargs, n_workers=N_WORKERS):
-    """A scoring pool of SINGLE-THREADED workers; returns ``(pool, saved_env)``
-    -- hand both to :func:`close_pool`.
-
-    Measured on 90 duffing bags: three workers left at OpenBLAS's default of
-    one thread per core took 34.5 s, three times SLOWER than fitting the same
-    bags serially (11.0 s), because 3 x 4 BLAS threads fight over 4 cores on
-    small least-squares solves.  With one BLAS thread each the pool takes
-    4.4 s.  The thread count is read when numpy loads, so the workers are
-    SPAWNED -- fresh interpreters that see the setting -- rather than forked,
-    which would inherit this process's already-initialised thread pool.  And
-    the setting must hold for the pool's whole life, not just its creation:
-    a spawn pool starts workers on demand, and one started after the variables
-    were restored came up with 7 threads.
-    """
-    saved = {k: os.environ.get(k) for k in _THREAD_VARS}
-    os.environ.update({k: '1' for k in _THREAD_VARS})
-    pool = ProcessPoolExecutor(max_workers=n_workers,
-                               mp_context=mp.get_context('spawn'),
-                               initializer=dc.init_energy_worker,
-                               initargs=initargs)
-    return pool, saved
-
-
-def close_pool(pool, saved):
-    """Shut the pool down, then restore the thread variables it needed."""
-    pool.shutdown(wait=True, cancel_futures=True)
-    for k, v in saved.items():
-        if v is None:
-            os.environ.pop(k, None)
-        else:
-            os.environ[k] = v
 
 
 class HallOfFame:
@@ -408,10 +371,11 @@ def DISCOVER_EDIT_TRAIN(
 
     pool = saved_env = None
     if use_pool:
-        pool, saved_env = make_pool((N, system.var_names, norm_stats, raw_trajs,
-                                     energy_normalize, max_traj, w_acc,
-                                     directional_leaves, transcendental,
-                                     reward, sim_window, sim_weights))
+        pool, saved_env = dc.make_pool((N, system.var_names, norm_stats,
+                                        raw_trajs, energy_normalize, max_traj,
+                                        w_acc, directional_leaves,
+                                        transcendental, reward, sim_window,
+                                        sim_weights), N_WORKERS)
     try:
         scorer = ee.Scorer(spec, pool, residual_features)
         _print_truth(system, spec, scorer)
@@ -523,4 +487,4 @@ def DISCOVER_EDIT_TRAIN(
                 'policy': policy, 'spec': spec, 'scorer': scorer}
     finally:
         if pool is not None:
-            close_pool(pool, saved_env)
+            dc.close_pool(pool, saved_env)
