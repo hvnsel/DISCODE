@@ -34,8 +34,9 @@ stacked least-squares solve, so it keeps the closed-form constant fit.
 -----------------------
 Instead of the balance, each candidate is integrated forward from the measured
 initial state and scored by the NRMSEs of its simulated displacement, velocity
-and acceleration against the record, weighted by ``sim_weights`` (summing to
-1; displacement only by default -- see :mod:`discover_rollout`).  Scored on
+and acceleration against the record, plus a phase-blind time-frequency term
+that sees beats, weighted by ``sim_weights`` (summing to 1; displacement only
+by default -- see :mod:`discover_rollout`).  Scored on
 displacement it needs no derivative relation between the channels, only the
 initial velocity, so it is the reward to try when the ceiling is low.  The
 ceiling bounds the energy reward only and is not printed under it.
@@ -80,8 +81,8 @@ def DISCOVER_MDOF_EXP(
     reward           = 'energy',   # 'energy' | 'simulation'
     sim_window       = None,       # simulation: None = one free run per trial,
                                    #   else restart from the record every N s
-    sim_weights      = (1.0, 0.0, 0.0),  # simulation: (disp, vel, acc) NRMSE
-                                   #   weights, summing to 1
+    sim_weights      = (1.0, 0.0, 0.0, 0.0),  # simulation: (disp, vel, acc,
+                                   #   time-frequency) weights, summing to 1
     use_pool         = True,
     # policy (see DISCOVER_TRAIN)
     cross_slice_attention = True,

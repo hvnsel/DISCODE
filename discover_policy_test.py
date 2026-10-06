@@ -816,14 +816,25 @@ def test_simulation_reward():
         # The weights: three, non-negative, summing to 1 -- and the residual
         # is exactly their weighted sum of the per-channel NRMSEs.
         bad_ok = True
-        for bad in ((0.5, 0.5, 0.5), (1.2, -0.2, 0.0), (1.0, 0.0), (0.5, 0.5, None)):
+        for bad in ((0.5, 0.5, 0.5), (1.2, -0.2, 0.0), (1.0, 0.0),
+                    (0.5, 0.5, None), (0.2, 0.2, 0.2, 0.2, 0.2),
+                    (0.5, 0.5, 0.0, 0.5)):
             try:
                 dc.set_reward('simulation', sim_weights=bad)
                 bad_ok = False
             except ValueError:
                 pass
-        check('sim_weights that are not three non-negatives summing to 1 '
-              'are refused', bad_ok)
+        good_ok = (ro.check_weights((0.5, 0.5, 0.0)) == (0.5, 0.5, 0.0, 0.0)
+                   and ro.check_weights((0.5, 0, 0, 0.5)) == (0.5, 0, 0, 0.5))
+        check('sim_weights must be three or four non-negatives summing to 1 '
+              '(three means no time-frequency term)', bad_ok and good_ok)
+        try:
+            dc.set_reward('simulation', sim_window=2.0,
+                          sim_weights=(0.5, 0, 0, 0.5))
+            win_ok = False
+        except ValueError:
+            win_ok = True
+        check('the time-frequency weight is refused with restart windows', win_ok)
         def lin(S):                                    # the linear model
             return -1.0 * S[0] - 0.3 * S[1]
         parts = [ro.rollout_residuals(lin, t, states, 0, stride=stride,
@@ -875,6 +886,18 @@ def test_simulation_reward():
                                          weights=(0.4, 0.3, 0.3))
         check('...and discover_score reproduces it', abs(r_an3 - r_tm) < 1e-3,
               f"engine {r_tm:.6f}  printed {r_an3:.6f}")
+        dc.set_reward('simulation', sim_weights=(0.5, 0, 0, 0.5))
+        r_tt = dc.candidate_reward([(truth, ct)])
+        r_wt = dc.candidate_reward([(wrong, cw)])
+        r_an4, _rows = simulation_scores(system, [dc.denormalize_expr(truth, ct, 0)],
+                                         weights=(0.5, 0, 0, 0.5))
+        out = dc.energy_worker((0, truth, None, None))
+        check('with the time-frequency weight: truth ~1, linear model clearly '
+              'below, and discover_score and the pool worker agree',
+              r_tt > 0.99 and r_wt < r_tt - 0.05 and abs(r_an4 - r_tt) < 1e-3
+              and out is not None
+              and abs(out[1] - dc.simulation_reward([(truth, out[3])])) < 1e-12,
+              f"truth {r_tt:.6f}  linear {r_wt:.4f}  printed {r_an4:.6f}")
         dc.set_reward('simulation')                    # back to displacement
         try:
             dc.set_reward('bogus')
@@ -931,6 +954,116 @@ def test_simulation_reward():
         dc._SIM_DATA.clear()
 
 
+def test_tf_term():
+    """The time-frequency term of the simulation reward (``w_tf``).
+
+    It exists to give credit for HOW an oscillation's amplitude evolves --
+    beats above all -- without the phase-sensitivity that makes point-by-point
+    NRMSE score every slightly-detuned equation the same.  Each property it is
+    there for is checked on synthetic signals, then on coupled_beats.
+    """
+    import contextlib
+    import io
+
+    import discover_rollout as ro
+    from discover_data import build_truth_system, generate_dataset
+    from discover_mdof_sim import get_mdof_system
+
+    def nrmse(a, b):
+        return float(np.sqrt(np.mean((a - b) ** 2)) / np.std(b))
+
+    def r_tf(sim, meas, t):
+        st = ro.tf_setup(t, meas[None, :], 1)
+        return float(ro.tf_residuals(st, sim[None, :])[0]), st
+
+    print("\ntime-frequency term")
+    t = np.linspace(0.0, 100.0, 10001)
+
+    tone = 0.7 * np.cos(2 * np.pi * 0.96 * t)
+    st = ro.tf_setup(t, tone[None, :], 1)
+    k = int(np.argmin(np.abs(st['bands'] - 0.96)))
+    amp = np.exp(st['logA'][0, k]) - st['eps'][k]
+    med = float(np.median(amp[st['valid'][k]]))
+    check('a band reads the amplitude of a tone at its centre', abs(med - 0.7) < 0.014,
+          f"{med:.4f} for 0.7")
+
+    x = np.exp(-t / 60) * np.cos(2 * np.pi * t)
+    shifted = np.exp(-t / 60) * np.cos(2 * np.pi * t + np.pi / 2)
+    r_same, _ = r_tf(x, x, t)
+    r_shift, _ = r_tf(shifted, x, t)
+    check('identical signals cost 0 and a quarter-period shift almost nothing',
+          r_same < 1e-9 and r_shift < 0.05 and nrmse(shifted, x) > 0.5,
+          f"shift: R_tf {r_shift:.4f}, NRMSE {nrmse(shifted, x):.3f}")
+
+    meas = np.cos(2 * np.pi * 1.00 * t) + np.cos(2 * np.pi * 1.05 * t)
+    r_none, _ = r_tf(np.sqrt(2) * np.cos(2 * np.pi * 1.025 * t), meas, t)
+    graded = [r_tf(np.cos(2 * np.pi * t) + np.cos(2 * np.pi * f2 * t), meas, t)[0]
+              for f2 in (1.051, 1.052, 1.053, 1.055)]
+    far = [r_tf(np.cos(2 * np.pi * t) + np.cos(2 * np.pi * f2 * t), meas, t)[0]
+           for f2 in (1.06, 1.07, 1.10)]
+    check('a beat period slightly off is graded, and any beat beats no beat',
+          all(a < b for a, b in zip(graded, graded[1:]))
+          and max(graded + far) < r_none,
+          f"no beat {r_none:.3f}; off by 1/2/3/5 mHz "
+          f"{', '.join(f'{g:.3f}' for g in graded)}; far {', '.join(f'{g:.3f}' for g in far)}")
+
+    t5 = np.linspace(0.0, 40.0, 4001)
+    slow_fast = (np.exp(-t5 / 5) * np.cos(2 * np.pi * 0.5 * t5)
+                 + np.exp(-t5 / 50) * np.cos(2 * np.pi * 2.0 * t5))
+    centre_off = (np.exp(-t5 / 2.5) * np.cos(2 * np.pi * 0.5 * t5)
+                  + np.exp(-t5 / 50) * np.cos(2 * np.pi * 2.0 * t5))
+    r_c, st5 = r_tf(centre_off, slow_fast, t5)
+    bands = st5['bands']
+    check('a moving centre (slower mode) gets its own bands and is compared there',
+          r_c > 0.1 and (bands < 1.0).any() and (bands > 1.4).any()
+          and not ((bands > 0.9) & (bands < 1.3)).any(),
+          f"R_tf {r_c:.3f}, bands {np.round(bands, 2)}")
+
+    decay = np.exp(-t5 / 10)
+    r_d, st6 = r_tf(np.exp(-t5 / 8), decay, t5)
+    check('a non-oscillating decay finds no bands and is scored by the trend',
+          len(st6['bands']) == 0 and r_d > 0.05
+          and r_tf(decay, decay, t5)[0] < 1e-9,
+          f"tau 8 vs 10: R_tf {r_d:.3f}")
+
+    frozen = x.copy()
+    frozen[5000:] = frozen[4999]
+    r_f, _ = r_tf(frozen, x, t)
+    r_det, _ = r_tf(np.exp(-t / 60) * np.cos(2 * np.pi * 1.01 * t), x, t)
+    check('a run frozen by the blow-up guard costs far more than a detuned one',
+          np.isfinite(r_f) and r_f > 5 * r_det, f"{r_f:.3f} vs {r_det:.3f}")
+
+    # coupled_beats: mass 1 simulated against the measured mass 2
+    with contextlib.redirect_stdout(io.StringIO()):
+        system = build_truth_system(get_mdof_system('coupled_beats'))
+    _X, _y, raw, _ns = generate_dataset(system, device=None)
+    tb = raw[0][0]
+    states = np.stack([r[2] for r in raw])
+    accs = np.stack([r[3] for r in raw])
+    stride, sub = ro.auto_steps(tb, states, accs)
+    tf0 = ro.tf_setup(tb, states[:, 0, :], stride)
+
+    def mass1(dk=0.0, coupled=True):
+        def a(S):
+            return (-4.0 * (1 + dk) * S[0] - 0.4 * (S[0] - (S[2] if coupled else 0.0))
+                    - 0.03 * S[1])
+        return a
+
+    def tf_of(acc):
+        return float(ro.rollout_residuals(acc, tb, states, 0, stride=stride,
+                                          substeps=sub, weights=(0, 0, 0, 1),
+                                          tf=tf0).mean())
+
+    sweep = [tf_of(mass1(dk)) for dk in (0.0, 0.0025, 0.01, 0.02, 0.05)]
+    r_nobeat = tf_of(mass1(coupled=False))
+    check('coupled_beats: R_tf ~0 at the truth and grows with the stiffness error; '
+          'dropping the coupling costs more than a 2% error',
+          sweep[0] < 1e-3 and all(a < b for a, b in zip(sweep, sweep[1:]))
+          and r_nobeat > sweep[3],
+          f"0/0.25/1/2/5%: {', '.join(f'{v:.3f}' for v in sweep)}; "
+          f"no coupling {r_nobeat:.3f}")
+
+
 def main():
     dc.configure_grammar(N_DOF)
     print(f"grammar: {dc.ALL_TOKENS}  (N_TOKENS={dc.N_TOKENS})")
@@ -950,6 +1083,7 @@ def main():
     test_blend()
     test_intpower()
     test_simulation_reward()
+    test_tf_term()
 
     print(f"\n{'=' * 60}")
     print(f"{len(_PASS)} passed, {len(_FAIL)} failed")

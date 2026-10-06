@@ -449,7 +449,7 @@ def plot_discovered(system, exprs, trial=0, t_end=None, solver='LSODA',
 
 
 def simulation_scores(system, exprs, trials=None, window=None,
-                      weights=(1.0, 0.0, 0.0)):
+                      weights=(1.0, 0.0, 0.0, 0.0)):
     """Score expressions with the SIMULATION reward (``reward='simulation'``),
     through the same :mod:`discover_rollout` integrator the trainer uses.
 
@@ -472,6 +472,7 @@ def simulation_scores(system, exprs, trials=None, window=None,
         for tr in keep])                                       # (P, 2N, m)
     accs = np.stack([system.acc[:, :, tr].T for tr in keep])   # (P, N, m)
     stride, substeps = ro.auto_steps(t, states, accs)
+    with_tf = ro.check_weights(weights)[3] > 0.0
 
     per_dof = []
     for clean in cleans:
@@ -484,10 +485,12 @@ def simulation_scores(system, exprs, trials=None, window=None,
                 ns[nm + 'dot'] = S[2 * d + 1]
             return eval(code, ns)                              # noqa: S307
 
-        per_dof.append(ro.rollout_residuals(accel, t, states, len(per_dof),
+        d = len(per_dof)
+        tf = ro.tf_setup(t, states[:, 2 * d, :], stride) if with_tf else None
+        per_dof.append(ro.rollout_residuals(accel, t, states, d,
                                             window=window, stride=stride,
                                             substeps=substeps,
-                                            weights=weights, accs=accs))
+                                            weights=weights, accs=accs, tf=tf))
     res = np.array(per_dof).T                                  # (P, N)
     r_sim = 1.0 / (1.0 + float(np.mean(res)))
     return r_sim, [(tr, list(res[i])) for i, tr in enumerate(keep)]

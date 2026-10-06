@@ -8,8 +8,9 @@ known set of coupled equations, so the work-energy identity closes exactly and
 the reward ceiling is ~1.0.  The only question is whether the search recovers
 the equations.
 
-The library here is deliberately generic — coupled Duffing oscillators, not any
-particular rig.  Each DOF's truth is a sum of terms that the grammar can write
+The library here is deliberately generic — coupled Duffing oscillators, and a
+pair of identical weakly coupled oscillators that beat (``coupled_beats``), not
+any particular rig.  Each DOF's truth is a sum of terms that the grammar can write
 exactly, which matters: if the truth is not representable, the best achievable
 reward is unknown and a shortfall can't be attributed to the search.
 
@@ -179,10 +180,59 @@ def _cubic_coupled():
     )
 
 
+def _coupled_beats():
+    """Two IDENTICAL oscillators joined by a weak spring -- beats (unit masses)::
+
+        q1'' = -k*q1 - kc*(q1 - q2) - c*q1'
+        q2'' = -k*q2 - kc*(q2 - q1) - c*q2'
+
+    The normal modes are in phase at w1 = sqrt(k) = 2.00 rad/s and in
+    anti-phase at w2 = sqrt(k + 2 kc) = 2.19 rad/s.  Close frequencies beat:
+    energy put into one mass drains through the coupling spring into the other
+    and back, the two amplitude envelopes alternating with period
+    2 pi / (w2 - w1) = 33 s, a full hand-over every ~16 s.  ``ic_scale``
+    starts every trial with its energy in mass 1 so the exchange is complete,
+    and ``t_end`` covers two round trips.  Keep it at 100 Hz: at 50 Hz the
+    trapezoid rule under-resolves ``v*a`` over a record this long and the
+    ceiling drops to 0.998.
+
+    The per-DOF work-energy reward is at its most demanding here: each mass's
+    energy is almost entirely the power flowing through the coupling, so a
+    candidate without the coupling term cannot close its balance at all.
+    """
+    k, kc, c = 4.00, 0.40, 0.03
+
+    def a0(s):
+        q1, v1, q2, _v2 = s
+        return -k * q1 - kc * (q1 - q2) - c * v1
+
+    def a1_(s):
+        q1, _v1, q2, v2 = s
+        return -k * q2 - kc * (q2 - q1) - c * v2
+
+    return TruthSystem(
+        name='mdof_coupled_beats',
+        accel_fns=[a0, a1_],
+        truth_strs=[
+            f"xddot = {-(k+kc):.4g}*x {+kc:+.4g}*y {-c:+.4g}*xdot",
+            f"yddot = {+kc:.4g}*x {-(k+kc):+.4g}*y {-c:+.4g}*ydot",
+        ],
+        truth_taus=[
+            ['add', 'x1', 'x2', 'x3', 'end'],        # q1, qd1, q2
+            ['add', 'x1', 'x3', 'x4', 'end'],        # q1, q2, qd2
+        ],
+        var_names=['x', 'y'],
+        t_end=66.0, n_pts=6600, n_traj=4,
+        ic_scale=[1.5, 0.5, 0.1, 0.1],
+        seed=0,
+    )
+
+
 _REGISTRY = {
     'coupled_duffing': _coupled_duffing,
     'duffing_chain3':  _duffing_chain3,
     'cubic_coupled':   _cubic_coupled,
+    'coupled_beats':   _coupled_beats,
 }
 
 
@@ -225,8 +275,8 @@ def DISCOVER_MDOF_SIM(
     reward           = 'energy',   # 'energy' | 'simulation'
     sim_window       = None,       # simulation: None = one free run per trial,
                                    #   else restart from the record every N s
-    sim_weights      = (1.0, 0.0, 0.0),  # simulation: (disp, vel, acc) NRMSE
-                                   #   weights, summing to 1
+    sim_weights      = (1.0, 0.0, 0.0, 0.0),  # simulation: (disp, vel, acc,
+                                   #   time-frequency) weights, summing to 1
     use_pool         = True,
     # policy (see DISCOVER_TRAIN)
     cross_slice_attention = True,

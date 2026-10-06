@@ -77,8 +77,8 @@ TRIALS           = None          # None = every trial; or e.g. [1, 2]
 ENERGY_NORMALIZE = True
 REWARD           = 'energy'      # 'energy' | 'simulation' — as in the run
 SIM_WINDOW       = None          # simulation: None = one free run per trial
-SIM_WEIGHTS      = (1.0, 0.0, 0.0)   # simulation: (disp, vel, acc) NRMSE
-                                     # weights, summing to 1
+SIM_WEIGHTS      = (1.0, 0.0, 0.0, 0.0)   # simulation: (disp, vel, acc,
+                                     # time-frequency) weights, summing to 1
 
 # One physical expression per DOF.
 EXPRS = [
@@ -183,8 +183,8 @@ def score_simulation(system, exprs, trials, window, weights, verbose=True):
     if verbose:
         how = ('one free run per trial' if window is None else
                f'restarted every {window:g} s')
-        print(f"\n  forward simulation, {how}, NRMSE weights "
-              f"(disp, vel, acc) = {tuple(weights)}")
+        print(f"\n  forward simulation, {how}, weights "
+              f"(disp, vel, acc, tf) = {tuple(weights)}")
         print(f"\n{'trial':>6}"
               + ''.join(f"{'r DOF'+str(d):>12}" for d in range(N))
               + f"{'r trial':>11}")

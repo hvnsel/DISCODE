@@ -429,7 +429,7 @@ def identity_ceiling(system, verbose=True, warn=False):
 def print_truth_rewards(system, max_traj=None, w_acc=None,
                         energy_normalize=True, directional_leaves=False,
                         transcendental=False, reward='energy',
-                        sim_window=None, sim_weights=(1.0, 0.0, 0.0)):
+                        sim_window=None, sim_weights=(1.0, 0.0, 0.0, 0.0)):
     """Score the known truth structure of each DOF with the training reward.
 
     Requires ``system.truth_taus``.  Constants are fitted by the same
