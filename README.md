@@ -98,7 +98,7 @@ Every driver and `DISCOVER_TRAIN` take `reward`:
 | `reward` | a candidate is scored by |
 |---|---|
 | `'energy'` (default) | the work-energy residual blended with acceleration NRMSE by `w_acc`, on the measured states (above) |
-| `'simulation'` | integrating it forward from the measured initial state and taking the weighted NRMSEs of its simulated displacement, velocity and acceleration against the measured ones (displacement only by default) |
+| `'simulation'` | integrating it forward from the measured initial state and comparing the result with the record: weighted NRMSEs of displacement, velocity and acceleration, plus an optional phase-blind time-frequency term (displacement NRMSE only by default) |
 
 Both map a residual `e` to `r = 1/(1+e)` and both are per DOF, so everything
 after the score — buffers, GRPO, the hall of fame — is shared. The constants are
@@ -118,13 +118,42 @@ Two more knobs, used only by `'simulation'`:
 | knob | default | what it does |
 |---|---|---|
 | `sim_window` | `None` | `None` is one free run per trial, from its first sample to its last. A number restarts the simulation from the measured state every that many seconds (multiple shooting). A small frequency error then costs a bounded phase error per window instead of one that grows over the whole record, and it runs faster |
-| `sim_weights` | `(1.0, 0.0, 0.0)` | the NRMSE weights of (displacement, velocity, acceleration): `w_q*NRMSE(q) + w_v*NRMSE(qdot) + w_a*NRMSE(qddot)`. Non-negative and summing to 1, or the run refuses to start. The acceleration is the equation's own along its simulated trajectory, its right-hand side at the simulated state, compared with the measured acceleration |
+| `sim_weights` | `(1.0, 0.0, 0.0, 0.0)` | the weights of (displacement, velocity, acceleration, time-frequency): `w_q*NRMSE(q) + w_v*NRMSE(qdot) + w_a*NRMSE(qddot) + w_tf*R_tf`. Non-negative and summing to 1, or the run refuses to start; a 3-tuple means `w_tf = 0`. The acceleration is the equation's own along its simulated trajectory, its right-hand side at the simulated state, compared with the measured acceleration. `R_tf` is below; it needs `sim_window=None` |
 
 The integrator is RK4 on the record's own samples. The step is sized from the
 data: at least 50 steps per cycle of the fastest measured motion, so an
 oversampled simulated record is stepped every few samples and a coarse one gets
 substeps. An equation that diverges is frozen at 10× the largest measured
 amplitude and scores a large but finite residual.
+
+**The time-frequency term (`w_tf`)** is for beats and anything else that lives in
+how an oscillation's amplitude evolves. Point-by-point NRMSE is phase-sensitive:
+over a long free run a small frequency error slides the simulation out of phase,
+NRMSE climbs to ~1, and every slightly-wrong equation scores the same. Beats make
+that worse, because the beat frequency is a *difference* of two close frequencies,
+so it amplifies coefficient errors by f/Δf. `R_tf` instead compares the local
+amplitude in each frequency band over time (an analytic Morlet filter bank on the
+displacement, bands chosen from the record), plus a signed slow trend:
+
+- **Phase:** a band's amplitude ignores phase. A quarter-period shift of a
+  decaying tone costs 0.006, where NRMSE reads 1.42.
+- **Beats:** two close frequencies in one band make its amplitude rise and fall.
+  On two tones 0.05 Hz apart, a single unmodulated tone costs 1.07. Beats off by
+  0.001, 0.003 and 0.005 Hz cost 0.17, 0.41 and 0.55, and wrong-period beats stay
+  between 0.55 and 0.7 out to 0.05 Hz off. The level and modulation depth of each band are also
+  compared regardless of timing, which is why the wrong-period beats stay below
+  the unmodulated tone.
+- **Moving centre:** a slower mode that the motion rides on sits in its own band
+  and cannot fake a modulation.
+- **No oscillation:** creep, drift or a decaying offset finds no bands and lands
+  in the trend, so the term reduces to a smoothed NRMSE.
+- **Graded on `coupled_beats`:** with mass 1 simulated against the measured mass
+  2, a 0.25 / 1 / 2 / 5 % stiffness error costs 0.06 / 0.24 / 0.50 / 1.17, and
+  dropping the coupling (no beats) costs 1.12.
+
+Amplitudes discard the phase between DOFs, so keep some displacement weight, e.g.
+`sim_weights=(0.5, 0, 0, 0.5)`. It costs ~3 ms per candidate on a 1300-sample
+grid with 4 trials. Its constants live in `discover_rollout.py` (`TF_*`).
 
 Measured per candidate on the simulated registry (4 trials, 1500–2500 samples),
 a free run costs 25–150 ms and a 2 s window 3–15 ms, against ~2 ms for the energy

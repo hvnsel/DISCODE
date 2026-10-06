@@ -264,9 +264,10 @@ def DISCOVER_TRAIN(
     sim_window       = None,   # simulation: None = one free run per trial,
                                # a number = restart from the record every
                                # sim_window seconds
-    sim_weights      = (1.0, 0.0, 0.0),  # simulation: NRMSE weights of
-                               # (displacement, velocity, acceleration),
-                               # non-negative and summing to 1
+    sim_weights      = (1.0, 0.0, 0.0, 0.0),  # simulation: weights of
+                               # (displacement, velocity, acceleration,
+                               # time-frequency), non-negative, summing to 1;
+                               # time-frequency needs sim_window=None
     use_pool         = True,
     center_features  = False,  # see generate_dataset(): scale-only by default
     # ── policy (see discover_policy) ───────────────────────────────────────
@@ -292,9 +293,12 @@ def DISCOVER_TRAIN(
     work-energy residual blended with acceleration NRMSE by ``w_acc``.
     ``'simulation'`` integrates each candidate forward from the measured
     initial state -- one DOF at a time, the other DOFs' states read off the
-    record -- and scores ``w_q*NRMSE(q) + w_v*NRMSE(qdot) + w_a*NRMSE(a)``
-    against the record, ``sim_weights = (w_q, w_v, w_a)`` summing to 1 (the
-    acceleration is the equation's own along its simulated trajectory).
+    record -- and scores ``w_q*NRMSE(q) + w_v*NRMSE(qdot) + w_a*NRMSE(a)
+    + w_tf*R_tf`` against the record, ``sim_weights = (w_q, w_v, w_a, w_tf)``
+    summing to 1.  The acceleration is the equation's own along its simulated
+    trajectory; ``R_tf`` compares the local amplitude in each frequency band
+    over time, so it sees beats and is blind to phase drift (see
+    :mod:`discover_rollout`; it needs ``sim_window=None``).
     ``sim_window`` restarts the simulation from the record every that many
     seconds instead of one free run per trial.  Constants are fitted the same
     way under both.

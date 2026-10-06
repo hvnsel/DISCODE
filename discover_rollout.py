@@ -8,13 +8,51 @@ integrator behind the simulation reward (``reward='simulation'``)::
     residual_d = w_q * NRMSE(q_d_sim, q_d)
                + w_v * NRMSE(qd_d_sim, qd_d)
                + w_a * NRMSE(a_d_sim, a_d)
+               + w_tf * R_tf(q_d_sim, q_d)
 
-per trial, with ``weights = (w_q, w_v, w_a)`` non-negative and summing to 1.
-NRMSE is the RMS error over the simulated samples divided by the measured
-channel's standard deviation over that trial.  ``a_d_sim`` is the equation's
-own acceleration along its simulated trajectory -- its right-hand side
-evaluated at the simulated state -- not a finite difference of the simulated
-velocity.
+per trial, with ``weights = (w_q, w_v, w_a, w_tf)`` non-negative and summing
+to 1 (a 3-tuple means ``w_tf = 0``).  NRMSE is the RMS error over the
+simulated samples divided by the measured channel's standard deviation over
+that trial.  ``a_d_sim`` is the equation's own acceleration along its
+simulated trajectory -- its right-hand side evaluated at the simulated state
+-- not a finite difference of the simulated velocity.  ``R_tf`` is the
+time-frequency term, below.
+
+Time-frequency term
+-------------------
+Point-by-point NRMSE is phase-sensitive: over a long free run any small
+frequency error slides the simulated oscillation out of phase, NRMSE climbs to
+~1 and stays there, and every slightly-wrong equation scores the same.  Beats
+-- slow amplitude modulation from two close frequencies -- are where that
+hurts most, because the beat frequency is a DIFFERENCE of frequencies and so
+amplifies every coefficient error by f / delta_f.
+
+``R_tf`` compares the local amplitude in each frequency band over time
+instead of the raw signal (an analytic Morlet filter bank on the displacement,
+:func:`tf_setup` / :func:`tf_residuals`), plus a signed slow trend:
+
+* the amplitude of ``a cos(2 pi f t + phi)`` in the band at ``f`` is ``a`` for
+  any ``phi``, so a run that has slipped in phase but has the right amplitude
+  history is not punished;
+* two close frequencies inside one band make that band's amplitude rise and
+  fall at ``delta_f`` -- a beat -- and an equation without the modulation pays
+  its full depth;
+* each band's amplitude level and modulation depth are also compared
+  regardless of timing, so an equation that beats at the wrong rate still
+  scores better than one that does not beat (:func:`tf_residuals`);
+* motion about a centre that itself oscillates and decays (another, slower
+  mode) has that centre in its own band, so it cannot fake a modulation;
+* non-oscillatory motion -- drift, creep, a decaying offset -- has no band
+  content and lands in the signed trend, where the term reduces to a smoothed
+  NRMSE.
+
+Amplitudes are compared in log, so a 2x error costs the same at high and low
+amplitude and a low-amplitude regime late in a decay counts as much as the
+start.  Every parameter (frequency range, bands, floors) comes from the
+measured record.  Amplitudes discard phase relations between DOFs, so the
+term complements the pointwise ones rather than replacing them, and it needs
+free runs: a windowed simulation restarts from the data and its signal jumps
+at every window boundary.
 
 Torch-free, so the engine (:func:`discover_core.simulation_reward`, used in
 training) and the scoring script (:mod:`discover_score`) run this one
@@ -67,6 +105,29 @@ SIM_BLOWUP = 10.0
 SIM_STEPS_PER_CYCLE = 50
 MAX_SUBSTEPS = 8
 
+# Time-frequency term (see the module docstring).
+#   TF_OMEGA0      Morlet centre frequency: a band at f spans f/6 in frequency
+#                  and ~one period in time, so two lines closer than ~f/6 share
+#                  a band and show up as its amplitude beating
+#   TF_PER_OCTAVE  bands per octave
+#   TF_LO_CYCLES   lowest band f_lo = TF_LO_CYCLES / record length; at 6 the
+#                  lowest band keeps ~half its samples after the edge mask
+#   TF_POWER_FRAC  highest band: the frequency below which this fraction of the
+#                  measured VELOCITY power lies (velocity, not displacement,
+#                  so a higher mode that is small in displacement is not cut)
+#   TF_BAND_FLOOR  drop a band whose mean measured amplitude is below this
+#                  fraction of the measured signal's std (noise-only bands)
+#   TF_MAG_FLOOR   per band, amplitudes are floored at this fraction of the
+#                  band's largest measured amplitude before the log (40 dB)
+#   TF_TREND       include the signed slow trend
+TF_OMEGA0 = 6.0
+TF_PER_OCTAVE = 8
+TF_LO_CYCLES = 6.0
+TF_POWER_FRAC = 0.99
+TF_BAND_FLOOR = 1e-2
+TF_MAG_FLOOR = 1e-2
+TF_TREND = True
+
 
 def _scale(x):
     """Normalising scale of one measured channel: its std, or mean |x| if flat."""
@@ -77,19 +138,21 @@ def _scale(x):
 
 
 def check_weights(weights):
-    """``(w_q, w_v, w_a)`` as floats -- the displacement, velocity and
-    acceleration weights -- or a ValueError unless they are three
-    non-negative numbers summing to 1."""
+    """``(w_q, w_v, w_a, w_tf)`` as floats -- the displacement, velocity,
+    acceleration and time-frequency weights -- or a ValueError unless they are
+    three or four non-negative numbers summing to 1.  Three means no
+    time-frequency term."""
     try:
         w = tuple(float(x) for x in weights)
     except (TypeError, ValueError):
         w = ()
-    if (len(w) != 3 or not all(np.isfinite(x) and x >= 0.0 for x in w)
+    if (len(w) not in (3, 4) or not all(np.isfinite(x) and x >= 0.0 for x in w)
             or abs(sum(w) - 1.0) > 1e-6):
-        raise ValueError("sim_weights must be three non-negative weights "
-                         "(displacement, velocity, acceleration) summing to 1, "
+        raise ValueError("sim_weights must be three or four non-negative "
+                         "weights (displacement, velocity, acceleration"
+                         "[, time-frequency]) summing to 1, "
                          f"got {weights!r}")
-    return w
+    return w + (0.0,) * (4 - len(w))
 
 
 def auto_steps(t, states, accs=None, per_cycle=SIM_STEPS_PER_CYCLE):
@@ -264,22 +327,196 @@ def rollout(accel, t, states, dof, window=None, stride=1, substeps=1,
     return q_sim, v_sim, a_sim, simulated
 
 
+def _next_pow2(n):
+    return 1 << int(np.ceil(np.log2(max(int(n), 2))))
+
+
+def _band_stats(logA, valid):
+    """Mean and std over each band's valid samples of ``logA`` (..., K, M)."""
+    n = valid.sum(axis=-1)
+    mu = (logA * valid).sum(axis=-1) / n
+    sd = np.sqrt((((logA - mu[..., None]) ** 2) * valid).sum(axis=-1) / n)
+    return mu, sd
+
+
+def tf_setup(t, x_meas, stride):
+    """The measured side of the time-frequency term for one DOF, computed once.
+
+    ``x_meas`` is (P, m): the measured displacement of every trial on the full
+    time grid ``t``.  The analysis grid is every ``stride``-th sample --
+    exactly the samples a free-running :func:`rollout` predicts at that stride
+    -- so the simulated side needs no resampling.
+
+    Builds the frequency range and bands from the data, the analytic Morlet
+    filter bank::
+
+        G_k(f) = 2 exp(-(w0 (f - f_k) / f_k)^2 / 2)   for f > 0, else 0
+
+    (amplitude-normalised: ``a cos(2 pi f_k t)`` gives a band amplitude of
+    ``a``), the per-band edge masks (the wavelet's own span at each end), the
+    floors, the measured log-amplitudes and the measured signed trend.  Pass
+    the result to :func:`tf_residuals`.  A record too short to analyse, or one
+    with no oscillation, simply yields no bands.
+    """
+    t = np.asarray(t, dtype=float)
+    x = np.atleast_2d(np.asarray(x_meas, dtype=float))
+    P, m = x.shape
+    s = max(1, int(stride))
+    n = (m - 1) // s
+    idx = np.arange(n + 1) * s
+    M = n + 1
+    setup = {'stride': s, 'idx': idx, 'M': M, 'N': _next_pow2(2 * M),
+             'bands': np.zeros(0), 'G': None, 'valid': None, 'eps': None,
+             'logA': None, 'trend': None, 'f_lo': np.nan, 'f_hi': np.nan}
+    if M < 16:
+        return setup
+    tt = t[idx] - t[idx[0]]
+    T = float(tt[-1])
+    D = float(np.median(np.diff(tt)))
+    N = setup['N']
+    xg = x[:, idx]
+    X = np.fft.fft(xg, N, axis=1)
+    f = np.fft.fftfreq(N, D)
+    std = np.array([_scale(row) for row in xg])
+    setup['std'] = std
+
+    # Frequency range.  The top comes from the VELOCITY power (displacement
+    # power times f^2) of the mean-removed, Hann-tapered record: a higher mode
+    # that is small in displacement must still get its bands, and the taper
+    # stops the record's start from looking broadband.  Noise that this lets
+    # in is removed by the band floor below.
+    f_lo = TF_LO_CYCLES / T
+    fr = np.fft.rfftfreq(N, D)
+    xc = (xg - xg.mean(axis=1, keepdims=True)) * np.hanning(M)
+    pw = (np.abs(np.fft.rfft(xc, N, axis=1)) ** 2).sum(axis=0) * fr ** 2
+    f_hi = 0.0
+    if pw.sum() > 0.0:
+        cum = np.cumsum(pw)
+        f_hi = float(fr[min(int(np.searchsorted(cum, TF_POWER_FRAC * cum[-1])),
+                            len(fr) - 1)])
+    f_hi = min(f_hi, 0.2 / D)                 # 0.4 x the grid's Nyquist
+    setup['f_lo'], setup['f_hi'] = f_lo, f_hi
+
+    if f_hi >= f_lo:
+        n_bands = int(np.floor(TF_PER_OCTAVE * np.log2(f_hi / f_lo))) + 1
+        fk = f_lo * 2.0 ** (np.arange(n_bands) / TF_PER_OCTAVE)
+        G = (2.0 * np.exp(-0.5 * (TF_OMEGA0 * (f[None, :] - fk[:, None])
+                                  / fk[:, None]) ** 2)
+             * (f[None, :] > 0.0))
+        # a band's own time span: sigma_t = w0 / (2 pi f_k); drop sqrt(2)
+        # sigma_t at each end, where the transform sees the record's edges
+        edge = np.sqrt(2.0) * TF_OMEGA0 / (2.0 * np.pi * fk)
+        valid = (tt[None, :] >= edge[:, None]) & (tt[None, :] <= T - edge[:, None])
+        A = np.stack([np.abs(np.fft.ifft(X[p][None, :] * G, axis=1)[:, :M])
+                      for p in range(P)])                          # (P, K, M)
+        n_valid = valid.sum(axis=1)
+        band_mean = np.array([A[:, k, valid[k]].mean() if n_valid[k] else 0.0
+                              for k in range(n_bands)])
+        keep = (n_valid >= 4) & (band_mean >= TF_BAND_FLOOR * float(std.mean()))
+        if keep.any():
+            fk, G, valid, A = fk[keep], G[keep], valid[keep], A[:, keep]
+            eps = TF_MAG_FLOOR * np.array([A[:, k, valid[k]].max()
+                                           for k in range(len(fk))])
+            logA = np.log(A + eps[None, :, None])
+            mu, sd = _band_stats(logA, valid)
+            setup.update(bands=fk, G=G, valid=valid, eps=eps, logA=logA,
+                         logA_mean=mu, logA_std=sd)
+
+    if TF_TREND:
+        f_tr = 0.5 * f_lo
+        tau = 1.0 / (2.0 * np.pi * f_tr)
+        tr_valid = (tt >= 2.0 * tau) & (tt <= T - 2.0 * tau)
+        if tr_valid.sum() >= 4:
+            gain = np.exp(-0.5 * (f / f_tr) ** 2)
+            setup['trend'] = {
+                'gain': gain, 'valid': tr_valid,
+                'xbar': np.fft.ifft(X * gain[None, :], axis=1).real[:, :M]}
+    return setup
+
+
+def tf_residuals(setup, q_sim):
+    """The time-frequency term ``R_tf`` for every trial: a (P,) array.
+
+    ``q_sim`` is the simulated displacement on the full time grid, as
+    :func:`rollout` returns it.  With ``L = ln(A + eps_k)`` the log band
+    amplitude, per trial::
+
+        R_local = mean over bands of the mean over valid times of
+                  | L_sim(t) - L_meas(t) |
+        R_stat  = mean over bands of  | mean_t L_sim - mean_t L_meas |
+                                    + | std_t  L_sim - std_t  L_meas |
+        R_trend = RMS(trend_sim - trend_meas) / std(measured)    (sign kept)
+        R_tf    = R_local + R_stat + R_trend
+
+    ``R_local`` sees WHEN the amplitude rises and falls, so it grades a beat
+    period that is slightly off -- but only while the simulated beat has
+    slipped by less than about half a beat over the record; past that, beats
+    out of step cost more than no beats at all.  ``R_stat`` is blind to timing:
+    it scores each band's amplitude level and modulation depth, so an equation
+    that beats at the wrong rate still beats one that does not beat.  Measured
+    on two tones 0.05 Hz apart over 100 s: with ``R_local`` alone a single
+    unmodulated tone scored 0.39 against 0.49-0.53 for beats off by 0.005-0.05
+    Hz; with ``R_stat`` added it scores 1.07 against 0.55-0.68.
+
+    Each band counts equally whatever its valid length.  The trend is
+    normalised by the whole channel's std, not the trend's own, so a near-zero
+    trend cannot blow up.
+    """
+    x = np.atleast_2d(np.asarray(q_sim, dtype=float))[:, setup['idx']]
+    P = x.shape[0]
+    out = np.zeros(P)
+    if setup['G'] is None and setup['trend'] is None:
+        return out
+    x = np.where(np.isfinite(x), x, 0.0)
+    X = np.fft.fft(x, setup['N'], axis=1)
+    M = setup['M']
+    if setup['G'] is not None:
+        valid = setup['valid']
+        n_valid = valid.sum(axis=1)
+        eps = setup['eps'][:, None]
+        for p in range(P):
+            A = np.abs(np.fft.ifft(X[p][None, :] * setup['G'], axis=1)[:, :M])
+            L = np.log(A + eps)
+            d = np.abs(L - setup['logA'][p])
+            mu, sd = _band_stats(L, valid)
+            out[p] += float(np.mean((d * valid).sum(axis=1) / n_valid))
+            out[p] += float(np.mean(np.abs(mu - setup['logA_mean'][p])
+                                    + np.abs(sd - setup['logA_std'][p])))
+    tr = setup['trend']
+    if tr is not None:
+        xbar = np.fft.ifft(X * tr['gain'][None, :], axis=1).real[:, :M]
+        err = (xbar - tr['xbar'])[:, tr['valid']]
+        out += np.sqrt(np.mean(err ** 2, axis=1)) / setup['std']
+    return out
+
+
 def rollout_residuals(accel, t, states, dof, window=None, stride=1, substeps=1,
-                      weights=(1.0, 0.0, 0.0), accs=None, blowup=SIM_BLOWUP):
+                      weights=(1.0, 0.0, 0.0, 0.0), accs=None, tf=None,
+                      blowup=SIM_BLOWUP):
     """Simulation residual of DOF ``dof`` for every trial: a (P,) array.
 
-    ``w_q * NRMSE(q) + w_v * NRMSE(qd) + w_a * NRMSE(a)`` with ``weights =
-    (w_q, w_v, w_a)`` (see :func:`check_weights`), each NRMSE taken over the
-    simulated samples and normalised by that trial's measured std of the
-    channel.  ``accs`` is the measured acceleration, (P, N, m); it is needed
-    only when ``w_a > 0``.  The simulated acceleration of a window that blew
-    up is clipped at ``blowup`` times the largest measured one, so it too
-    scores large but finite.  See :func:`rollout` for the other arguments.
+    ``w_q * NRMSE(q) + w_v * NRMSE(qd) + w_a * NRMSE(a) + w_tf * R_tf`` with
+    ``weights = (w_q, w_v, w_a[, w_tf])`` (see :func:`check_weights`), each
+    NRMSE taken over the simulated samples and normalised by that trial's
+    measured std of the channel.  ``accs`` is the measured acceleration,
+    (P, N, m); it is needed only when ``w_a > 0``.  ``tf`` is this DOF's
+    :func:`tf_setup` at the same ``stride``; it is needed only when
+    ``w_tf > 0``, which also requires a free run (``window=None``).  The
+    simulated acceleration of a window that blew up is clipped at ``blowup``
+    times the largest measured one, so it too scores large but finite.  See
+    :func:`rollout` for the other arguments.
     """
-    w_q, w_v, w_a = check_weights(weights)
+    w_q, w_v, w_a, w_tf = check_weights(weights)
     if w_a > 0.0 and accs is None:
         raise ValueError("an acceleration weight needs the measured "
                          "acceleration (accs)")
+    if w_tf > 0.0:
+        if window is not None:
+            raise ValueError("the time-frequency weight needs free runs: "
+                             "set sim_window=None")
+        if tf is None or tf['stride'] != max(1, int(stride)):
+            raise ValueError("the time-frequency weight needs this DOF's "
+                             "tf_setup at the same stride")
     states = np.asarray(states, dtype=float)
     q_sim, v_sim, a_sim, sim = rollout(accel, t, states, dof, window, stride,
                                        substeps, blowup, with_acc=w_a > 0.0)
@@ -293,6 +530,7 @@ def rollout_residuals(accel, t, states, dof, window=None, stride=1, substeps=1,
         return (np.sqrt(np.mean((sim_x[mk] - meas_x[mk]) ** 2))
                 / _scale(meas_x))
 
+    r_tf = tf_residuals(tf, q_sim) if w_tf > 0.0 else None
     out = np.full(states.shape[0], np.nan)
     for p in range(states.shape[0]):
         mk = sim[p]
@@ -305,5 +543,7 @@ def rollout_residuals(accel, t, states, dof, window=None, stride=1, substeps=1,
             res += w_v * nrmse(v_sim[p], states[p, iv], mk)
         if w_a > 0.0:
             res += w_a * nrmse(a_sim[p], a_meas[p], mk)
+        if w_tf > 0.0:
+            res += w_tf * r_tf[p]
         out[p] = res
     return out

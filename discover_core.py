@@ -63,7 +63,8 @@ the same closed-form work-energy / acceleration fit under both:
     'simulation'  the candidate is integrated forward from the measured
                   initial state and scored by a weighted sum of the NRMSEs
                   of its simulated displacement, velocity and acceleration
-                  against the record (``SIM_WEIGHTS``, summing to 1) -- see
+                  and of a phase-blind time-frequency term against the
+                  record (``SIM_WEIGHTS``, summing to 1) -- see
                   :func:`simulation_reward` and :mod:`discover_rollout`
 
 Both are per DOF and both map a residual ``e`` to ``r = 1 / (1 + e)``, so
@@ -341,13 +342,15 @@ W_ACC = 0.0
 # longer enters the score.
 #   SIM_WINDOW   None = one free run per trial from its first sample; a
 #                number = restart from the measured state every SIM_WINDOW s
-#   SIM_WEIGHTS  (displacement, velocity, acceleration) NRMSE weights,
-#                non-negative and summing to 1
+#   SIM_WEIGHTS  (displacement, velocity, acceleration, time-frequency)
+#                weights, non-negative and summing to 1; the time-frequency
+#                term needs SIM_WINDOW = None
 REWARD_MODES = ('energy', 'simulation')
 REWARD_MODE  = 'energy'
 SIM_WINDOW   = None
-SIM_WEIGHTS  = (1.0, 0.0, 0.0)
+SIM_WEIGHTS  = (1.0, 0.0, 0.0, 0.0)
 _SIM_DATA    = {}          # (max_traj, horizon) -> stacked record, per process
+_TF_DATA     = {}          # (max_traj, horizon, dof) -> tf_setup, per process
 
 
 # ── Grammar configuration ───────────────────────────────────────────────────
@@ -440,16 +443,19 @@ def set_problem_data(norm_stats, raw_trajectories, energy_normalize=True,
     if w_acc is not None:
         W_ACC = float(np.clip(w_acc, 0.0, 1.0))
     _SIM_DATA.clear()
+    _TF_DATA.clear()
 
 
-def set_reward(mode='energy', sim_window=None, sim_weights=(1.0, 0.0, 0.0)):
+def set_reward(mode='energy', sim_window=None,
+               sim_weights=(1.0, 0.0, 0.0, 0.0)):
     """Choose what candidates are scored by (also called in the workers).
 
     ``'energy'`` is the work-energy / acceleration blend of
     :func:`energy_reward`; ``'simulation'`` is the forward-simulation NRMSE of
     :func:`simulation_reward`.  ``sim_window`` and ``sim_weights`` -- the
-    (displacement, velocity, acceleration) weights, which must be
-    non-negative and sum to 1 -- only matter for the latter.
+    (displacement, velocity, acceleration[, time-frequency]) weights, which
+    must be non-negative and sum to 1 -- only matter for the latter.  The
+    time-frequency weight needs free runs (``sim_window=None``).
     """
     global REWARD_MODE, SIM_WINDOW, SIM_WEIGHTS
     if mode not in REWARD_MODES:
@@ -457,6 +463,9 @@ def set_reward(mode='energy', sim_window=None, sim_weights=(1.0, 0.0, 0.0)):
     if sim_window is not None and not float(sim_window) > 0.0:
         raise ValueError(f"sim_window must be None or > 0 s, got {sim_window!r}")
     weights = _ro.check_weights(sim_weights)
+    if weights[3] > 0.0 and sim_window is not None:
+        raise ValueError("the time-frequency weight needs free runs: "
+                         "set sim_window=None")
     REWARD_MODE = mode
     SIM_WINDOW  = None if sim_window is None else float(sim_window)
     SIM_WEIGHTS = weights
@@ -471,14 +480,14 @@ def describe_reward():
     """One line saying what candidates are scored by and what the constants
     are fitted to."""
     if REWARD_MODE == 'simulation':
-        parts = [(w, nm) for w, nm in zip(SIM_WEIGHTS, ('displacement',
-                                                        'velocity',
-                                                        'acceleration')) if w > 0]
+        names = ('displacement NRMSE', 'velocity NRMSE', 'acceleration NRMSE',
+                 'time-frequency term')
+        parts = [(w, nm) for w, nm in zip(SIM_WEIGHTS, names) if w > 0]
         what = (parts[0][1] if len(parts) == 1 else
                 ' + '.join(f'{w:.2f} {nm}' for w, nm in parts))
         how = ('one free run per trial' if SIM_WINDOW is None else
                f'restarted from the record every {SIM_WINDOW:g} s')
-        return (f"forward simulation, {what} NRMSE ({how}); constants fitted "
+        return (f"forward simulation, {what} ({how}); constants fitted "
                 f"to {1 - W_ACC:.2f} work-energy + {W_ACC:.2f} accel-NRMSE")
     return (f"work-energy, blend w_acc={W_ACC:.2f} "
             f"({1 - W_ACC:.2f} work-energy + {W_ACC:.2f} accel-NRMSE)")
@@ -1503,6 +1512,17 @@ def _sim_data(max_traj, horizon):
     return _SIM_DATA[key]
 
 
+def _tf_setup(max_traj, horizon, dof, data):
+    """The measured side of DOF ``dof``'s time-frequency term
+    (:func:`discover_rollout.tf_setup`) on ``_sim_data``'s record and stride,
+    cached per process like the record itself."""
+    key = (_resolve_max_traj(max_traj), horizon, dof)
+    if key not in _TF_DATA:
+        t, states, _accs, stride, _substeps = data
+        _TF_DATA[key] = _ro.tf_setup(t, states[:, 2 * dof, :], stride)
+    return _TF_DATA[key]
+
+
 def simulation_reward(exprs, max_traj=None, horizon=None):
     """Forward-simulation reward for a set of per-DOF expressions.
 
@@ -1511,7 +1531,8 @@ def simulation_reward(exprs, max_traj=None, horizon=None):
     or of every ``SIM_WINDOW``-second window -- with the OTHER DOFs' states
     read off the record, and its residual is the ``SIM_WEIGHTS``-weighted sum
     of the NRMSEs of its simulated displacement, velocity and acceleration
-    against the measured ones; see :mod:`discover_rollout`.  Aggregated like the energy reward: mean
+    against the measured ones and of the time-frequency term; see
+    :mod:`discover_rollout`.  Aggregated like the energy reward: mean
     over DOFs per trial, then ``r = 1 / (1 + mean over trials)``.  0 if
     nothing is evaluable.
 
@@ -1544,9 +1565,11 @@ def simulation_reward(exprs, max_traj=None, horizon=None):
             # normalised ones
             return ym + ys * fn(*((S - xm) / xs))
 
+        tf = (_tf_setup(max_traj, horizon, d, data)
+              if SIM_WEIGHTS[3] > 0.0 else None)
         res = _ro.rollout_residuals(accel, t, states, d, window=SIM_WINDOW,
                                     stride=stride, substeps=substeps,
-                                    weights=SIM_WEIGHTS, accs=accs)
+                                    weights=SIM_WEIGHTS, accs=accs, tf=tf)
         if not np.all(np.isfinite(res)):
             return 0.0
         per_dof.append(res)
@@ -2345,7 +2368,7 @@ def init_energy_worker(n_dof, var_names, norm_stats, raw_trajs,
                        energy_normalize=True, max_traj=5, w_acc=None,
                        directional_leaves=False, transcendental=False,
                        reward='energy', sim_window=None,
-                       sim_weights=(1.0, 0.0, 0.0)):
+                       sim_weights=(1.0, 0.0, 0.0, 0.0)):
     # BOTH grammar flags MUST match the parent's: a worker with a different
     # token table computes a different ``count_total_consts`` for the same tau
     # and silently mis-fits every candidate it is handed.  The reward settings

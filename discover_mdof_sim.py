@@ -275,8 +275,8 @@ def DISCOVER_MDOF_SIM(
     reward           = 'energy',   # 'energy' | 'simulation'
     sim_window       = None,       # simulation: None = one free run per trial,
                                    #   else restart from the record every N s
-    sim_weights      = (1.0, 0.0, 0.0),  # simulation: (disp, vel, acc) NRMSE
-                                   #   weights, summing to 1
+    sim_weights      = (1.0, 0.0, 0.0, 0.0),  # simulation: (disp, vel, acc,
+                                   #   time-frequency) weights, summing to 1
     use_pool         = True,
     # policy (see DISCOVER_TRAIN)
     cross_slice_attention = True,
