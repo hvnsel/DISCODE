@@ -348,10 +348,15 @@ W_ACC = 0.0
 #   SIM_WEIGHTS  (displacement, velocity, acceleration, time-frequency)
 #                weights, non-negative and summing to 1; the time-frequency
 #                term needs SIM_WINDOW = None
+#   TRIAL_DECAY  how a candidate's trials are combined, under both schemes:
+#                ranked from worst fit to best, the k-th worst weighted
+#                TRIAL_DECAY**(k-1); 1 = plain mean, 0 = worst trial only
+#                (discover_rollout.combine_trials)
 REWARD_MODES = ('energy', 'simulation')
 REWARD_MODE  = 'energy'
 SIM_WINDOW   = None
 SIM_WEIGHTS  = (1.0, 0.0, 0.0, 0.0)
+TRIAL_DECAY  = 1.0
 _SIM_DATA    = {}          # (max_traj, horizon) -> stacked record, per process
 _TF_DATA     = {}          # (max_traj, horizon, dof) -> tf_setup, per process
 
@@ -450,7 +455,7 @@ def set_problem_data(norm_stats, raw_trajectories, energy_normalize=True,
 
 
 def set_reward(mode='energy', sim_window=None,
-               sim_weights=(1.0, 0.0, 0.0, 0.0)):
+               sim_weights=(1.0, 0.0, 0.0, 0.0), trial_decay=1.0):
     """Choose what candidates are scored by (also called in the workers).
 
     ``'energy'`` is the work-energy / acceleration blend of
@@ -459,10 +464,19 @@ def set_reward(mode='energy', sim_window=None,
     (displacement, velocity, acceleration[, time-frequency]) weights, which
     must be non-negative and sum to 1 -- only matter for the latter.  The
     time-frequency weight needs free runs (``sim_window=None``).
+    ``trial_decay`` in [0, 1] sets how the trials are combined under either
+    scheme (see ``TRIAL_DECAY``); it never touches the constant fit.
     """
-    global REWARD_MODE, SIM_WINDOW, SIM_WEIGHTS
+    global REWARD_MODE, SIM_WINDOW, SIM_WEIGHTS, TRIAL_DECAY
     if mode not in REWARD_MODES:
         raise ValueError(f"reward must be one of {REWARD_MODES}, got {mode!r}")
+    try:
+        decay = float(trial_decay)
+    except (TypeError, ValueError):
+        decay = float('nan')
+    if not 0.0 <= decay <= 1.0:
+        raise ValueError("trial_decay must be in [0, 1] (1 = plain mean over "
+                         f"trials, 0 = worst trial only), got {trial_decay!r}")
     if sim_window is not None and not float(sim_window) > 0.0:
         raise ValueError(f"sim_window must be None or > 0 s, got {sim_window!r}")
     weights = _ro.check_weights(sim_weights)
@@ -472,6 +486,7 @@ def set_reward(mode='energy', sim_window=None,
     REWARD_MODE = mode
     SIM_WINDOW  = None if sim_window is None else float(sim_window)
     SIM_WEIGHTS = weights
+    TRIAL_DECAY = decay
 
 
 def reward_label():
@@ -490,10 +505,15 @@ def describe_reward():
                 ' + '.join(f'{w:.2f} {nm}' for w, nm in parts))
         how = ('one free run per trial' if SIM_WINDOW is None else
                f'restarted from the record every {SIM_WINDOW:g} s')
-        return (f"forward simulation, {what} ({how}); constants fitted "
+        text = (f"forward simulation, {what} ({how}); constants fitted "
                 f"to {1 - W_ACC:.2f} work-energy + {W_ACC:.2f} accel-NRMSE")
-    return (f"work-energy, blend w_acc={W_ACC:.2f} "
-            f"({1 - W_ACC:.2f} work-energy + {W_ACC:.2f} accel-NRMSE)")
+    else:
+        text = (f"work-energy, blend w_acc={W_ACC:.2f} "
+                f"({1 - W_ACC:.2f} work-energy + {W_ACC:.2f} accel-NRMSE)")
+    if TRIAL_DECAY != 1.0:
+        text += (f"; trials ranked worst-fit first, weight x{TRIAL_DECAY:g} "
+                 f"per rank")
+    return text
 
 
 def set_energy_options(energy_normalize=True):
@@ -1483,7 +1503,7 @@ def energy_reward(exprs, max_traj=None, horizon=None, w_acc=None):
 
     if not residual_means:
         return 0.0
-    return 1.0 / (1.0 + float(np.mean(residual_means)))
+    return 1.0 / (1.0 + _ro.combine_trials(residual_means, TRIAL_DECAY))
 
 
 # ── Forward-simulation reward ───────────────────────────────────────────────
@@ -1583,7 +1603,7 @@ def simulation_reward(exprs, max_traj=None, horizon=None):
         if not np.all(np.isfinite(res)):
             return 0.0
         per_dof.append(res)
-    return 1.0 / (1.0 + float(np.mean(per_dof)))
+    return 1.0 / (1.0 + _ro.combine_trials(per_dof, TRIAL_DECAY))
 
 
 def coupled_simulation_rewards(exprs, score, max_traj=None, horizon=None):
@@ -1626,7 +1646,7 @@ def coupled_simulation_rewards(exprs, score, max_traj=None, horizon=None):
                                     score=scored)
     for d in scored:
         if np.all(np.isfinite(res[d])):
-            out[d] = 1.0 / (1.0 + float(np.mean(res[d])))
+            out[d] = 1.0 / (1.0 + _ro.combine_trials(res[d], TRIAL_DECAY))
     return out
 
 
@@ -2422,14 +2442,14 @@ def init_energy_worker(n_dof, var_names, norm_stats, raw_trajs,
                        energy_normalize=True, max_traj=5, w_acc=None,
                        directional_leaves=False, transcendental=False,
                        reward='energy', sim_window=None,
-                       sim_weights=(1.0, 0.0, 0.0, 0.0)):
+                       sim_weights=(1.0, 0.0, 0.0, 0.0), trial_decay=1.0):
     # BOTH grammar flags MUST match the parent's: a worker with a different
     # token table computes a different ``count_total_consts`` for the same tau
     # and silently mis-fits every candidate it is handed.  The reward settings
     # likewise, or the pool scores by a different reward than the parent logs.
     configure_grammar(n_dof, var_names, directional_leaves, transcendental)
     set_problem_data(norm_stats, raw_trajs, energy_normalize, max_traj, w_acc)
-    set_reward(reward, sim_window, sim_weights)
+    set_reward(reward, sim_window, sim_weights, trial_decay)
 
 
 def energy_worker(args):

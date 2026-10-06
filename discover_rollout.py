@@ -161,6 +161,28 @@ def check_weights(weights):
     return w + (0.0,) * (4 - len(w))
 
 
+def combine_trials(res, decay=1.0):
+    """One residual from per-trial residuals, trials on the last axis.
+
+    The trials are ranked from worst fit to best and the k-th worst is
+    weighted ``decay**(k-1)``, normalised: ``decay=1`` is the plain mean,
+    ``0`` the worst trial alone, and ``0.5`` halves the weight at each rank --
+    with five trials 52, 26, 13, 6 and 3%.  Each equation is ranked by its own
+    residuals, so whichever trial it fits worst counts most: a phenomenon
+    that only one trial shows (beats, say) cannot be averaged away by the
+    trials that lack it.  A 2-D ``res`` (DOFs x trials) is averaged over DOFs
+    first; at ``decay=1`` it is simply the mean of everything.  NaN or inf in
+    gives NaN or inf out.
+    """
+    r = np.asarray(res, dtype=float)
+    if decay == 1.0:
+        return float(np.mean(r))
+    if r.ndim > 1:
+        r = r.reshape(-1, r.shape[-1]).mean(axis=0)
+    w = float(decay) ** np.arange(r.size)
+    return float(np.dot(w, np.sort(r)[::-1]) / w.sum())
+
+
 def auto_steps(t, states, accs=None, per_cycle=SIM_STEPS_PER_CYCLE):
     """``(stride, substeps)`` giving ``per_cycle`` RK4 steps per cycle of the
     fastest measured motion.

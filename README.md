@@ -106,6 +106,19 @@ fitted the same way under both: the closed-form work-energy / acceleration fit,
 steered by `w_acc`. Under `'simulation'`, `w_acc` therefore only shapes the fit;
 the simulation decides the ranking.
 
+**Combining the trials (`trial_decay`).** Both rewards average a candidate's
+residual over the trials by default. `trial_decay` ranks the trials by how badly
+that candidate fits them and weights the k-th worst `trial_decay**(k-1)`: `1` is
+the plain mean, `0.5` halves the weight at each rank (52, 26, 13, 6 and 3% over
+five trials), `0` keeps only the worst trial. A behaviour only one trial shows —
+beats in one of five experimental records, say — then counts most until it is
+captured, without anyone choosing that trial: the ranking is per candidate, so
+it follows whichever trial that equation fits worst. The constant fit is
+untouched. On four `coupled_duffing` trials the truth still scores above 0.99
+at `0.5`, while a wrong linear equation drops from 0.363 to 0.342 under the
+simulation reward. The catch is that a trial that is simply bad data dominates
+too. Set `TRIAL_DECAY` in `discover_score.py` to match the run.
+
 **One DOF at a time, by default.** In a multi-DOF run, DOF d's equation is
 integrated on its own, and the other DOFs' states are read off the measured
 record at every step. A coupling term is judged against the partner's true

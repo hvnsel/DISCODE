@@ -83,6 +83,9 @@ def DISCOVER_MDOF_EXP(
     max_traj         = 10,
     w_acc            = 0.9,
     reward           = 'energy',   # 'energy' | 'simulation'
+    trial_decay      = 1.0,        # trials ranked worst-fit first, the k-th
+                                   #   worst weighted trial_decay**(k-1):
+                                   #   1 = plain mean, 0.5 = halve per rank
     sim_window       = None,       # simulation: None = one free run per trial,
                                    #   else restart from the record every N s
     sim_weights      = (1.0, 0.0, 0.0, 0.0),  # simulation: (disp, vel, acc,
@@ -149,6 +152,7 @@ def DISCOVER_MDOF_EXP(
         max_traj         = max_traj,
         w_acc            = w_acc,
         reward           = reward,
+        trial_decay      = trial_decay,
         sim_window       = sim_window,
         sim_weights      = sim_weights,
         sim_coupling     = sim_coupling,

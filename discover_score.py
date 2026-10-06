@@ -20,6 +20,7 @@ What it reports
 ---------------
   r_energy   the training reward, reproduced exactly:
              mean over time -> mean over DOFs -> mean over trials -> 1/(1+res)
+             (trials worst-fit first with TRIAL_DECAY < 1, as in the run)
   ceiling    the same quantity computed with the MEASURED acceleration.
              This is the best score ANY expression can achieve on this data.
              If r_energy is at the ceiling, the search has converged and the
@@ -83,6 +84,8 @@ SIM_WEIGHTS      = (1.0, 0.0, 0.0, 0.0)   # simulation: (disp, vel, acc,
                                      # time-frequency) weights, summing to 1
 SIM_COUPLED      = False         # simulation: True = all DOFs integrated
                                  # together, not each against the record
+TRIAL_DECAY      = 1.0           # as in the run: 1 = plain mean over trials,
+                                 # 0.5 = worst-fit trial first, halving per rank
 
 # One physical expression per DOF.
 EXPRS = [
@@ -124,7 +127,8 @@ def build_system():
 
 def score(exprs=None, system=None, trials=TRIALS, normalize=ENERGY_NORMALIZE,
           verbose=True, reward=REWARD, sim_window=SIM_WINDOW,
-          sim_weights=SIM_WEIGHTS, sim_coupled=SIM_COUPLED):
+          sim_weights=SIM_WEIGHTS, sim_coupled=SIM_COUPLED,
+          trial_decay=TRIAL_DECAY):
     exprs = EXPRS if exprs is None else exprs
     if not exprs or not any(str(e).strip() for e in exprs):
         print(__doc__.split('What it reports')[0])
@@ -152,10 +156,12 @@ def score(exprs=None, system=None, trials=TRIALS, normalize=ENERGY_NORMALIZE,
 
     if reward == 'simulation':
         return score_simulation(system, exprs, keep, sim_window, sim_weights,
-                                verbose, coupled=sim_coupled)
+                                verbose, coupled=sim_coupled,
+                                trial_decay=trial_decay)
 
     r_pred, r_ceil, rows = score_system(system, exprs, normalize=normalize,
-                                        trials=keep, verbose=verbose)
+                                        trials=keep, verbose=verbose,
+                                        trial_decay=trial_decay)
 
     if verbose:
         print(f"\n{'trial':>6}"
@@ -180,12 +186,12 @@ def score(exprs=None, system=None, trials=TRIALS, normalize=ENERGY_NORMALIZE,
 
 
 def score_simulation(system, exprs, trials, window, weights, verbose=True,
-                     coupled=False):
+                     coupled=False, trial_decay=1.0):
     """The simulation reward, per trial and DOF.  Returns ``(r_sim, None)``."""
     N = system.n_dof
     r_sim, rows = simulation_scores(system, exprs, trials=trials,
                                     window=window, weights=weights,
-                                    coupled=coupled)
+                                    coupled=coupled, trial_decay=trial_decay)
     if verbose:
         how = ('one free run per trial' if window is None else
                f'restarted every {window:g} s')
