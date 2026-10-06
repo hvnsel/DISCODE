@@ -370,8 +370,10 @@ def DISCOVER_EDIT_TRAIN(
     w_acc              = 0.5,
     reward             = 'energy',  # 'energy' | 'simulation'
     sim_window         = None,      # simulation: None = one free run per trial
-    sim_weights        = (1.0, 0.0, 0.0),  # simulation: (disp, vel, acc)
-                                    # NRMSE weights, summing to 1
+    sim_weights        = (1.0, 0.0, 0.0, 0.0),  # simulation: weights of
+                                    # (displacement, velocity, acceleration,
+                                    # time-frequency), non-negative, summing
+                                    # to 1; time-frequency needs sim_window=None
     center_features    = False,
     directional_leaves = False,
     transcendental     = False,
