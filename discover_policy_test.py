@@ -1618,6 +1618,50 @@ def test_frequency_content():
         dc._SPEC_DATA.clear()
 
 
+def test_diagnose_tools():
+    """The pieces :mod:`discover_diagnose` decides with: the monomial list,
+    sparse regression that finds a sparse truth in it, and the channel check
+    that sees a filtered or delayed channel."""
+    import discover_diagnose as dg
+
+    print("\ndiagnose tools")
+    exps = dg.monomials(4, 3)
+    check('the list holds every monomial of 4 variables up to degree 3 and a '
+          'constant', len(exps) == 35 and exps[0] == (0, 0, 0, 0)
+          and len(set(exps)) == 35)
+
+    rng = np.random.default_rng(1)
+    Z = rng.normal(size=(4000, 4))
+    Th = dg.theta(Z, exps)
+    want = {exps.index((1, 0, 0, 0)): 2.0, exps.index((0, 1, 1, 0)): -0.5,
+            exps.index((0, 0, 0, 3)): 0.1}
+    y = sum(c * Th[:, k] for k, c in want.items()) + 1e-3 * rng.normal(size=4000)
+    path = dg.stlsq_path(Th, y, 12)
+    found = path.get(3)
+    check('sparse regression finds a 3-term truth among 35 monomials',
+          found is not None
+          and set(np.flatnonzero(found[0])) == set(want)
+          and all(abs(found[0][k] - c) < 1e-2 for k, c in want.items()),
+          f"sizes found {sorted(k for k in path if k != 'dense')}")
+
+    t = np.linspace(0.0, 20.0, 4001)
+    f0 = 1.3
+    x = np.stack([np.sin(2 * np.pi * f0 * t + ph) for ph in (0.0, 1.0)])
+    dx = 2 * np.pi * f0 * np.stack([np.cos(2 * np.pi * f0 * t + ph)
+                                    for ph in (0.0, 1.0)])
+    lag = np.radians(30.0)
+    y_lag = 0.9 * 2 * np.pi * f0 * np.stack(
+        [np.cos(2 * np.pi * f0 * t + ph - lag) for ph in (0.0, 1.0)])
+    (_f, g_ok, p_ok), = dg.channel_agreement(t, x, dx, [f0])
+    (_f, g_bad, p_bad), = dg.channel_agreement(t, x, y_lag, [f0])
+    check('the channel check reads a clean derivative as 1 / 0 deg and a '
+          'filtered one as its gain and lag',
+          abs(g_ok - 1) < 0.01 and abs(p_ok) < 1.0
+          and abs(g_bad - 0.9) < 0.01 and abs(p_bad + 30.0) < 1.0,
+          f"clean {g_ok:.3f} / {p_ok:+.1f} deg, filtered {g_bad:.3f} / "
+          f"{p_bad:+.1f} deg")
+
+
 def test_scoring_pool():
     """The scoring pool (:func:`discover_core.make_pool`).
 
@@ -1698,6 +1742,7 @@ def main():
     test_trial_decay()
     test_beats_tools()
     test_frequency_content()
+    test_diagnose_tools()
     test_scoring_pool()
 
     print(f"\n{'=' * 60}")
