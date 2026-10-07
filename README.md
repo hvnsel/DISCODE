@@ -40,8 +40,9 @@ committed for the others. See [Policy architecture](#policy-architecture).
 | `discover_score.py` | reproduces the training reward + the data's ceiling. No plots |
 | `discover_plot_sim.py` | forward-simulates discovered equations vs simulated truth |
 | `discover_plot_exp.py` | forward-simulates discovered equations vs the experimental record |
+| `discover_inspect.py` | one trial as the simulation reward sees it: per DOF the wavelet map and velocity spectrum, measured and (with equations) simulated, plus the sampling, windows and per-term residuals |
 
-All three handle any number of DOFs.
+All four handle any number of DOFs.
 
 ## Quickstart
 
@@ -170,12 +171,16 @@ Six more knobs, used only by `'simulation'`:
 
 | knob | default | what it does |
 |---|---|---|
-| `sim_window` | `None` | `None` is one free run per trial, from its first sample to its last. A number restarts the simulation from the measured state every that many seconds (multiple shooting); `'auto'` every 3 periods of the fastest measured motion. Windows apply to the pointwise terms: a small frequency error then costs a bounded phase error per window instead of saturating the NRMSE near 1.4 over a long free run, where it stops ranking anything. The time-frequency term always gets a free run of its own |
-| `sim_weights` | `(1.0, 0.0, 0.0, 0.0)` | the weights of (displacement, velocity, acceleration, time-frequency): `w_q*NRMSE(q) + w_v*NRMSE(qdot) + w_a*NRMSE(qddot) + w_tf*R_tf`. Non-negative and summing to 1, or the run refuses to start; a 3-tuple means `w_tf = 0`. The acceleration is the equation's own along its simulated trajectory, its right-hand side at the simulated state, compared with the measured acceleration. `R_tf` is below |
+| `sim_window` | `None` | `None` is one free run per trial, from its first sample to its last. A number restarts the simulation from the measured state every that many seconds (multiple shooting); `'auto'` every 3 periods of the fastest motion of the DOF being simulated (DOFs integrated together: of the fastest among them). Windows apply to the pointwise terms: a small frequency error then costs a bounded phase error per window instead of saturating the NRMSE near 1.4 over a long free run, where it stops ranking anything. Per DOF because on a record with a fast and a slow DOF the slow one would otherwise get windows of about one of its own cycles, where its frequency error cannot show (measured: a 2% error on a 1 Hz DOF next to a 4 Hz one, displacement NRMSE 0.054 on the 4 Hz DOF's windows, 0.193 on its own). The time-frequency and frequency-content terms always get a free run of their own |
+| `sim_weights` | `(1.0, 0.0, 0.0, 0.0)` | the weights of (displacement, velocity, acceleration, time-frequency[, frequency content]): `w_q*NRMSE(q) + w_v*NRMSE(qdot) + w_a*NRMSE(qddot) + w_tf*R_tf + w_f*R_f`. Three to five non-negative numbers summing to 1, or the run refuses to start; the ones left out are 0. The acceleration is the equation's own along its simulated trajectory, its right-hand side at the simulated state, compared with the measured acceleration. `R_tf` and `R_f` are below |
 | `sim_coupling` | `(0.0, 0.0)` | the fractions of each DOF's equations simulated with the other DOFs' top equations and with the other DOFs' equations from the same sample (above). Non-negative, summing to at most 1; the rest are simulated alone. Needs two DOFs or more |
 | `sim_coupling_mode` | `'split'` | `'split'` scores each equation one of those ways; `'blend'` scores it all three ways and weights the rewards by the fractions (above) |
 | `sim_refine` | `0` | per DOF per epoch, the best this many equations get their amplitudes tuned on the simulation itself (below) |
 | `sim_refine_evals` | `60` | simulations per tuned equation |
+
+`sim_weights` takes a fifth weight, for the frequency-content term below; e.g.
+`(0.15, 0.15, 0.15, 0.35, 0.2)` keeps the pointwise and envelope terms in the
+same proportions as `(0.2, 0.2, 0.2, 0.4)`, roughly.
 
 The integrator is RK4 on the record's own samples. The step is sized from the
 data: at least 50 steps per cycle of the fastest measured motion, so an
@@ -220,6 +225,34 @@ Amplitudes discard the phase between DOFs, so keep some displacement weight, e.g
 `sim_weights=(0.5, 0, 0, 0.5)`. It costs ~3 ms per candidate on a 1300-sample
 grid with 4 trials. Its constants live in `discover_rollout.py` (`TF_*`).
 
+**The frequency-content term (`w_f`, the fifth weight)** asks where in
+frequency the motion's energy sits, not when: the earth mover's distance between
+the simulated and the measured velocity power spectra of each trial, measured in
+cycles over the record (the distance in Hz times the record length) and taken as
+`R_f = ln(1 + cycles)`. A spectrum moved by `df` is `T*df` cycles — exactly the
+phase a frequency error of `df` piles up over the record — so:
+
+- **Frequency errors at any size, however far the phase has slipped.** On a
+  6.5 Hz mode over 5 s, 1% costs 0.28 and 10% costs 1.45 (`ln(1 + T*df)` to
+  within 2%). A windowed NRMSE barely sees a 1% error (each window is too short
+  for the phase to slip), and the envelope term, phase-blind with bands ~f/6
+  wide, sees it only indirectly: where a measured partner drives the DOF at its
+  true frequency, a detuned DOF beats against that forcing.
+- **Energy in the wrong mode** costs its share times the distance it has to
+  move. On a 6.5 + 20.3 Hz record, a 1% error on both modes costs 0.60, the
+  20 Hz mode dying four times too fast 3.26, losing it entirely 3.93.
+- **Beats** come out as two close peaks; having both, in the right places and
+  proportion, is what makes the beat right.
+
+Velocity rather than displacement, so a higher mode that is small in
+displacement still counts; amplitude is normalised out. The logarithm keeps the
+term on the scale of the others: moving energy between distant modes is tens
+of cycles. Measurement noise of 1–3% of the signal leaves the truth at
+0.004–0.03. On `coupled_beats` with `sim_weights=(0.2,)*5` the truth scores
+0.996 and a 3% stiffer equation 0.725. It shares the time-frequency term's free
+run and adds ~1 ms per candidate (5 trials of 2500 samples). Its constants are
+`SPEC_*` in `discover_rollout.py`.
+
 Measured per candidate on the simulated registry (4 trials, 1500–2500 samples),
 a free run costs 25–150 ms and a 2 s window 3–15 ms, against ~2 ms for the energy
 reward. Both rewards share the constant fit, which usually costs more: on an
@@ -258,14 +291,22 @@ equation comes back as `-4.401*x - 0.02999*xdot + 0.4011*y` (truth `-4.4*x -
 0.3 s on five 660-sample trials with `sim_window='auto'` — so `sim_refine=2,
 sim_refine_evals=40` adds 160 per epoch, spread over the pool.
 
-**What gets printed.** With `reward='simulation'` a run starts with the window
-`sim_window='auto'` picked and a report per DOF and trial: the two strongest
+**What gets printed.** With `reward='simulation'` a run starts with each DOF's
+fastest motion and how many samples a cycle of it gets — under ~10 the record
+is too coarse to compare that motion point by point or to fit its constants
+well, so raise `desired_timesteps` — the windows `sim_window='auto'` picked per
+DOF, the range the frequency-content term compares (when weighted), and a
+report per DOF and trial: the two strongest
 spectral peaks, the envelope swing the
 time-frequency term sees (the largest std of a band's detrended log-amplitude;
 ~0 for a steady or decaying oscillation, 0.3 and up for clear beats) and the
 beat period read off the envelope's own spectrum. The trial whose swing stands
 out is the one carrying the beats; a peak outside the bands is invisible to the
-term. Every best equation printed each epoch, and in the final summary, comes
+term. `discover_inspect.py` prints the same for any record and plots one trial:
+per DOF the wavelet map (a beat is a band that swells and fades, a mode that
+dies a band that goes dark) and the velocity spectrum, measured and — given
+equations — simulated, with every residual term per trial. Every best equation
+printed each epoch, and in the final summary, comes
 with the equations it was simulated with to earn its score — per mode, each
 other DOF's equation in physical units, or "the measured record" — even when
 that is the other DOF's own best.
