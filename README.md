@@ -41,8 +41,9 @@ committed for the others. See [Policy architecture](#policy-architecture).
 | `discover_plot_sim.py` | forward-simulates discovered equations vs simulated truth |
 | `discover_plot_exp.py` | forward-simulates discovered equations vs the experimental record |
 | `discover_inspect.py` | one trial as the simulation reward sees it: per DOF the wavelet map and velocity spectrum, measured and (with equations) simulated, plus the sampling, windows and per-term residuals |
+| `discover_diagnose.py` | is it the data, the setup or the search? Checks that the channels agree and how finely each DOF is sampled, finds the best equations the search space holds by sparse regression, scores them with the run's reward, and puts your run's equations next to them ([below](#data-setup-or-search-discover_diagnosepy)) |
 
-All four handle any number of DOFs.
+All five handle any number of DOFs.
 
 ## Quickstart
 
@@ -314,6 +315,47 @@ that is the other DOF's own best.
 To score pasted equations with it afterwards, set `REWARD = 'simulation'` (and
 the same `SIM_WINDOW` / `SIM_WEIGHTS`) in `discover_score.py`; `SIM_COUPLED = True`
 scores them integrated together instead.
+
+## Data, setup or search? (`discover_diagnose.py`)
+
+When a run stalls, the record, the reward settings and the search itself can
+all be at fault. With integer powers up to 3, every candidate the search can
+write is a weighted sum of a fixed list of monomials (34 for two DOFs, plus a
+constant), so the best it could find can be computed without training:
+
+1. **The data.** Per DOF, the samples per cycle of its fastest motion, and at
+   its main spectral peaks the gain and phase of velocity against d/dt
+   displacement and of acceleration against d/dt velocity (ideal 1.00 and
+   0°). These come from cross-spectra, so no numerical derivative enters.
+   Beyond 5% or 5°, or under 10 samples per cycle, it is flagged.
+2. **The search space's best.** Sparse regression on the monomials
+   (SINDy-style thresholded least squares) gives the best equation of each
+   size up to `MAX_TERMS` (the run's `max_terms`). Each is simulated and
+   scored with the run's `SIM_WINDOW`, `SIM_WEIGHTS` and `TRIAL_DECAY`, and
+   the best is tuned on the simulation as `sim_refine` does. It is fitted
+   twice: to the measured acceleration (what the training's constant fit leans
+   on through `w_acc`) and to the derivative of the measured velocity.
+3. **Your equations** (`EXPRS`, the run's best per DOF), scored the same way.
+
+| it prints | which means |
+|---|---|
+| the list's best simulates clearly better than your run's (by 0.1+) | the space holds a better equation and the search does not find it: settings or method |
+| the list's best is poor too (under 0.5) | no equation of this form simulates the record: the data, or physics the measured states do not hold (forcing, friction, an unmeasured mode) |
+| fitted to d/dt velocity the list simulates clearly better than fitted to the acceleration | the acceleration channel is biased, and the constant fit leans on it, so the constants come out wrong before the search starts |
+| a channel or sampling flag | fix the data first |
+
+Checked on three stand-ins, 15–60 s each:
+
+- **Filtered acceleration** (`coupled_beats`, five trials, the acceleration
+  low-passed as in the `sim_refine` table above): acceleration flagged at
+  45–50° lag and gain 0.96–0.98. Fitted to the acceleration, every equation in the
+  list simulates at 0.04–0.06; fitted to d/dt velocity, it recovers `-4.402*x -
+  0.02999*xdot + 0.4000*y` (truth `-4.4*x - 0.03*xdot + 0.4*y`) at 0.85.
+- **An unmeasured third mass** driving q2: q1 recovered exactly at 0.999; q2's
+  best is 0.45, reported as nothing in the space doing well.
+- **20 Hz and 6.5 Hz modes sampled at 102 Hz** (noise-free): flagged at 5
+  samples per cycle, and still recovered within 7% on every coefficient, 0.99
+  for each DOF simulated together.
 
 ## Policy architecture
 
