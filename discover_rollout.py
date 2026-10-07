@@ -123,7 +123,9 @@ ranking anything.  :func:`auto_window` picks a few periods of the fastest
 motion -- of the DOF being simulated, not of the whole record: a slow DOF next
 to a fast one would otherwise be cut into windows shorter than one of its own
 cycles, where no frequency error shows.  The time-frequency and
-frequency-content terms always get a free run of their own.
+frequency-content terms always get a free run of their own, with
+``FREE_STEP_FRACTION`` of the RK4 substeps: neither looks at phase, and that
+run is nearly all of a candidate's simulation time.
 
 Integration
 -----------
@@ -151,6 +153,14 @@ SIM_BLOWUP = 10.0
 # hundred cycles on a perfect equation.
 SIM_STEPS_PER_CYCLE = 50
 MAX_SUBSTEPS = 8
+# When the pointwise terms are windowed, the separate free run that feeds only
+# the phase-blind terms (time-frequency, frequency content) takes this
+# fraction of the RK4 substeps, rounded up: an envelope or a spectrum needs
+# far less phase accuracy than a point-by-point comparison.  Measured on a
+# 20 Hz + 6.5 Hz record at 10-20 samples per cycle, halving moved R_tf by at
+# most 3e-4 and cut that run -- ~97% of a candidate's simulation time -- by
+# 34-44%.
+FREE_STEP_FRACTION = 0.5
 # sim_window='auto': restart every this many periods of the fastest motion
 SIM_AUTO_PERIODS = 3.0
 
@@ -285,6 +295,13 @@ def auto_steps(t, states, accs=None, per_cycle=SIM_STEPS_PER_CYCLE):
     if per_sample_cycle >= 2 * per_cycle:
         return int(per_sample_cycle // per_cycle), 1
     return 1, int(min(MAX_SUBSTEPS, max(1, np.ceil(per_cycle / per_sample_cycle))))
+
+
+def free_substeps(substeps):
+    """RK4 substeps for the separate free run of the phase-blind terms:
+    ``FREE_STEP_FRACTION`` of ``substeps``, rounded up (8 -> 4, 3 -> 2,
+    1 -> 1)."""
+    return max(1, int(np.ceil(FREE_STEP_FRACTION * max(1, int(substeps)))))
 
 
 def fastest_omega(states, accs=None, dofs=None):
@@ -925,9 +942,10 @@ def rollout_set_residuals(accels, t, states, window=None, stride=1, substeps=1,
     q_free, v_free = q_sim, v_sim
     if (w_tf > 0.0 or w_f > 0.0) and window is not None:
         # an envelope or a spectrum needs the whole record in one run: their
-        # own free run
+        # own free run, at fewer substeps since both are phase-blind
         _d, q_free, v_free, _a, _s, blown_free = rollout_set(
-            accels, t, states, None, stride, substeps, blowup, with_acc=False)
+            accels, t, states, None, stride, free_substeps(substeps), blowup,
+            with_acc=False)
         blown = blown | blown_free
 
     def nrmse(sim_x, meas_x, mk):

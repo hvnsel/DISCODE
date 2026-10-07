@@ -1530,6 +1530,30 @@ def test_frequency_content():
           f"frequency 2% high, displacement NRMSE: {on_fast:.4f} on the fast "
           f"DOF's windows, {on_own:.4f} on its own")
 
+    # A coarse record (10 samples per cycle of the 4 Hz DOF) needs RK4
+    # substeps; the free run of the phase-blind terms takes half of them.
+    c_ = slice(None, None, 10)
+    st_c, ac_c, t_c = states[:, :, c_], accs[:, :, c_], tt[c_]
+    stride_c, sub_c = ro.auto_steps(t_c, st_c, ac_c)
+    tf_c = ro.tf_setup(t_c, st_c[:, 0, :], stride_c)
+    sp_c = ro.spec_setup(t_c, st_c[:, 1, :], stride_c)
+    w0 = 2 * np.pi * 4.0
+
+    def fast_detuned(S):                     # DOF 0, frequency 1% too high
+        return -(1.01 * w0) ** 2 * S[0] - 2 * 0.01 * w0 * S[1]
+    phase_blind = [ro.rollout_residuals(fast_detuned, t_c, st_c, 0, window=wn,
+                                        stride=stride_c, substeps=sub_c,
+                                        weights=(0, 0, 0, 0.5, 0.5), accs=ac_c,
+                                        tf=tf_c, spec=sp_c)
+                   for wn in (None, 0.75)]
+    check('on a coarse record the free run of the phase-blind terms takes '
+          'half the RK4 substeps and scores the same to 1e-3',
+          [ro.free_substeps(k) for k in (8, 6, 5, 3, 1)] == [4, 3, 3, 2, 1]
+          and sub_c > 1 and phase_blind[0].min() > 0
+          and np.abs(phase_blind[0] - phase_blind[1]).max() < 1e-3,
+          f"{sub_c} -> {ro.free_substeps(sub_c)} substeps; envelope + "
+          f"spectrum {phase_blind[0].mean():.4f} vs {phase_blind[1].mean():.4f}")
+
     saved = (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
              dc.MAX_TRAJ, dc.W_ACC, dc.REWARD_MODE, dc.SIM_WINDOW,
              dc.SIM_WEIGHTS, dc.TRIAL_DECAY)
