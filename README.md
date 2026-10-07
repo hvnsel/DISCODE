@@ -258,8 +258,9 @@ equation comes back as `-4.401*x - 0.02999*xdot + 0.4011*y` (truth `-4.4*x -
 0.3 s on five 660-sample trials with `sim_window='auto'` — so `sim_refine=2,
 sim_refine_evals=40` adds 160 per epoch, spread over the pool.
 
-**What gets printed.** With `reward='simulation'` a run starts with a report per
-DOF and trial: the two strongest spectral peaks, the envelope swing the
+**What gets printed.** With `reward='simulation'` a run starts with the window
+`sim_window='auto'` picked and a report per DOF and trial: the two strongest
+spectral peaks, the envelope swing the
 time-frequency term sees (the largest std of a band's detrended log-amplitude;
 ~0 for a steady or decaying oscillation, 0.3 and up for clear beats) and the
 beat period read off the envelope's own spectrum. The trial whose swing stands
