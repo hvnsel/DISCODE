@@ -1600,6 +1600,10 @@ def print_record_summary(max_traj=None, horizon=None):
     D = float(np.median(np.diff(t))) * stride
     print(f"[record] per trial, what the simulation reward compares "
           f"({T:.4g} s per trial, {1.0 / D:.4g} Hz simulation grid):")
+    if SIM_WINDOW == 'auto':
+        win = _window(data)
+        print("  sim_window='auto': pointwise terms restart every "
+              + (f"{win:.4g} s" if win else "-- no motion to time, free runs"))
     for d in range(N_DOF):
         tf = _tf_setup(max_traj, horizon, d, data)
         if tf['G'] is None:
