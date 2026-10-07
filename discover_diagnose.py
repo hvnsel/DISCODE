@@ -27,10 +27,13 @@ run's equations scored alongside.
    - Some do, and your run's best is far below them: the search is what
      fails -- its settings or the method.
 
-   Fitted twice: to the measured acceleration (what the training's constant
-   fit leans on) and to the derivative of the measured velocity.  If the
-   second simulates clearly better, the acceleration channel is biased and
-   that bias is what holds the constants back.
+   With ``CHANNELS = 'measured'`` it is fitted twice: to the file's
+   acceleration (what the training's constant fit leans on) and to the
+   derivative of the file's velocity.  If the second simulates clearly better,
+   the acceleration channel is biased and that bias is what holds the
+   constants back.  With ``'disp'`` (the loader's default) both are
+   derivatives of the displacement and agree by construction; the data check
+   above still reads the file's own channels.
 
 3. **Your equations**, scored the same way, next to the list's best.
 
@@ -53,6 +56,7 @@ sys.path.insert(0, '.')
 
 import discover_rollout as ro
 from discover_analysis import clean_expr, expr_accels, record_states
+from discover_data import time_derivative
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ── CONFIG ─────────────────────────────────────────────────────────────────
@@ -67,6 +71,10 @@ VAR_NAMES         = ['q1', 'q2']
 TRIM_FRONT        = 1000
 TRIM_BACK         = 125_000
 DESIRED_TIMESTEPS = 2000
+
+# Velocity and acceleration, as in the run: 'disp' (the displacement's
+# derivatives, the loader's default) or 'measured' (the file's own).
+CHANNELS = 'disp'
 
 # ── simulated ──────────────────────────────────────────────────────────────
 SIM_KEY = 'coupled_beats'        # a key from discover_mdof_sim / discover_sdof_sim
@@ -90,14 +98,15 @@ EXPRS = [
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def build_system():
-    """The record the run trained on."""
+def build_system(channels=None):
+    """The record the run trained on (``channels`` overrides ``CHANNELS``)."""
     if SOURCE == 'experimental':
         from discover_data import load_mat_data
         return load_mat_data(MAT_PATH, trim_timesteps_front=TRIM_FRONT,
                              trim_timesteps_back=TRIM_BACK,
                              desired_timesteps=DESIRED_TIMESTEPS,
-                             var_names=VAR_NAMES, plot_data=False)
+                             var_names=VAR_NAMES, plot_data=False,
+                             channels=CHANNELS if channels is None else channels)
     if SOURCE == 'simulated':
         from discover_data import build_truth_system
         from discover_mdof_sim import _REGISTRY as MDOF_REG
@@ -245,16 +254,6 @@ def stlsq_path(Th, y, max_terms, n_lam=60):
     return best
 
 
-def ddt(x, t):
-    """Fourth-order central difference along the last axis (second order at
-    the ends): much closer than np.gradient at a few samples per cycle."""
-    dt = float(np.median(np.diff(t)))
-    d = np.gradient(x, t, axis=-1, edge_order=2)
-    d[..., 2:-2] = (-x[..., 4:] + 8 * x[..., 3:-1] - 8 * x[..., 1:-3]
-                    + x[..., :-4]) / (12.0 * dt)
-    return d
-
-
 def as_expr(dof, coefs, exps, names, var_names):
     """A physical equation string the scorers and plot scripts accept."""
     body = ' '.join(f"{c:+.6g}*{term_name(e, names)}"
@@ -355,7 +354,14 @@ def main():
     states, accs = record_states(system, range(P))
     names = [n for v in system.var_names for n in (v, v + 'dot')]
 
-    flags = check_data(system, t, states, accs)
+    file_system = system
+    if SOURCE == 'experimental' and CHANNELS != 'measured':
+        file_system = build_system('measured')
+    flags = check_data(file_system, t, *record_states(file_system, range(P)))
+    if file_system is not system:
+        print("  (the file's own channels, above; with CHANNELS='disp' the fit "
+              "and the reward below use the displacement's derivatives, which "
+              "agree by construction)")
 
     exps = monomials(2 * N, MAX_DEGREE)
     X = np.concatenate([states[p].T for p in range(P)])          # (rows, 2N)
@@ -363,9 +369,12 @@ def main():
     Th = theta(X / scale, exps)
     col_scale = np.array([np.prod(scale ** np.array(e)) for e in exps])
     scorer = Scorer(system, t, states, accs)
-    targets = {'acceleration': accs,
-               'd/dt velocity': np.stack([ddt(states[:, 2 * d + 1, :], t)
-                                          for d in range(N)], axis=1)}
+    targets = {'acceleration': accs}
+    dv = np.stack([time_derivative(states[:, 2 * d + 1, :], t, axis=-1)
+                   for d in range(N)], axis=1)
+    if not np.allclose(dv, accs, rtol=0.0,
+                       atol=1e-6 * float(np.abs(accs).max() + 1e-300)):
+        targets['d/dt velocity'] = dv          # the channels disagree: fit both
 
     print(f"\n[2. the list] every monomial of {', '.join(names)} up to degree "
           f"{MAX_DEGREE} ({len(exps) - 1}) and a constant; sparse fits of each "
@@ -376,8 +385,9 @@ def main():
     best_list, by_target = {}, {}
     for d in range(N):
         print(f"\n  DOF {d} ({system.var_names[d]})")
-        print("    fitted to         terms   R^2 vs accel   R^2 vs d/dt vel   "
-              "sim reward alone   worst trial residual")
+        print("    fitted to         terms   "
+              + "".join(f"{'R^2 vs ' + lb:>22s}" for lb in targets)
+              + "   sim reward alone   worst trial residual")
         rows = []
         for label, tgt in targets.items():
             y = np.concatenate([tgt[p, d] for p in range(P)])
@@ -390,9 +400,9 @@ def main():
                 fit = r2s(system, states, targets, d, expr)
                 n_terms = int(np.count_nonzero(coefs))
                 rows.append((r, label, n_terms, coefs, expr))
-                print(f"    {label:16s} {str(k):>6s}   {fit['acceleration']:12.4f}"
-                      f"   {fit['d/dt velocity']:15.4f}   {r:16.4f}   "
-                      f"{np.nanmax(res):12.3f}")
+                print(f"    {label:16s} {str(k):>6s}   "
+                      + "".join(f"{fit[lb]:22.4f}" for lb in targets)
+                      + f"   {r:16.4f}   {np.nanmax(res):20.3f}")
         # what the search can write: at most MAX_TERMS terms
         fits = [row for row in rows if row[2] <= MAX_TERMS] or rows
         by_target[d] = {lb: max((r for r, l2, *_ in fits if l2 == lb),
@@ -429,9 +439,10 @@ def main():
             r, res = scorer.alone(d, clean_expr(exprs[d]))
             fit = r2s(system, states, targets, d, exprs[d])
             yours.append(r)
-            print(f"  DOF {d}: R^2 vs accel {fit['acceleration']:.4f}, vs d/dt "
-                  f"velocity {fit['d/dt velocity']:.4f}; sim reward alone "
-                  f"{r:.4f}, worst trial residual {np.nanmax(res):.3f}")
+            print(f"  DOF {d}: R^2 "
+                  + ", ".join(f"vs {lb} {fit[lb]:.4f}" for lb in targets)
+                  + f"; sim reward alone {r:.4f}, worst trial residual "
+                    f"{np.nanmax(res):.3f}")
         tog = scorer.together(exprs)
         print("  simulated together: "
               + ", ".join(f"DOF {d} {r:.4f}" for d, r in enumerate(tog)))
@@ -439,6 +450,11 @@ def main():
     print("\n[reading]")
     if flags:
         print("  data: " + "\n        ".join(flags))
+        if file_system is not system:
+            print("        (the file's own channels: with CHANNELS='disp' the "
+                  "run uses the displacement's derivatives instead, so a "
+                  "velocity or acceleration flag no longer reaches the fit or "
+                  "the reward)")
     else:
         print("  data: the channels agree at the main peaks (within 5% and 5 "
               "deg) and every DOF gets 10+ samples per cycle")
@@ -461,6 +477,8 @@ def main():
             line += (" -> nothing in the search space does well: the data, or "
                      "physics these states do not hold")
         print(line)
+        if 'd/dt velocity' not in targets:
+            continue
         r_acc, r_dv = (by_target[d]['acceleration'],
                        by_target[d]['d/dt velocity'])
         if r_dv > r_acc + 0.1:

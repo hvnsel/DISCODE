@@ -1662,6 +1662,113 @@ def test_diagnose_tools():
           f"{p_bad:+.1f} deg")
 
 
+def test_derived_channels():
+    """``load_mat_data(channels='disp')``, the default: velocity and
+    acceleration are the displacement's derivatives.  A record whose velocity
+    and displacement were made by integrating the acceleration with a
+    zero-phase 2 Hz high-pass after each step -- what the channel check read
+    off the NOhit record -- leaves its channels disagreeing at the low mode,
+    and its own equation of motion unsatisfied; the displacement's
+    derivatives satisfy it again, because a filter that reaches all three
+    channels alike commutes with a linear equation of motion."""
+    import contextlib
+    import io
+    import os
+    import tempfile
+
+    import scipy.io
+    from scipy.integrate import solve_ivp
+    from scipy.signal import butter, filtfilt
+
+    import discover_data as dd
+    import discover_diagnose as dg
+
+    print("\nderived channels")
+    t = np.arange(0.0, 3.0, 1.0 / 50.0)             # 50 samples per cycle
+    w, sg = 2 * np.pi, 0.3
+    q = np.exp(-sg * t) * np.sin(w * t)
+    v = np.exp(-sg * t) * (w * np.cos(w * t) - sg * np.sin(w * t))
+    a = np.exp(-sg * t) * ((sg * sg - w * w) * np.sin(w * t)
+                           - 2 * sg * w * np.cos(w * t))
+    V, A = dd.derive_channels(q, t)
+    e_v = float(np.abs(V - v).max() / np.abs(v).max())
+    e_a = np.abs(A - a) / np.abs(a).max()
+    check('the derivatives are accurate at 50 samples per cycle, ends included',
+          e_v < 1e-4 and e_a[4:-4].max() < 1e-4 and e_a.max() < 5e-3,
+          f"velocity {e_v:.1e}, acceleration {e_a[4:-4].max():.1e} inside, "
+          f"{e_a.max():.1e} at the ends")
+
+    K = np.array([[1.6e4, -1.2e3], [-1.2e3, 1.6e3]])      # modes 6.2, 20.2 Hz
+    C = np.array([[3.0, 0.0], [0.0, 1.0]])
+    fs = 4096.0
+    tt = np.arange(0.0, 4.0, 1.0 / fs)
+    b, a_hp = butter(1, 2.0 / (0.5 * fs), 'high')
+
+    def integrate(x):
+        out = np.zeros_like(x)
+        out[1:] = np.cumsum(0.5 * (x[1:] + x[:-1]) / fs, axis=0)
+        return filtfilt(b, a_hp, out, axis=0)
+
+    acc, vel, disp = [], [], []
+    for ic in ([1e-3, 2e-3, 0.0, 0.0], [0.0, 3e-3, 0.05, 0.0]):
+        S = solve_ivp(lambda _t, s: np.r_[s[2:], -K @ s[:2] - C @ s[2:]],
+                      (0.0, tt[-1]), ic, t_eval=tt, rtol=1e-10, atol=1e-13,
+                      method='DOP853').y
+        A_ = (-K @ S[:2] - C @ S[2:]).T
+        V_ = integrate(A_)
+        acc.append(A_)
+        vel.append(V_)
+        disp.append(integrate(V_))
+    acc, vel, disp = (np.stack(x, axis=2) for x in (acc, vel, disp))
+    kw = dict(trim_timesteps_front=4096, trim_timesteps_back=4096,
+              desired_timesteps=2048)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'record.mat')
+        scipy.io.savemat(path, {'Acc': acc, 'Vel': vel, 'Disp': disp,
+                                'Time': tt[:, None]})
+        with contextlib.redirect_stdout(io.StringIO()):
+            derived = dd.load_mat_data(path, **kw)
+            measured = dd.load_mat_data(path, channels='measured', **kw)
+            try:
+                dd.load_mat_data(path, channels='acc', **kw)
+                refused = False
+            except ValueError:
+                refused = True
+    t = derived.time
+    v_d, a_d = dd.derive_channels(derived.disp, t)
+    keep = slice(4096, -4096, 4)
+    check("by default velocity and acceleration are the displacement's "
+          "derivatives; 'measured' keeps the file's; anything else is refused",
+          np.array_equal(derived.vel, v_d) and np.array_equal(derived.acc, a_d)
+          and np.array_equal(measured.disp, derived.disp)
+          and np.array_equal(measured.vel, vel[keep])
+          and np.array_equal(measured.acc, acc[keep]) and refused)
+
+    f_lo = float(np.sqrt(np.linalg.eigvalsh(K)).min() / (2 * np.pi))
+    (_f, g_file, _p), = dg.channel_agreement(t, measured.disp[:, 1, :].T,
+                                             measured.vel[:, 1, :].T, [f_lo])
+    (_f, g_disp, _p), = dg.channel_agreement(t, derived.disp[:, 1, :].T,
+                                             derived.vel[:, 1, :].T, [f_lo])
+    g_pred = 1.0 + (2.0 / f_lo) ** 2
+    check('the high-pass shows in the file as the gain 1 + (fc/f)^2 at the low '
+          'mode, and is gone from the derived channels',
+          abs(g_file - g_pred) < 0.02 and abs(g_disp - 1.0) < 0.01,
+          f"{f_lo:.2f} Hz: file {g_file:.3f} (predicted {g_pred:.3f}), "
+          f"derived {g_disp:.3f}")
+
+    def equation_error(sy):
+        err = []
+        for p in range(sy.n_trials):
+            r = sy.acc[:, :, p] + sy.disp[:, :, p] @ K.T + sy.vel[:, :, p] @ C.T
+            err.append(np.sqrt(np.mean(r ** 2, axis=0)
+                               / np.mean(sy.acc[:, :, p] ** 2, axis=0)))
+        return float(np.max(err))
+    e_file, e_disp = equation_error(measured), equation_error(derived)
+    check("the true equation of motion fails on the file's channels and holds "
+          "on the derived ones", e_file > 0.1 and e_disp < 1e-3,
+          f"relative error {e_file:.3f} vs {e_disp:.1e}")
+
+
 def test_scoring_pool():
     """The scoring pool (:func:`discover_core.make_pool`).
 
@@ -1743,6 +1850,7 @@ def main():
     test_beats_tools()
     test_frequency_content()
     test_diagnose_tools()
+    test_derived_channels()
     test_scoring_pool()
 
     print(f"\n{'=' * 60}")

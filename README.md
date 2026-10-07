@@ -20,7 +20,7 @@ committed for the others. See [Policy architecture](#policy-architecture).
 | `discover_rollout.py` | the forward-simulation reward's integrator: one DOF against the measured record, or several integrated together (torch-free, shared with `discover_score.py`) |
 | `discover_policy.py` | the terms-in-a-bag policy: model, attention mask, sampling, beam search, `jgrpo_terms` |
 | `discover_policy_test.py` | correctness invariants for the above — run it before anything long |
-| `discover_data.py` | everything that produces a `SystemData`: `.mat` loading, truth simulation, dataset prep, ceiling + truth-reward diagnostics |
+| `discover_data.py` | everything that produces a `SystemData`: `.mat` loading (velocity and acceleration derived from the displacement by default), truth simulation, dataset prep, ceiling + truth-reward diagnostics |
 | `discover_train.py` | `DISCOVER_TRAIN(system_data, ...)` — the one N-DOF training loop |
 | `discover_analysis.py` | post-hoc: expression parsing, forward simulation, energy residual, comparison plots |
 
@@ -71,14 +71,63 @@ Paste it into `discover_score.py` or a plotter, point the config at the same dat
 balance. No expression can beat it (under the energy reward — the simulation
 reward below has no ceiling, and the experimental drivers skip it there). On simulated data it must be ~1.0 — if it
 isn't, the trapezoid rule is under-resolving the `v*a` integrand and every reward
-is capped; raise `n_pts`. On experimental data it is typically well below 1.0
-because filtering breaks `a = dv/dt` and `v = dq/dt`, and near the ceiling the
-ranking between expressions can invert. Printed by every driver.
+is capped; raise `n_pts`. With the file's own channels (`channels='measured'`,
+[below](#velocity-and-acceleration-come-from-the-displacement)) it is typically
+well below 1.0 on experimental data, because filtering breaks `a = dv/dt` and
+`v = dq/dt`, and near the ceiling the ranking between expressions can invert;
+with the default derived channels it is ~1.0. Printed by every driver.
 
 **Negative headroom** (`ceiling - r_energy < 0`) means an expression closes the
 balance better than the measured acceleration does. That is a data-integrity
 warning, not a success: the disp/vel/acc channels are mutually inconsistent,
-usually because they were filtered a different number of times each.
+usually because they were filtered a different number of times each. The
+default `channels='disp'` removes that by deriving velocity and acceleration
+from the displacement.
+
+## Velocity and acceleration come from the displacement
+
+`load_mat_data` takes `channels`:
+
+| `channels` | velocity and acceleration are |
+|---|---|
+| `'disp'` (default) | the first and second derivatives of the displacement on the trimmed, downsampled grid (fourth-order differences, error ~1e-5 at 50 samples per cycle) |
+| `'measured'` | the file's own `Vel` and `Acc` |
+
+An equation of motion can only match a record whose three channels describe one
+motion, and the NOhit record's do not: at its 6.19 Hz mode the velocity is 10%
+larger than the derivative of the displacement and the acceleration 10% larger
+than the derivative of the velocity, with no phase shift; at 19.7 Hz both are
+1.2% (`discover_diagnose.py`, below). That is the signature of velocity and
+displacement integrated from the acceleration with a zero-phase high-pass near
+2 Hz after each step, whose gain gives `1 + (2/f)^2`: 1.10 at 6.19 Hz, 1.01 at
+19.7 Hz. A filter that reaches all three channels alike leaves a linear
+equation of motion exactly satisfied, because it only rescales each mode. The
+displacement carries the high-pass twice; its derivatives carry the same two,
+so all three channels agree again.
+
+Measured on a stand-in built that way (the diagnostic's NOhit equations plus a
+little DOF 1 damping as the truth, the acceleration integrated twice with a
+zero-phase 2 Hz high-pass after each step, five trials of 2.5 s at 1024 Hz),
+whose channel check reads 1.13 at its 5.6 Hz mode and 1.01 at 19.8 Hz:
+
+| | the file's channels | derived from the displacement |
+|---|---|---|
+| the list's best equations, alone | 0.89, 0.77 | 0.99, 0.99 |
+| simulated together | 0.78, 0.66 | 0.99, 0.99 |
+| DOF 1 recovered (truth `1996*q1 - 1398*q2 - 0.85*q2dot - 2.07e7*q2**3`) | `2990*q1 - 1495*q2 - 0.777*q2dot - 3.46e7*q2**3` | `2001*q1 - 1399*q2 - 0.850*q2dot - 3.44e7*q2**3 + 4576*q2*q2dot**2` |
+
+The linear terms (stiffness, coupling, damping) come back within 1% on both
+DOFs. The cubic ones
+come back about 1.6× too large: the processing shrank the low mode's
+displacement (to 0.78 here), and the cubic coefficients describe the
+displacement as recorded. They simulate the record correctly; keep that in mind
+when reading them as physics.
+
+The loader prints, per DOF, the derived channels' RMS over the file's (below 1
+where the high-pass took low-frequency motion out of the file's displacement)
+and warns when the acceleration's is above 1.5, which would be noise in the
+displacement amplified by differentiating twice. `channels='measured'` in the
+driver's `load_mat_data` call goes back to the file's channels.
 
 ## `w_acc`
 
@@ -326,25 +375,27 @@ constant), so the best it could find can be computed without training:
 1. **The data.** Per DOF, the samples per cycle of its fastest motion, and at
    its main spectral peaks the gain and phase of velocity against d/dt
    displacement and of acceleration against d/dt velocity (ideal 1.00 and
-   0°). These come from cross-spectra, so no numerical derivative enters.
-   Beyond 5% or 5°, or under 10 samples per cycle, it is flagged.
+   0°), on the file's own channels whatever `CHANNELS` the run uses. These
+   come from cross-spectra, so no numerical derivative enters. Beyond 5% or
+   5°, or under 10 samples per cycle, it is flagged.
 2. **The search space's best.** Sparse regression on the monomials
    (SINDy-style thresholded least squares) gives the best equation of each
    size up to `MAX_TERMS` (the run's `max_terms`). Each is simulated and
    scored with the run's `SIM_WINDOW`, `SIM_WEIGHTS` and `TRIAL_DECAY`, and
-   the best is tuned on the simulation as `sim_refine` does. It is fitted
-   twice: to the measured acceleration (what the training's constant fit leans
-   on through `w_acc`) and to the derivative of the measured velocity.
+   the best is tuned on the simulation as `sim_refine` does. With
+   `CHANNELS = 'measured'` it is fitted twice: to the file's acceleration
+   (what the training's constant fit leans on through `w_acc`) and to the
+   derivative of its velocity. With the default `'disp'` the two are the same.
 3. **Your equations** (`EXPRS`, the run's best per DOF), scored the same way.
 
 | it prints | which means |
 |---|---|
 | the list's best simulates clearly better than your run's (by 0.1+) | the space holds a better equation and the search does not find it: settings or method |
 | the list's best is poor too (under 0.5) | no equation of this form simulates the record: the data, or physics the measured states do not hold (forcing, friction, an unmeasured mode) |
-| fitted to d/dt velocity the list simulates clearly better than fitted to the acceleration | the acceleration channel is biased, and the constant fit leans on it, so the constants come out wrong before the search starts |
+| (`CHANNELS='measured'`) fitted to d/dt velocity the list simulates clearly better than fitted to the acceleration | the acceleration channel is biased, and the constant fit leans on it, so the constants come out wrong before the search starts |
 | a channel or sampling flag | fix the data first |
 
-Checked on three stand-ins, 15–60 s each:
+Checked on four stand-ins, 15–60 s each:
 
 - **Filtered acceleration** (`coupled_beats`, five trials, the acceleration
   low-passed as in the `sim_refine` table above): acceleration flagged at
@@ -356,6 +407,13 @@ Checked on three stand-ins, 15–60 s each:
 - **20 Hz and 6.5 Hz modes sampled at 102 Hz** (noise-free): flagged at 5
   samples per cycle, and still recovered within 7% on every coefficient, 0.99
   for each DOF simulated together.
+- **Velocity and displacement integrated with a 2 Hz high-pass** (the stand-in
+  [above](#velocity-and-acceleration-come-from-the-displacement)): flagged at
+  1.13 on both pairs at 5.6 Hz; the list's best 0.89 and 0.77 on the file's
+  channels, 0.99 and 0.99 on the derived ones.
+
+On NOhit it read 1.10 at 6.19 Hz and 1.01 at 19.7 Hz on both pairs and both
+DOFs, and the list's best was 0.59 on the file's channels.
 
 ## Policy architecture
 

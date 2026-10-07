@@ -9,7 +9,9 @@ three (m, n_dof, p_trials) arrays — displacement, velocity, acceleration — o
 shared (m,) time grid, plus the variable names used by the grammar.  There are
 exactly two ways to make one:
 
-  * :func:`load_mat_data`  — read an experimental MATLAB record from disk.
+  * :func:`load_mat_data`  — read an experimental MATLAB record from disk.  By
+    default its velocity and acceleration are the derivatives of its
+    displacement (:func:`derive_channels`), not the file's own channels.
   * :func:`simulate_truth` — integrate a known set of accelerations from given
     initial conditions.
 
@@ -89,9 +91,52 @@ class SystemData:
                 f"{self.t_end:.3f} s, {fs:.0f} Hz>")
 
 
+# ── Channels ────────────────────────────────────────────────────────────────
+CHANNELS = ('disp', 'measured')
+
+
+def time_derivative(x, t, axis=0):
+    """d/dt of ``x`` along ``axis`` on the grid ``t``: fourth-order central
+    differences inside and fourth-order one-sided ones at the two samples at
+    each end (``np.gradient``'s second order if the grid is uneven).  At 50
+    samples per cycle the error is ~1e-5 of the amplitude inside and ~5e-5 at
+    the ends."""
+    x = np.moveaxis(np.asarray(x, dtype=float), axis, 0)
+    t = np.asarray(t, dtype=float)
+    n = x.shape[0]
+    steps = np.diff(t)
+    dt = float(np.median(steps)) if n > 1 else 1.0
+    if n < 5 or not np.allclose(steps, dt, rtol=1e-3, atol=0.0):
+        d = np.gradient(x, t, axis=0, edge_order=2 if n > 2 else 1)
+        return np.moveaxis(d, 0, axis)
+    d = np.empty_like(x)
+    d[2:-2] = x[:-4] - 8.0 * x[1:-3] + 8.0 * x[3:-1] - x[4:]
+    d[0] = -25.0 * x[0] + 48.0 * x[1] - 36.0 * x[2] + 16.0 * x[3] - 3.0 * x[4]
+    d[1] = -3.0 * x[0] - 10.0 * x[1] + 18.0 * x[2] - 6.0 * x[3] + x[4]
+    d[-2] = 3.0 * x[-1] + 10.0 * x[-2] - 18.0 * x[-3] + 6.0 * x[-4] - x[-5]
+    d[-1] = 25.0 * x[-1] - 48.0 * x[-2] + 36.0 * x[-3] - 16.0 * x[-4] + 3.0 * x[-5]
+    return np.moveaxis(d / (12.0 * dt), 0, axis)
+
+
+def derive_channels(disp, t):
+    """Velocity and acceleration as the first and second time derivatives of
+    ``disp`` (time on axis 0), so that the three channels describe one motion."""
+    vel = time_derivative(disp, t)
+    return vel, time_derivative(vel, t)
+
+
+def _rms_ratio(new, old):
+    """Per DOF, the RMS of ``new`` over that of ``old``, means removed."""
+    def rms(x):
+        return np.sqrt(np.mean((x - x.mean(axis=0, keepdims=True)) ** 2,
+                               axis=(0, 2)))
+    return rms(new) / np.maximum(rms(old), 1e-300)
+
+
 # ── Experimental loading ────────────────────────────────────────────────────
 def load_mat_data(filepath, trim_timesteps_front=1000, trim_timesteps_back=70000,
-                  desired_timesteps=600, var_names=None, plot_data=False):
+                  desired_timesteps=600, var_names=None, plot_data=False,
+                  channels='disp'):
     """
     Load Acc, Vel, Disp, Time from a MATLAB .mat file.
 
@@ -105,9 +150,25 @@ def load_mat_data(filepath, trim_timesteps_front=1000, trim_timesteps_back=70000
     The first ``trim_timesteps_front`` and last ``trim_timesteps_back`` rows are
     dropped to keep only the free response, then the record is downsampled to
     roughly ``desired_timesteps`` samples.
+
+    ``channels`` says where velocity and acceleration come from:
+
+      * ``'disp'`` (default): the first and second derivatives of the
+        displacement on that final grid (:func:`derive_channels`), so the three
+        channels describe one motion.  Processing that treats the channels
+        differently -- integrating the acceleration with a drift-removing
+        high-pass after each step, say -- leaves a file's channels disagreeing
+        with each other's derivatives, and then no equation of motion can match
+        all three (``discover_diagnose.py`` measures it).  A filter that
+        reaches all three channels alike leaves a linear equation of motion
+        exactly satisfied.
+      * ``'measured'``: the file's own Vel and Acc.
     """
     import h5py
     import scipy.io
+
+    if channels not in CHANNELS:
+        raise ValueError(f"channels must be one of {CHANNELS}, got {channels!r}")
 
     if not os.path.isfile(filepath):
         raise FileNotFoundError(
@@ -214,6 +275,21 @@ def load_mat_data(filepath, trim_timesteps_front=1000, trim_timesteps_back=70000
     vel  = vel[::down_sample_factor, :, :]
     disp = disp[::down_sample_factor, :, :]
     time = time[::down_sample_factor]
+
+    if channels == 'disp':
+        vel_file, acc_file = vel, acc
+        vel, acc = derive_channels(disp, time)
+        r_v, r_a = _rms_ratio(vel, vel_file), _rms_ratio(acc, acc_file)
+        fmt = lambda r: '/'.join(f"{x:.3f}" for x in r)
+        print(f"[load_mat_data] velocity and acceleration are the derivatives of "
+              f"the displacement (channels='disp'; 'measured' keeps the file's "
+              f"own).  Their RMS over the file's, per DOF: velocity {fmt(r_v)}, "
+              f"acceleration {fmt(r_a)}", flush=True)
+        if np.any(r_a > 1.5):
+            print(f"[load_mat_data] WARNING: the displacement's second derivative "
+                  f"is up to {r_a.max():.1f}x the file's acceleration -- noise in "
+                  f"the displacement, amplified by differentiating.  Check the "
+                  f"displacement, or use channels='measured'.", flush=True)
 
     name = os.path.splitext(os.path.basename(filepath))[0]
 
