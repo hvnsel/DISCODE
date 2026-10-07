@@ -482,6 +482,8 @@ def simulation_scores(system, exprs, trials=None, window=None,
     accs = np.stack([system.acc[:, :, tr].T for tr in keep])   # (P, N, m)
     stride, substeps = ro.auto_steps(t, states, accs)
     with_tf = ro.check_weights(weights)[3] > 0.0
+    if window == 'auto':
+        window = ro.auto_window(t, states, accs)
 
     accels = []
     for clean in cleans:

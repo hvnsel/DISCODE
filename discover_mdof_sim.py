@@ -299,6 +299,10 @@ def DISCOVER_MDOF_SIM(
     term_grammar          = 'free',    # 'free' | 'varpro'
     term_position_encoding = True,     # False -> order-blind bag
     seed_policy           = None,
+    sim_refine       = 0,        # simulation: per DOF per epoch, the best this
+                                 #   many equations get their amplitudes tuned
+                                 #   on the simulation (0 = off)
+    sim_refine_evals = 60,       # simulations per tuned equation
 ):
     """Generate an N-DOF system from the library and try to rediscover it."""
     spec = get_mdof_system(system_key)
@@ -352,6 +356,8 @@ def DISCOVER_MDOF_SIM(
         term_grammar          = term_grammar,
         term_position_encoding = term_position_encoding,
         seed                  = seed_policy,
+        sim_refine            = sim_refine,
+        sim_refine_evals      = sim_refine_evals,
     )
 
 

@@ -344,10 +344,12 @@ W_ACC = 0.0
 # steering the constant fit under both schemes; under 'simulation' it no
 # longer enters the score.
 #   SIM_WINDOW   None = one free run per trial from its first sample; a
-#                number = restart from the measured state every SIM_WINDOW s
+#                number = restart from the measured state every SIM_WINDOW s;
+#                'auto' = every 3 periods of the fastest motion.  Windows
+#                apply to the pointwise terms; the time-frequency term always
+#                gets a free run of its own
 #   SIM_WEIGHTS  (displacement, velocity, acceleration, time-frequency)
-#                weights, non-negative and summing to 1; the time-frequency
-#                term needs SIM_WINDOW = None
+#                weights, non-negative and summing to 1
 #   TRIAL_DECAY  how a candidate's trials are combined, under both schemes:
 #                ranked from worst fit to best, the k-th worst weighted
 #                TRIAL_DECAY**(k-1); 1 = plain mean, 0 = worst trial only
@@ -462,8 +464,10 @@ def set_reward(mode='energy', sim_window=None,
     :func:`energy_reward`; ``'simulation'`` is the forward-simulation NRMSE of
     :func:`simulation_reward`.  ``sim_window`` and ``sim_weights`` -- the
     (displacement, velocity, acceleration[, time-frequency]) weights, which
-    must be non-negative and sum to 1 -- only matter for the latter.  The
-    time-frequency weight needs free runs (``sim_window=None``).
+    must be non-negative and sum to 1 -- only matter for the latter.
+    ``sim_window`` is None (free runs), a restart interval in seconds, or
+    ``'auto'`` (:func:`discover_rollout.auto_window`); it applies to the
+    pointwise terms, the time-frequency term always running free.
     ``trial_decay`` in [0, 1] sets how the trials are combined under either
     scheme (see ``TRIAL_DECAY``); it never touches the constant fit.
     """
@@ -477,14 +481,18 @@ def set_reward(mode='energy', sim_window=None,
     if not 0.0 <= decay <= 1.0:
         raise ValueError("trial_decay must be in [0, 1] (1 = plain mean over "
                          f"trials, 0 = worst trial only), got {trial_decay!r}")
-    if sim_window is not None and not float(sim_window) > 0.0:
-        raise ValueError(f"sim_window must be None or > 0 s, got {sim_window!r}")
+    if sim_window is not None and sim_window != 'auto':
+        try:
+            ok = float(sim_window) > 0.0
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            raise ValueError("sim_window must be None, 'auto' or > 0 s, "
+                             f"got {sim_window!r}")
     weights = _ro.check_weights(sim_weights)
-    if weights[3] > 0.0 and sim_window is not None:
-        raise ValueError("the time-frequency weight needs free runs: "
-                         "set sim_window=None")
     REWARD_MODE = mode
-    SIM_WINDOW  = None if sim_window is None else float(sim_window)
+    SIM_WINDOW  = (sim_window if sim_window in (None, 'auto')
+                   else float(sim_window))
     SIM_WEIGHTS = weights
     TRIAL_DECAY = decay
 
@@ -503,8 +511,14 @@ def describe_reward():
         parts = [(w, nm) for w, nm in zip(SIM_WEIGHTS, names) if w > 0]
         what = (parts[0][1] if len(parts) == 1 else
                 ' + '.join(f'{w:.2f} {nm}' for w, nm in parts))
-        how = ('one free run per trial' if SIM_WINDOW is None else
-               f'restarted from the record every {SIM_WINDOW:g} s')
+        if SIM_WINDOW is None:
+            how = 'one free run per trial'
+        else:
+            every = ('3 periods of the fastest motion' if SIM_WINDOW == 'auto'
+                     else f'{SIM_WINDOW:g} s')
+            how = f'restarted from the record every {every}'
+            if SIM_WEIGHTS[3] > 0.0:
+                how += '; time-frequency on a free run'
         text = (f"forward simulation, {what} ({how}); constants fitted "
                 f"to {1 - W_ACC:.2f} work-energy + {W_ACC:.2f} accel-NRMSE")
     else:
@@ -1535,6 +1549,14 @@ def _sim_data(max_traj, horizon):
     return _SIM_DATA[key]
 
 
+def _window(data):
+    """``SIM_WINDOW`` in seconds for this record (``'auto'`` resolved)."""
+    if SIM_WINDOW == 'auto':
+        t, states, accs, _stride, _substeps = data
+        return _ro.auto_window(t, states, accs)
+    return SIM_WINDOW
+
+
 def _tf_setup(max_traj, horizon, dof, data):
     """The measured side of DOF ``dof``'s time-frequency term
     (:func:`discover_rollout.tf_setup`) on ``_sim_data``'s record and stride,
@@ -1560,6 +1582,49 @@ def _accel_fn(d, expr):
     def accel(S):
         return ym + ys * fn(*((S - xm) / xs))
     return accel
+
+
+def print_record_summary(max_traj=None, horizon=None):
+    """Print, per DOF and trial, what the simulation reward has to work with:
+    the two strongest spectral peaks of the displacement, the envelope swing
+    the time-frequency term sees (the largest std of a band's detrended
+    log-amplitude, nepers: ~0 for a steady or decaying oscillation, ~0.3 and
+    up for clear beats), and the beat period read off the envelope's own
+    spectrum.  A trial whose swing stands out is the one carrying the beats;
+    one whose peaks fall outside the bands is invisible to the term."""
+    data = _sim_data(max_traj, horizon)
+    if data is None:
+        return
+    t, states, _accs, stride, _sub = data
+    T = float(t[-1] - t[0])
+    D = float(np.median(np.diff(t))) * stride
+    print(f"[record] per trial, what the simulation reward compares "
+          f"({T:.4g} s per trial, {1.0 / D:.4g} Hz simulation grid):")
+    for d in range(N_DOF):
+        tf = _tf_setup(max_traj, horizon, d, data)
+        if tf['G'] is None:
+            print(f"  DOF {d}: no oscillation found -- the time-frequency term "
+                  f"reduces to its trend")
+            continue
+        freqs, rel = _ro.spectral_peaks(t, states[:, 2 * d, :], stride,
+                                        tf['f_lo'], tf['f_hi'])
+        print(f"  DOF {d}: time-frequency bands {tf['f_lo']:.3g}-{tf['f_hi']:.3g} Hz"
+              + ("" if tf['rate'] is not None else
+                 "; record too short for the beat-rate term"))
+        print("     trial   peak Hz   2nd peak Hz (rel)   envelope swing   "
+              "beat period s")
+        swing = tf['swing']
+        strongest = int(np.argmax(swing)) if len(swing) > 1 else -1
+        for p in range(len(swing)):
+            f1, f2, r2 = freqs[p, 0], freqs[p, 1], rel[p, 1]
+            second = (f"{f2:9.4g} ({r2:4.2f})" if np.isfinite(f2) else
+                      f"{'-':>16s}")
+            beat = (f"{1.0 / tf['rate']['nu_peak'][p]:13.4g}"
+                    if tf['rate'] is not None and swing[p] >= 0.1
+                    else f"{'-':>13s}")
+            mark = "   <- strongest" if p == strongest else ""
+            print(f"     {p:5d} {f1:9.4g}   {second}   {swing[p]:14.3f}   "
+                  f"{beat}{mark}")
 
 
 def simulation_reward(exprs, max_traj=None, horizon=None):
@@ -1597,7 +1662,7 @@ def simulation_reward(exprs, max_traj=None, horizon=None):
             return 0.0
         tf = (_tf_setup(max_traj, horizon, d, data)
               if SIM_WEIGHTS[3] > 0.0 else None)
-        res = _ro.rollout_residuals(accel, t, states, d, window=SIM_WINDOW,
+        res = _ro.rollout_residuals(accel, t, states, d, window=_window(data),
                                     stride=stride, substeps=substeps,
                                     weights=SIM_WEIGHTS, accs=accs, tf=tf)
         if not np.all(np.isfinite(res)):
@@ -1640,7 +1705,7 @@ def coupled_simulation_rewards(exprs, score, max_traj=None, horizon=None):
         return out
     tfs = ({d: _tf_setup(max_traj, horizon, d, data) for d in accels}
            if SIM_WEIGHTS[3] > 0.0 else None)
-    res = _ro.rollout_set_residuals(accels, t, states, window=SIM_WINDOW,
+    res = _ro.rollout_set_residuals(accels, t, states, window=_window(data),
                                     stride=stride, substeps=substeps,
                                     weights=SIM_WEIGHTS, accs=accs, tfs=tfs,
                                     score=scored)
@@ -2514,8 +2579,10 @@ def coupled_worker(args):
     differs.  In a coupled mode each member is scored on its own channel, and
     a set that blows up charges every equation in it
     (:func:`coupled_simulation_rewards`).  Returns a list aligned with
-    ``members`` of ``(dof, reward, tau, consts, {mode: reward})`` -- the
-    reward the weighted mean over modes -- or None.
+    ``members`` of ``(dof, reward, tau, consts, {mode: reward},
+    {mode: {dof: (tau, consts)}})`` -- the reward the weighted mean over
+    modes, the last the partner equations each mode simulated it with (empty
+    for a DOF read off the record) -- or None.
 
     This gives up the isolation :func:`energy_worker` argues for on purpose:
     a member's score now depends on the equations it is simulated with.  An
@@ -2564,8 +2631,117 @@ def coupled_worker(args):
     out = []
     for (d, tau, consts), md in zip(fitted, modes):
         r = sum(w * md[m] for m, w in weights.items()) / total
-        out.append(None if r <= 1e-6 else (d, r, tau, consts, md))
+        used = {}
+        for m in weights:
+            if m == 'top':
+                used[m] = {j: e for j, e in (tops or {}).items() if j != d}
+            elif m == 'peer':
+                used[m] = {j: (t2, c2) for j, t2, c2 in fitted if j != d}
+            else:
+                used[m] = {}
+        out.append(None if r <= 1e-6 else (d, r, tau, consts, md, used))
     return out
+
+
+def score_member(d, tau, consts, weights, tops=None, peers=None, horizon=None):
+    """DOF ``d``'s equation scored the ways ``weights`` names, its partners
+    held fixed: ``'alone'`` against the record, ``'top'`` with ``tops``,
+    ``'peer'`` with ``peers`` (each ``{dof: (tau, consts)}``; a DOF's own
+    entry is ignored, and a mode with no partner falls back to ``'alone'``).
+    The same rewards :func:`coupled_worker` gives, one member at a time.
+    Returns ``(reward, {mode: reward})``."""
+    weights = {m: float(w) for m, w in weights.items() if w > 0.0}
+    md, alone = {}, []
+
+    def r_alone():
+        if not alone:
+            exprs = [None] * N_DOF
+            exprs[d] = (tau, consts)
+            alone.append(simulation_reward(exprs, horizon=horizon))
+        return alone[0]
+
+    for m in weights:
+        if m == 'alone':
+            md[m] = r_alone()
+            continue
+        exprs = [None] * N_DOF
+        for j, e in ((tops if m == 'top' else peers) or {}).items():
+            if j != d:
+                exprs[j] = e
+        if any(e is not None for e in exprs):
+            exprs[d] = (tau, consts)
+            md[m] = coupled_simulation_rewards(exprs, [d], horizon=horizon)[d]
+        else:
+            md[m] = r_alone()
+    total = sum(weights.values())
+    return sum(w * md[m] for m, w in weights.items()) / total, md
+
+
+REFINE_SPAN = 0.5      # simulation tuning moves each amplitude by at most +-50%
+
+
+def _amplitude_slots(tau):
+    """Per constant slot of ``tau`` (pre-order): True if it scales a term -- a
+    coefficient, a ``const``, an amplitude -- False if it shapes one (an
+    ``intpower`` or ``power`` exponent, a ``blend`` rate), which simulation
+    tuning leaves alone so the structure it was found with stays put."""
+    mask = []
+    for t in tau:
+        if t == INTPOWER_OP:
+            mask += [True, False]
+        elif t in POWER_OPS:
+            mask += [True, True, False]
+        elif t in TRANSCENDENTAL_OPS:
+            mask += [True, True, False, False]
+        else:
+            mask += [True] * CONST_SLOTS.get(t, 0)
+    return np.array(mask, dtype=bool)
+
+
+def refine_worker(args):
+    """Tune an equation's amplitudes on the simulation itself
+    (``reward='simulation'``).
+
+    args = (dof, tau, consts, weights, tops, peers, horizon, max_evals)
+
+    The constants come from the closed-form fit to the equation error, which
+    is cheap but blind to what a free run magnifies: a beat period is a
+    DIFFERENCE of two close frequencies, so a 1% coupling error can move it by
+    tens of percent.  Starting from the fitted constants, Powell's method
+    moves the amplitude slots (:func:`_amplitude_slots`; exponents and rates
+    stay) by up to ``REFINE_SPAN`` of their value to maximise the equation's
+    own reward -- scored exactly as it was (:func:`score_member`, same modes,
+    partners held fixed) -- within ``max_evals`` simulations.  Returns
+    ``(dof, reward, tau, consts, {mode: reward}, n_evals)``: the best
+    constants seen, which are the given ones unless something scored higher.
+    """
+    from scipy.optimize import minimize
+
+    d, tau, consts, weights, tops, peers, horizon, max_evals = args
+    c0 = np.asarray(consts, dtype=float)
+    r0, md0 = score_member(d, tau, list(c0), weights, tops, peers, horizon)
+    free = np.flatnonzero(_amplitude_slots(tau))
+    if (free.size == 0 or len(c0) != len(_amplitude_slots(tau))
+            or max_evals <= 0 or r0 <= 1e-6):
+        return (d, r0, tau, list(c0), md0, 0)
+    base = c0[free]
+    scale = np.where(np.abs(base) > 1e-12, base, 1.0)
+    best = {'r': r0, 'c': c0, 'md': md0, 'n': 0}
+
+    def residual(x):
+        c = c0.copy()
+        c[free] = base + scale * x
+        r, md = score_member(d, tau, list(c), weights, tops, peers, horizon)
+        best['n'] += 1
+        if r > best['r']:
+            best.update(r=r, c=c, md=md)
+        return 1.0 / max(r, 1e-12) - 1.0
+
+    minimize(residual, np.zeros(free.size), method='Powell',
+             bounds=[(-REFINE_SPAN, REFINE_SPAN)] * free.size,
+             options={'maxfev': int(max_evals), 'xtol': 1e-3, 'ftol': 1e-4})
+    return (d, best['r'], tau, [float(v) for v in best['c']], best['md'],
+            best['n'])
 
 
 _THREAD_VARS = ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS',
