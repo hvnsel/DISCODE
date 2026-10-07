@@ -346,11 +346,13 @@ def DISCOVER_TRAIN(
     sim_window       = None,   # simulation: None = one free run per trial,
                                # a number = restart from the record every
                                # sim_window seconds, 'auto' = every 3 periods
-                               # of the fastest motion; windows apply to the
-                               # pointwise terms, time-frequency runs free
+                               # of the simulated DOF's own fastest motion;
+                               # windows apply to the pointwise terms,
+                               # time-frequency and frequency content run free
     sim_weights      = (1.0, 0.0, 0.0, 0.0),  # simulation: weights of
                                # (displacement, velocity, acceleration,
-                               # time-frequency), non-negative, summing to 1
+                               # time-frequency[, frequency content]),
+                               # non-negative, summing to 1
     sim_coupling     = (0.0, 0.0),  # simulation, 2+ DOFs: the fractions of
                                # each DOF's equations simulated with the other
                                # DOFs' top equations, and with the other DOFs'
@@ -390,15 +392,18 @@ def DISCOVER_TRAIN(
     ``'simulation'`` integrates each candidate forward from the measured
     initial state -- one DOF at a time, the other DOFs' states read off the
     record -- and scores ``w_q*NRMSE(q) + w_v*NRMSE(qdot) + w_a*NRMSE(a)
-    + w_tf*R_tf`` against the record, ``sim_weights = (w_q, w_v, w_a, w_tf)``
-    summing to 1.  The acceleration is the equation's own along its simulated
-    trajectory; ``R_tf`` compares the local amplitude in each frequency band
-    over time, so it sees beats and is blind to phase drift (see
+    + w_tf*R_tf + w_f*R_f`` against the record, ``sim_weights = (w_q, w_v,
+    w_a[, w_tf[, w_f]])`` summing to 1.  The acceleration is the equation's own
+    along its simulated trajectory; ``R_tf`` compares the local amplitude in
+    each frequency band over time, so it sees beats and is blind to phase
+    drift; ``R_f`` compares where in frequency the kinetic energy sits, so it
+    grades a frequency error at any size and a mode that dies out (see
     :mod:`discover_rollout`).
     ``sim_window`` restarts the simulation from the record every that many
-    seconds (``'auto'``: every 3 periods of the fastest motion) for the
-    pointwise terms, which on one long free run saturate for any slightly-off
-    frequency; the time-frequency term always gets a free run of its own.
+    seconds (``'auto'``: every 3 periods of the simulated DOF's own fastest
+    motion) for the pointwise terms, which on one long free run saturate for
+    any slightly-off frequency; the time-frequency and frequency-content terms
+    always get a free run of their own.
     Constants are fitted the same way under both.
 
     ``trial_decay`` sets how each candidate's trials are combined into its

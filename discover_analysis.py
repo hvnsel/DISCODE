@@ -107,6 +107,36 @@ def predict_accel(cleans, var_names, disp, vel):
     return accs, bad
 
 
+def expr_accels(exprs, var_names):
+    """One ``accel(S) -> a`` per printed expression, in the form
+    :mod:`discover_rollout` integrates: ``S`` is a (2N, W) array of physical
+    states ``[q1, q1dot, q2, q2dot, ...]``."""
+    accels = []
+    for clean in clean_exprs(exprs, var_names):
+        code = compile(clean, '<expr>', 'eval')
+
+        def accel(S, code=code):
+            ns = dict(_NS_BASE)
+            for d, nm in enumerate(var_names):
+                ns[nm] = S[2 * d]
+                ns[nm + 'dot'] = S[2 * d + 1]
+            return eval(code, ns)                              # noqa: S307
+        accels.append(accel)
+    return accels
+
+
+def record_states(system, trials):
+    """``(states, accs)`` of ``system``'s ``trials`` in the rollout layout:
+    (P, 2N, m) measured ``[q1, q1dot, ...]`` and (P, N, m) accelerations."""
+    N = system.n_dof
+    states = np.stack([
+        np.vstack([row for d in range(N)
+                   for row in (system.disp[:, d, tr], system.vel[:, d, tr])])
+        for tr in trials])
+    accs = np.stack([system.acc[:, :, tr].T for tr in trials])
+    return states, accs
+
+
 # ── Forward simulation ──────────────────────────────────────────────────────
 def build_rhs(cleans, var_names):
     """ODE right-hand side for the full N-DOF discovered system.
@@ -474,41 +504,31 @@ def simulation_scores(system, exprs, trials=None, window=None,
     t = np.asarray(system.time, dtype=float)
     keep = list(range(system.n_trials)) if trials is None else list(trials)
     N = system.n_dof
-    cleans = clean_exprs(exprs, system.var_names)
-    states = np.stack([
-        np.vstack([row for d in range(N)
-                   for row in (system.disp[:, d, tr], system.vel[:, d, tr])])
-        for tr in keep])                                       # (P, 2N, m)
-    accs = np.stack([system.acc[:, :, tr].T for tr in keep])   # (P, N, m)
+    states, accs = record_states(system, keep)
     stride, substeps = ro.auto_steps(t, states, accs)
-    with_tf = ro.check_weights(weights)[3] > 0.0
-    if window == 'auto':
-        window = ro.auto_window(t, states, accs)
+    w = ro.check_weights(weights)
 
-    accels = []
-    for clean in cleans:
-        code = compile(clean, '<expr>', 'eval')
+    def win(dofs):
+        # 'auto' per DOF alone, at the fastest member's for a set together
+        return (ro.auto_window(t, states, accs, dofs=dofs) if window == 'auto'
+                else window)
 
-        def accel(S, code=code):
-            ns = dict(_NS_BASE)
-            for d, nm in enumerate(system.var_names):
-                ns[nm] = S[2 * d]
-                ns[nm + 'dot'] = S[2 * d + 1]
-            return eval(code, ns)                              # noqa: S307
-        accels.append(accel)
-
+    accels = expr_accels(exprs, system.var_names)
     tfs = ({d: ro.tf_setup(t, states[:, 2 * d, :], stride) for d in range(N)}
-           if with_tf else {})
+           if w[3] > 0.0 else {})
+    specs = ({d: ro.spec_setup(t, states[:, 2 * d + 1, :], stride)
+              for d in range(N)} if w[4] > 0.0 else {})
     if coupled:
         together = ro.rollout_set_residuals(
-            dict(enumerate(accels)), t, states, window=window, stride=stride,
-            substeps=substeps, weights=weights, accs=accs, tfs=tfs or None)
+            dict(enumerate(accels)), t, states, window=win(None),
+            stride=stride, substeps=substeps, weights=weights, accs=accs,
+            tfs=tfs or None, specs=specs or None)
         per_dof = [together[d] for d in range(N)]
     else:
-        per_dof = [ro.rollout_residuals(accels[d], t, states, d, window=window,
+        per_dof = [ro.rollout_residuals(accels[d], t, states, d, window=win(d),
                                         stride=stride, substeps=substeps,
                                         weights=weights, accs=accs,
-                                        tf=tfs.get(d))
+                                        tf=tfs.get(d), spec=specs.get(d))
                    for d in range(N)]
     res = np.array(per_dof).T                                  # (P, N)
     r_sim = 1.0 / (1.0 + ro.combine_trials(res.T, trial_decay))

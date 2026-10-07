@@ -813,21 +813,22 @@ def test_simulation_reward():
               'too', max(res_v.max(), res_a.max()) < 1e-4,
               f"velocity {res_v.max():.1e}  acceleration {res_a.max():.1e}")
 
-        # The weights: three, non-negative, summing to 1 -- and the residual
-        # is exactly their weighted sum of the per-channel NRMSEs.
+        # The weights: three to five, non-negative, summing to 1 -- and the
+        # residual is exactly their weighted sum of the per-channel NRMSEs.
         bad_ok = True
         for bad in ((0.5, 0.5, 0.5), (1.2, -0.2, 0.0), (1.0, 0.0),
-                    (0.5, 0.5, None), (0.2, 0.2, 0.2, 0.2, 0.2),
-                    (0.5, 0.5, 0.0, 0.5)):
+                    (0.5, 0.5, None), (0.2, 0.2, 0.2, 0.2, 0.3),
+                    (0.5, 0.5, 0.0, 0.5), (0.2,) * 6):
             try:
                 dc.set_reward('simulation', sim_weights=bad)
                 bad_ok = False
             except ValueError:
                 pass
-        good_ok = (ro.check_weights((0.5, 0.5, 0.0)) == (0.5, 0.5, 0.0, 0.0)
-                   and ro.check_weights((0.5, 0, 0, 0.5)) == (0.5, 0, 0, 0.5))
-        check('sim_weights must be three or four non-negatives summing to 1 '
-              '(three means no time-frequency term)', bad_ok and good_ok)
+        good_ok = (ro.check_weights((0.5, 0.5, 0.0)) == (0.5, 0.5, 0.0, 0.0, 0.0)
+                   and ro.check_weights((0.5, 0, 0, 0.5)) == (0.5, 0, 0, 0.5, 0)
+                   and ro.check_weights((0.2,) * 5) == (0.2,) * 5)
+        check('sim_weights must be three to five non-negatives summing to 1 '
+              '(the ones left out are 0)', bad_ok and good_ok)
         def det(S):                                    # 3% stiffer
             return spec.accel_fns[0](S) - 0.03 * S[0]
         tf_d = ro.tf_setup(t, states[:, 0, :], stride)
@@ -1435,6 +1436,164 @@ def test_beats_tools():
         dc._TF_DATA.clear()
 
 
+def test_frequency_content():
+    """The frequency-content term and per-DOF windows.
+
+    ``R_f`` grades where in frequency the energy sits: a frequency error at
+    any size, however far the phase has slipped, and energy lost from a mode.
+    And ``sim_window='auto'`` sizes each DOF's windows by its own motion, so a
+    slow DOF next to a fast one gets windows long enough for its frequency
+    error to show.
+    """
+    import contextlib
+    import io
+
+    import discover_rollout as ro
+    from discover_data import (SystemData, build_truth_system,
+                               generate_dataset)
+    from discover_mdof_sim import get_mdof_system
+
+    print("\nfrequency content and per-DOF windows")
+    t = np.linspace(0.0, 5.0, 2001)
+    T = float(t[-1] - t[0])
+
+    def tone(f, zeta=0.01):
+        w = 2 * np.pi * f
+        return np.exp(-zeta * w * t) * np.cos(w * t)
+
+    su = ro.spec_setup(t, tone(6.5)[None, :], 1)
+
+    def r_f(x, setup=su):
+        return float(ro.spec_residuals(setup, x[None, :])[0])
+    errs = (0.0, 0.01, 0.02, 0.05, 0.10, 0.20, 0.40)
+    got = [r_f(tone(6.5 * (1 + e))) for e in errs]
+    want = [float(np.log1p(T * 6.5 * e)) for e in errs]
+    check('a frequency error costs ln(1 + the cycles it slips over the '
+          'record), at any size',
+          got[0] < 1e-9 and all(a < b for a, b in zip(got, got[1:]))
+          and all(abs(a - b) <= 0.03 * b for a, b in zip(got[1:], want[1:])),
+          "1/5/40%: " + " ".join(f"{got[i]:.3f}~{want[i]:.3f}"
+                                 for i in (1, 3, 6)))
+
+    two = 0.4 * tone(6.5) + tone(20.3, 0.008)
+    su2 = ro.spec_setup(t, two[None, :], 1)
+    one_pc = r_f(0.4 * tone(6.5 * 1.01) + tone(20.3 * 1.01, 0.008), su2)
+    dying = r_f(0.4 * tone(6.5) + tone(20.3, 0.033), su2)
+    lost = r_f(0.4 * tone(6.5), su2)
+    still = r_f(np.zeros_like(t), su2)
+    check('energy a mode loses costs more than a 1% frequency error, a lost '
+          'mode more still, and no motion is finite',
+          one_pc < dying < lost and np.isfinite(still) and still > 1.0,
+          f"1%: {one_pc:.2f}  20 Hz dying 4x fast: {dying:.2f}  lost: "
+          f"{lost:.2f}  none: {still:.2f}")
+
+    # Two uncoupled oscillators, 4 Hz and 1 Hz: 'auto' windows per DOF.
+    m, P = t.size * 2 - 1, 2
+    tt = np.linspace(0.0, 10.0, m)
+    disp, vel, acc = (np.zeros((m, 2, P)) for _ in range(3))
+    for d, f in enumerate((4.0, 1.0)):
+        w, z = 2 * np.pi * f, 0.01
+        wd = w * np.sqrt(1 - z * z)
+        for p in range(P):
+            ph, amp = 0.7 * p, 1.0 + 0.5 * p
+            env = amp * np.exp(-z * w * tt)
+            disp[:, d, p] = env * np.cos(wd * tt + ph)
+            vel[:, d, p] = env * (-z * w * np.cos(wd * tt + ph)
+                                  - wd * np.sin(wd * tt + ph))
+            acc[:, d, p] = -w * w * disp[:, d, p] - 2 * z * w * vel[:, d, p]
+    states = np.stack([np.vstack([disp[:, 0, p], vel[:, 0, p],
+                                  disp[:, 1, p], vel[:, 1, p]])
+                       for p in range(P)])
+    accs = np.stack([acc[:, :, p].T for p in range(P)])
+    wins = [ro.auto_window(tt, states, accs, dofs=d) for d in (0, 1)]
+    both = ro.auto_window(tt, states, accs)
+    check("'auto' gives each DOF 3 of its own periods; a set together "
+          "restarts at its fastest member's",
+          abs(wins[0] - 0.75) < 0.01 and abs(wins[1] - 3.0) < 0.03
+          and abs(both - wins[0]) < 1e-12
+          and ro.auto_window(tt, states, accs, dofs=[0, 1]) == both,
+          f"DOF 0 {wins[0]:.3f} s, DOF 1 {wins[1]:.3f} s, together {both:.3f} s")
+
+    w1 = 2 * np.pi * 1.0
+
+    def slow_detuned(S):                                 # DOF 1, 2% too stiff
+        return -(1.02 * w1) ** 2 * S[2] - 2 * 0.01 * w1 * S[3]
+    stride, sub = ro.auto_steps(tt, states, accs)
+    on_fast = ro.rollout_residuals(slow_detuned, tt, states, 1, window=both,
+                                   stride=stride, substeps=sub,
+                                   weights=(1, 0, 0)).mean()
+    on_own = ro.rollout_residuals(slow_detuned, tt, states, 1, window=wins[1],
+                                  stride=stride, substeps=sub,
+                                  weights=(1, 0, 0)).mean()
+    check("...and on its own windows a slow DOF's frequency error shows",
+          on_own > 2.5 * on_fast,
+          f"2% stiffer, displacement NRMSE: {on_fast:.4f} on the fast DOF's "
+          f"windows, {on_own:.4f} on its own")
+
+    saved = (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+             dc.MAX_TRAJ, dc.W_ACC, dc.REWARD_MODE, dc.SIM_WINDOW,
+             dc.SIM_WEIGHTS, dc.TRIAL_DECAY)
+    try:
+        sysd = SystemData('two_rates', acc, vel, disp, tt, var_names=['x', 'y'])
+        dc.configure_grammar(2, sysd.var_names)
+        _X, _y, raw, ns = generate_dataset(sysd, device=None)
+        dc.set_problem_data(ns, raw, True, None, 0.5)
+        dc.set_reward('simulation', sim_window='auto',
+                      sim_weights=(0.2, 0.2, 0.2, 0.2, 0.2))
+        data = dc._sim_data(None, None)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            dc.print_record_summary()
+        log = buf.getvalue()
+        check("the engine resolves 'auto' per DOF and the report shows it, "
+              "with the fastest motion's samples per cycle and the frequency "
+              "range",
+              abs(dc._window(data, 0) - wins[0]) < 1e-9
+              and abs(dc._window(data, 1) - wins[1]) < 1e-9
+              and '(DOF 1)' in log and 'samples/cycle' in log
+              and 'frequency content compared over' in log,
+              log.strip().splitlines()[2] if log.count('\n') > 2 else log)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            system = build_truth_system(get_mdof_system('coupled_beats'),
+                                        n_traj=2, n_pts=3300)
+        dc.configure_grammar(2, system.var_names)
+        _X, _y, raw, ns = generate_dataset(system, device=None)
+        dc.set_problem_data(ns, raw, True, None, 0.5)
+        dc.set_reward('simulation', sim_window='auto',
+                      sim_weights=(0.2, 0.2, 0.2, 0.2, 0.2))
+        T0 = system.truth_taus[0]
+        c0 = dc.optimise_consts_energy(T0, 0)
+        ex = [None, None]
+        ex[0] = (T0, c0)
+        r_true = dc.simulation_reward(ex)
+        ex[0] = (T0, list(np.array(c0) * np.array([1.03, 1.0, 1.0])))
+        r_stiff = dc.simulation_reward(ex)
+        tq, st_b, ac_b, s_b, sub_b = dc._sim_data(None, None)
+        sp0 = dc._spec_setup(None, None, 0, dc._sim_data(None, None))
+        acc0 = dc._accel_fn(0, (T0, c0))
+        only_f = [ro.rollout_residuals(acc0, tq, st_b, 0, window=wn,
+                                       stride=s_b, substeps=sub_b,
+                                       weights=(0, 0, 0, 0, 1), spec=sp0)
+                  for wn in (None, 3.0)]
+        check('five weights train end to end: the truth scores near 1, 3% '
+              'stiffer lower, and the frequency term is the same with and '
+              'without windows',
+              r_true > 0.95 and r_stiff < r_true - 0.02
+              and np.allclose(only_f[0], only_f[1])
+              and only_f[0].max() < 0.05,
+              f"truth {r_true:.4f}, 3% stiffer {r_stiff:.4f}; R_f of the "
+              f"truth {only_f[0].max():.4f}")
+    finally:
+        dc.configure_grammar(N_DOF)
+        (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+         dc.MAX_TRAJ, dc.W_ACC) = saved[:5]
+        dc.set_reward(*saved[5:])
+        dc._SIM_DATA.clear()
+        dc._TF_DATA.clear()
+        dc._SPEC_DATA.clear()
+
+
 def test_scoring_pool():
     """The scoring pool (:func:`discover_core.make_pool`).
 
@@ -1514,6 +1673,7 @@ def main():
     test_coupled_scoring()
     test_trial_decay()
     test_beats_tools()
+    test_frequency_content()
     test_scoring_pool()
 
     print(f"\n{'=' * 60}")

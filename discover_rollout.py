@@ -9,14 +9,16 @@ integrator behind the simulation reward (``reward='simulation'``)::
                + w_v * NRMSE(qd_d_sim, qd_d)
                + w_a * NRMSE(a_d_sim, a_d)
                + w_tf * R_tf(q_d_sim, q_d)
+               + w_f * R_f(qd_d_sim, qd_d)
 
-per trial, with ``weights = (w_q, w_v, w_a, w_tf)`` non-negative and summing
-to 1 (a 3-tuple means ``w_tf = 0``).  NRMSE is the RMS error over the
-simulated samples divided by the measured channel's standard deviation over
-that trial.  ``a_d_sim`` is the equation's own acceleration along its
-simulated trajectory -- its right-hand side evaluated at the simulated state
--- not a finite difference of the simulated velocity.  ``R_tf`` is the
-time-frequency term, below.
+per trial, with ``weights = (w_q, w_v, w_a, w_tf, w_f)`` non-negative and
+summing to 1 (a 3-tuple means ``w_tf = w_f = 0``, a 4-tuple ``w_f = 0``).
+NRMSE is the RMS error over the simulated samples divided by the measured
+channel's standard deviation over that trial.  ``a_d_sim`` is the equation's
+own acceleration along its simulated trajectory -- its right-hand side
+evaluated at the simulated state -- not a finite difference of the simulated
+velocity.  ``R_tf`` is the time-frequency term and ``R_f`` the
+frequency-content term, both below.
 
 Time-frequency term
 -------------------
@@ -55,6 +57,38 @@ gets a free run: with a ``window`` the pointwise terms are taken on the
 restarted windows and the envelope on a separate free run, since a windowed
 signal jumps at every window boundary.
 
+Frequency-content term
+----------------------
+``R_f`` asks WHERE IN FREQUENCY the motion's energy sits, not when: it is the
+earth mover's (Wasserstein-1) distance between the simulated and the measured
+velocity power spectra of each trial, measured in CYCLES OVER THE RECORD --
+the distance in Hz times the record length -- and taken as
+``R_f = ln(1 + cycles)`` (:func:`spec_setup` / :func:`spec_residuals`).
+Moving a spectrum by ``df`` is ``T * df`` cycles, exactly the phase a frequency
+error of ``df`` piles up over the record, so:
+
+* a frequency error is graded at any size, however far the phase has slipped:
+  1% on a 6.5 Hz mode over a 5 s record is 0.32 cycles, ``R_f`` 0.28 -- the
+  slow drift a windowed NRMSE cannot see (each window is too short for the
+  phase to slip) and the envelope term sees only indirectly (amplitude is
+  phase-blind and its bands are ~f/6 wide; it catches a detuned DOF where a
+  measured partner drives it at the true frequency and the two beat).  The
+  cost keeps growing with the error instead of saturating as a free run's
+  NRMSE does;
+* energy in the wrong mode costs its share times the distance it has to move,
+  so a simulation that lets a mode die out pays for moving that mode's energy
+  to the ones it kept;
+* beats come out as two close peaks: having both, at the right places and in
+  the right proportion, is what makes the beat right.
+
+The logarithm keeps the term on the scale of the others: moving energy
+between distant modes costs tens of cycles, and taken linearly that would
+drown every other term, while below a cycle or so ``R_f`` is still about the
+cycles themselves.  Velocity rather than displacement, so the spectrum is the
+kinetic energy's and a higher mode that is small in displacement still
+counts.  Amplitude is normalised out -- the pointwise terms see it.  It shares
+the time-frequency term's free run.
+
 Torch-free, so the engine (:func:`discover_core.simulation_reward`, used in
 training) and the scoring script (:mod:`discover_score`) run this one
 implementation, and the number read after training is the number trained on.
@@ -86,7 +120,10 @@ the record length, and a small frequency error costs a bounded phase error per
 window instead of one that grows over the whole record -- on a free run the
 pointwise errors saturate near 1.4 for any slightly-off frequency and stop
 ranking anything.  :func:`auto_window` picks a few periods of the fastest
-motion.  The time-frequency term always gets a free run of its own.
+motion -- of the DOF being simulated, not of the whole record: a slow DOF next
+to a fast one would otherwise be cut into windows shorter than one of its own
+cycles, where no frequency error shows.  The time-frequency and
+frequency-content terms always get a free run of their own.
 
 Integration
 -----------
@@ -159,6 +196,23 @@ TF_RATE_REF = 0.3
 TF_RATE_FLOOR = 1e-2
 TF_RATE_SHARE = 0.1
 
+# Frequency-content term (see the module docstring).
+#   SPEC_LO_CYCLES   lowest frequency compared: this many cycles over the record
+#                    (below lie the mean and slow drift)
+#   SPEC_POWER_FRAC  highest frequency compared: SPEC_MARGIN times the one
+#   SPEC_MARGIN      below which this fraction of the measured velocity power
+#                    lies, pooled over trials -- the margin keeps a simulated
+#                    mode a little above the measured top one in view
+#   SPEC_NYQUIST     ... and never above this fraction of the grid's Nyquist
+#   SPEC_FLOOR       both spectra are floored at this fraction of the measured
+#                    one's mean power before normalising, so a motionless
+#                    simulation reads as energy spread evenly, not as nothing
+SPEC_LO_CYCLES = 2.0
+SPEC_POWER_FRAC = 0.995
+SPEC_MARGIN = 1.5
+SPEC_NYQUIST = 0.8
+SPEC_FLOOR = 1e-3
+
 
 def _scale(x):
     """Normalising scale of one measured channel: its std, or mean |x| if flat."""
@@ -169,21 +223,22 @@ def _scale(x):
 
 
 def check_weights(weights):
-    """``(w_q, w_v, w_a, w_tf)`` as floats -- the displacement, velocity,
-    acceleration and time-frequency weights -- or a ValueError unless they are
-    three or four non-negative numbers summing to 1.  Three means no
-    time-frequency term."""
+    """``(w_q, w_v, w_a, w_tf, w_f)`` as floats -- the displacement, velocity,
+    acceleration, time-frequency and frequency-content weights -- or a
+    ValueError unless they are three to five non-negative numbers summing to
+    1.  The weights left out are 0."""
     try:
         w = tuple(float(x) for x in weights)
     except (TypeError, ValueError):
         w = ()
-    if (len(w) not in (3, 4) or not all(np.isfinite(x) and x >= 0.0 for x in w)
+    if (len(w) not in (3, 4, 5)
+            or not all(np.isfinite(x) and x >= 0.0 for x in w)
             or abs(sum(w) - 1.0) > 1e-6):
-        raise ValueError("sim_weights must be three or four non-negative "
+        raise ValueError("sim_weights must be three to five non-negative "
                          "weights (displacement, velocity, acceleration"
-                         "[, time-frequency]) summing to 1, "
-                         f"got {weights!r}")
-    return w + (0.0,) * (4 - len(w))
+                         "[, time-frequency[, frequency content]]) summing to "
+                         f"1, got {weights!r}")
+    return w + (0.0,) * (5 - len(w))
 
 
 def combine_trials(res, decay=1.0):
@@ -220,22 +275,10 @@ def auto_steps(t, states, accs=None, per_cycle=SIM_STEPS_PER_CYCLE):
     ``accs`` is (P, N, m); without it ``rms(qd) / rms(q)`` is used.
     """
     t = np.asarray(t, dtype=float)
-    states = np.asarray(states, dtype=float)
     if len(t) < 3:
         return 1, 1
     dt = float(np.median(np.diff(t)))
-    omega = 0.0
-    for p in range(states.shape[0]):
-        for d in range(states.shape[1] // 2):
-            rq = float(np.sqrt(np.mean(states[p, 2 * d] ** 2)))
-            rv = float(np.sqrt(np.mean(states[p, 2 * d + 1] ** 2)))
-            if accs is not None:
-                ra = float(np.sqrt(np.mean(np.asarray(accs)[p, d] ** 2)))
-                w = ra / rv if rv > 0 else 0.0
-            else:
-                w = rv / rq if rq > 0 else 0.0
-            if np.isfinite(w):
-                omega = max(omega, w)
+    omega = fastest_omega(states, accs)
     if omega <= 0.0 or dt <= 0.0:
         return 1, 1
     per_sample_cycle = 2.0 * np.pi / (omega * dt)       # samples per cycle
@@ -244,25 +287,41 @@ def auto_steps(t, states, accs=None, per_cycle=SIM_STEPS_PER_CYCLE):
     return 1, int(min(MAX_SUBSTEPS, max(1, np.ceil(per_cycle / per_sample_cycle))))
 
 
-def auto_window(t, states, accs=None, periods=SIM_AUTO_PERIODS):
-    """The ``sim_window='auto'`` restart interval, in seconds: ``periods``
-    periods of the fastest measured motion, estimated as in :func:`auto_steps`.
-    Short enough that a small frequency error costs a bounded phase error per
-    window, long enough to show each window's frequency and damping.  None if
-    the record has no motion to time."""
+def fastest_omega(states, accs=None, dofs=None):
+    """The fastest measured motion of ``dofs`` (default: every DOF), in rad/s:
+    the largest over trials of ``rms(a) / rms(qd)`` -- exact for one harmonic,
+    weighted towards the higher mode otherwise -- or of ``rms(qd) / rms(q)``
+    without ``accs`` (P, N, m).  0 if nothing moves."""
     states = np.asarray(states, dtype=float)
+    accs = None if accs is None else np.asarray(accs, dtype=float)
+    which = (range(states.shape[1] // 2) if dofs is None
+             else [int(d) for d in np.atleast_1d(dofs)])
     omega = 0.0
     for p in range(states.shape[0]):
-        for d in range(states.shape[1] // 2):
+        for d in which:
             rq = float(np.sqrt(np.mean(states[p, 2 * d] ** 2)))
             rv = float(np.sqrt(np.mean(states[p, 2 * d + 1] ** 2)))
             if accs is not None:
-                ra = float(np.sqrt(np.mean(np.asarray(accs)[p, d] ** 2)))
+                ra = float(np.sqrt(np.mean(accs[p, d] ** 2)))
                 w = ra / rv if rv > 0 else 0.0
             else:
                 w = rv / rq if rq > 0 else 0.0
             if np.isfinite(w):
                 omega = max(omega, w)
+    return omega
+
+
+def auto_window(t, states, accs=None, periods=SIM_AUTO_PERIODS, dofs=None):
+    """The ``sim_window='auto'`` restart interval, in seconds: ``periods``
+    periods of the fastest measured motion of ``dofs`` (default: every DOF),
+    estimated as in :func:`auto_steps`.  Short enough that a small frequency
+    error costs a bounded phase error per window, long enough to show each
+    window's frequency and damping.  A DOF simulated alone takes its own
+    (``dofs=d``): on a record with a 20 Hz and a 6.5 Hz DOF, the slow one would
+    otherwise get windows of about one of its own cycles, too short for its
+    frequency error to show.  A set integrated together restarts as one, at
+    its fastest member's.  None if the record has no motion to time."""
+    omega = fastest_omega(states, accs, dofs)
     return periods * 2.0 * np.pi / omega if omega > 0.0 else None
 
 
@@ -716,32 +775,121 @@ def tf_residuals(setup, q_sim):
     return out
 
 
+def _velocity_power(v, N):
+    """Power spectrum of each row of ``v`` (P, M), mean removed, untapered,
+    zero-padded to ``N``: (P, N // 2 + 1)."""
+    v = np.where(np.isfinite(v), v, 0.0)
+    return np.abs(np.fft.rfft(v - v.mean(axis=1, keepdims=True), N, axis=1)) ** 2
+
+
+def spec_setup(t, v_meas, stride):
+    """The measured side of the frequency-content term for one DOF, computed
+    once.
+
+    ``v_meas`` is (P, m): the measured velocity of every trial on the full
+    time grid ``t``.  The analysis grid is every ``stride``-th sample, as for
+    :func:`tf_setup`.  Each trial's velocity is transformed with its mean
+    removed and NO taper -- a decaying record keeps its early, strongest
+    motion, which a taper would fade out -- zero-padded to a quarter of the
+    record's own frequency resolution, so a shift smaller than one bin still
+    moves the spectrum.  The compared range ``f_lo``-``f_hi`` comes from the
+    record (``SPEC_*``); over it, each trial's power is the distribution of its
+    kinetic energy over frequency, kept as a CDF for :func:`spec_residuals`.
+    A record too short to analyse, or without motion, yields no range.
+    """
+    t = np.asarray(t, dtype=float)
+    v = np.atleast_2d(np.asarray(v_meas, dtype=float))
+    P, m = v.shape
+    s = max(1, int(stride))
+    idx = np.arange((m - 1) // s + 1) * s
+    M = idx.size
+    setup = {'stride': s, 'idx': idx, 'M': M, 'band': None,
+             'f_lo': np.nan, 'f_hi': np.nan}
+    if M < 16:
+        return setup
+    tt = t[idx] - t[idx[0]]
+    T = float(tt[-1])
+    D = float(np.median(np.diff(tt)))
+    N = _next_pow2(4 * M)
+    f = np.fft.rfftfreq(N, D)
+    S = _velocity_power(v[:, idx], N)
+    f_lo = SPEC_LO_CYCLES / T
+    pooled = np.where(f >= f_lo, S.sum(axis=0), 0.0)
+    if pooled.sum() <= 0.0:
+        return setup
+    cum = np.cumsum(pooled)
+    f_pow = float(f[min(int(np.searchsorted(cum, SPEC_POWER_FRAC * cum[-1])),
+                        len(f) - 1)])
+    f_hi = min(SPEC_MARGIN * f_pow, SPEC_NYQUIST * 0.5 / D)
+    band = (f >= f_lo) & (f <= f_hi)
+    if band.sum() < 4:
+        return setup
+    Sm = S[:, band]
+    floor = SPEC_FLOOR * Sm.mean(axis=1)                 # per trial
+    weight = (floor > 0.0).astype(float)
+    Sf = Sm + floor[:, None]
+    cdf = np.cumsum(Sf, axis=1) / np.maximum(Sf.sum(axis=1, keepdims=True),
+                                             1e-300)
+    setup.update(band=band, N=N, T=T, df=float(f[1] - f[0]), f_lo=f_lo,
+                 f_hi=f_hi, cdf=cdf, floor=floor, weight=weight)
+    return setup
+
+
+def spec_residuals(setup, v_sim):
+    """The frequency-content term ``R_f`` for every trial: a (P,) array.
+
+    ``v_sim`` is the simulated velocity on the full time grid, as
+    :func:`rollout` returns it.  Per trial, the Wasserstein-1 (earth mover's)
+    distance between the simulated and the measured velocity power spectra
+    over the compared range, both normalised to unit energy, times the record
+    length: how far, in Hz, the simulated energy has to move to sit where the
+    measured energy does, expressed as the cycles of phase a frequency error
+    of that size piles up over the record.  A pure shift of the spectrum by
+    ``df`` is ``T * df`` cycles; energy in the wrong mode costs its share
+    times the distance between the modes.  Returned as ``ln(1 + cycles)``
+    (see the module docstring).  0 for a trial whose measured velocity has no
+    energy in range.
+    """
+    v = np.atleast_2d(np.asarray(v_sim, dtype=float))[:, setup['idx']]
+    out = np.zeros(v.shape[0])
+    if setup.get('band') is None:
+        return out
+    S = _velocity_power(v, setup['N'])[:, setup['band']] + setup['floor'][:, None]
+    tot = S.sum(axis=1, keepdims=True)
+    ok = (setup['weight'] > 0.0) & (tot[:, 0] > 0.0)
+    cdf = np.cumsum(S, axis=1) / np.where(tot > 0.0, tot, 1.0)
+    w1 = np.abs(cdf[:, :-1] - setup['cdf'][:, :-1]).sum(axis=1) * setup['df']
+    return np.where(ok, np.log1p(setup['T'] * w1), 0.0)
+
+
 def rollout_residuals(accel, t, states, dof, window=None, stride=1, substeps=1,
                       weights=(1.0, 0.0, 0.0, 0.0), accs=None, tf=None,
-                      blowup=SIM_BLOWUP):
+                      blowup=SIM_BLOWUP, spec=None):
     """Simulation residual of DOF ``dof`` for every trial: a (P,) array.
 
-    ``w_q * NRMSE(q) + w_v * NRMSE(qd) + w_a * NRMSE(a) + w_tf * R_tf`` with
-    ``weights = (w_q, w_v, w_a[, w_tf])`` (see :func:`check_weights`), each
-    NRMSE taken over the simulated samples and normalised by that trial's
-    measured std of the channel.  ``accs`` is the measured acceleration,
-    (P, N, m); it is needed only when ``w_a > 0``.  ``tf`` is this DOF's
-    :func:`tf_setup` at the same ``stride``; it is needed only when
-    ``w_tf > 0``.  With a ``window`` the NRMSEs are taken over the restarted
-    windows and ``R_tf`` over a free run of its own -- an envelope needs the
-    whole record in one piece.  The
+    ``w_q * NRMSE(q) + w_v * NRMSE(qd) + w_a * NRMSE(a) + w_tf * R_tf
+    + w_f * R_f`` with ``weights = (w_q, w_v, w_a[, w_tf[, w_f]])`` (see
+    :func:`check_weights`), each NRMSE taken over the simulated samples and
+    normalised by that trial's measured std of the channel.  ``accs`` is the
+    measured acceleration, (P, N, m); it is needed only when ``w_a > 0``.
+    ``tf`` is this DOF's :func:`tf_setup` and ``spec`` its :func:`spec_setup`,
+    both at the same ``stride``; each is needed only when its weight is
+    positive.  With a ``window`` the NRMSEs are taken over the restarted
+    windows and ``R_tf`` and ``R_f`` over a free run of their own -- an
+    envelope or a spectrum needs the whole record in one piece.  The
     simulated acceleration of a window that blew up is clipped at ``blowup``
     times the largest measured one, so it too scores large but finite.  See
     :func:`rollout` for the other arguments.
     """
     return rollout_set_residuals({dof: accel}, t, states, window, stride,
                                  substeps, weights, accs,
-                                 None if tf is None else {dof: tf}, blowup)[dof]
+                                 None if tf is None else {dof: tf}, blowup,
+                                 specs=None if spec is None else {dof: spec})[dof]
 
 
 def rollout_set_residuals(accels, t, states, window=None, stride=1, substeps=1,
                           weights=(1.0, 0.0, 0.0, 0.0), accs=None, tfs=None,
-                          blowup=SIM_BLOWUP, score=None):
+                          blowup=SIM_BLOWUP, score=None, specs=None):
     """Simulation residuals of DOFs integrated together (:func:`rollout_set`):
     ``{dof: (P,) array}`` for every DOF in ``score`` (default: all of
     ``accels``).
@@ -751,11 +899,12 @@ def rollout_set_residuals(accels, t, states, window=None, stride=1, substeps=1,
     coupled run blew up.  There every DOF of the set is charged the largest
     residual among them: once the set diverges no equation in it can be said
     to work, and one whose own channel happened to be in bounds when the
-    window froze would otherwise score as if it had been fine.  ``tfs`` maps
-    every integrated DOF to its :func:`tf_setup`; it is needed only when
-    ``w_tf > 0``.  The other arguments are as in :func:`rollout_residuals`.
+    window froze would otherwise score as if it had been fine.  ``tfs`` and
+    ``specs`` map every integrated DOF to its :func:`tf_setup` and
+    :func:`spec_setup`; each is needed only when its weight is positive.  The
+    other arguments are as in :func:`rollout_residuals`.
     """
-    w_q, w_v, w_a, w_tf = check_weights(weights)
+    w_q, w_v, w_a, w_tf, w_f = check_weights(weights)
     dofs = sorted(int(d) for d in accels)
     score = dofs if score is None else sorted(int(d) for d in score)
     if not set(score) <= set(dofs):
@@ -763,19 +912,21 @@ def rollout_set_residuals(accels, t, states, window=None, stride=1, substeps=1,
     if w_a > 0.0 and accs is None:
         raise ValueError("an acceleration weight needs the measured "
                          "acceleration (accs)")
-    if w_tf > 0.0:
-        if any(tf is None or tf['stride'] != max(1, int(stride))
-               for tf in ((tfs or {}).get(d) for d in dofs)):
-            raise ValueError("the time-frequency weight needs every "
-                             "integrated DOF's tf_setup at the same stride")
+    for w, sets, name, fn in ((w_tf, tfs, 'time-frequency', 'tf_setup'),
+                              (w_f, specs, 'frequency-content', 'spec_setup')):
+        if w > 0.0 and any(su is None or su['stride'] != max(1, int(stride))
+                           for su in ((sets or {}).get(d) for d in dofs)):
+            raise ValueError(f"the {name} weight needs every integrated DOF's "
+                             f"{fn} at the same stride")
     states = np.asarray(states, dtype=float)
     _dofs, q_sim, v_sim, a_sim, sim, blown = rollout_set(
         accels, t, states, window, stride, substeps, blowup,
         with_acc=w_a > 0.0)
-    q_free = q_sim
-    if w_tf > 0.0 and window is not None:
-        # the envelope needs the whole record in one run: its own free run
-        _d, q_free, _v, _a, _s, blown_free = rollout_set(
+    q_free, v_free = q_sim, v_sim
+    if (w_tf > 0.0 or w_f > 0.0) and window is not None:
+        # an envelope or a spectrum needs the whole record in one run: their
+        # own free run
+        _d, q_free, v_free, _a, _s, blown_free = rollout_set(
             accels, t, states, None, stride, substeps, blowup, with_acc=False)
         blown = blown | blown_free
 
@@ -792,6 +943,7 @@ def rollout_set_residuals(accels, t, states, window=None, stride=1, substeps=1,
             a_d = np.clip(np.where(np.isfinite(a_sim[:, k]), a_sim[:, k], a_lim),
                           -a_lim, a_lim)
         r_tf = tf_residuals(tfs[d], q_free[:, k]) if w_tf > 0.0 else None
+        r_f = spec_residuals(specs[d], v_free[:, k]) if w_f > 0.0 else None
         out = np.full(states.shape[0], np.nan)
         for p in range(states.shape[0]):
             mk = sim[p]
@@ -806,6 +958,8 @@ def rollout_set_residuals(accels, t, states, window=None, stride=1, substeps=1,
                 res += w_a * nrmse(a_d[p], a_meas[p], mk)
             if w_tf > 0.0:
                 res += w_tf * r_tf[p]
+            if w_f > 0.0:
+                res += w_f * r_f[p]
             out[p] = res
         return out
 

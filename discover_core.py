@@ -345,11 +345,12 @@ W_ACC = 0.0
 # longer enters the score.
 #   SIM_WINDOW   None = one free run per trial from its first sample; a
 #                number = restart from the measured state every SIM_WINDOW s;
-#                'auto' = every 3 periods of the fastest motion.  Windows
-#                apply to the pointwise terms; the time-frequency term always
-#                gets a free run of its own
-#   SIM_WEIGHTS  (displacement, velocity, acceleration, time-frequency)
-#                weights, non-negative and summing to 1
+#                'auto' = every 3 periods of the simulated DOF's own fastest
+#                motion (a set integrated together: its fastest member's).
+#                Windows apply to the pointwise terms; the time-frequency and
+#                frequency-content terms always get a free run of their own
+#   SIM_WEIGHTS  (displacement, velocity, acceleration, time-frequency,
+#                frequency content) weights, non-negative and summing to 1
 #   TRIAL_DECAY  how a candidate's trials are combined, under both schemes:
 #                ranked from worst fit to best, the k-th worst weighted
 #                TRIAL_DECAY**(k-1); 1 = plain mean, 0 = worst trial only
@@ -357,10 +358,11 @@ W_ACC = 0.0
 REWARD_MODES = ('energy', 'simulation')
 REWARD_MODE  = 'energy'
 SIM_WINDOW   = None
-SIM_WEIGHTS  = (1.0, 0.0, 0.0, 0.0)
+SIM_WEIGHTS  = (1.0, 0.0, 0.0, 0.0, 0.0)
 TRIAL_DECAY  = 1.0
 _SIM_DATA    = {}          # (max_traj, horizon) -> stacked record, per process
 _TF_DATA     = {}          # (max_traj, horizon, dof) -> tf_setup, per process
+_SPEC_DATA   = {}          # (max_traj, horizon, dof) -> spec_setup, per process
 
 
 # ── Grammar configuration ───────────────────────────────────────────────────
@@ -454,6 +456,7 @@ def set_problem_data(norm_stats, raw_trajectories, energy_normalize=True,
         W_ACC = float(np.clip(w_acc, 0.0, 1.0))
     _SIM_DATA.clear()
     _TF_DATA.clear()
+    _SPEC_DATA.clear()
 
 
 def set_reward(mode='energy', sim_window=None,
@@ -463,11 +466,12 @@ def set_reward(mode='energy', sim_window=None,
     ``'energy'`` is the work-energy / acceleration blend of
     :func:`energy_reward`; ``'simulation'`` is the forward-simulation NRMSE of
     :func:`simulation_reward`.  ``sim_window`` and ``sim_weights`` -- the
-    (displacement, velocity, acceleration[, time-frequency]) weights, which
-    must be non-negative and sum to 1 -- only matter for the latter.
-    ``sim_window`` is None (free runs), a restart interval in seconds, or
-    ``'auto'`` (:func:`discover_rollout.auto_window`); it applies to the
-    pointwise terms, the time-frequency term always running free.
+    (displacement, velocity, acceleration[, time-frequency[, frequency
+    content]]) weights, which must be non-negative and sum to 1 -- only matter
+    for the latter.  ``sim_window`` is None (free runs), a restart interval in
+    seconds, or ``'auto'`` (:func:`discover_rollout.auto_window`, per DOF); it
+    applies to the pointwise terms, the time-frequency and frequency-content
+    terms always running free.
     ``trial_decay`` in [0, 1] sets how the trials are combined under either
     scheme (see ``TRIAL_DECAY``); it never touches the constant fit.
     """
@@ -507,18 +511,21 @@ def describe_reward():
     are fitted to."""
     if REWARD_MODE == 'simulation':
         names = ('displacement NRMSE', 'velocity NRMSE', 'acceleration NRMSE',
-                 'time-frequency term')
+                 'time-frequency term', 'frequency-content term')
         parts = [(w, nm) for w, nm in zip(SIM_WEIGHTS, names) if w > 0]
         what = (parts[0][1] if len(parts) == 1 else
                 ' + '.join(f'{w:.2f} {nm}' for w, nm in parts))
         if SIM_WINDOW is None:
             how = 'one free run per trial'
         else:
-            every = ('3 periods of the fastest motion' if SIM_WINDOW == 'auto'
-                     else f'{SIM_WINDOW:g} s')
+            every = ("3 periods of each DOF's own fastest motion"
+                     if SIM_WINDOW == 'auto' else f'{SIM_WINDOW:g} s')
             how = f'restarted from the record every {every}'
-            if SIM_WEIGHTS[3] > 0.0:
-                how += '; time-frequency on a free run'
+            free = [nm for w, nm in zip(SIM_WEIGHTS[3:],
+                                        ('time-frequency', 'frequency content'))
+                    if w > 0.0]
+            if free:
+                how += f"; {' and '.join(free)} on a free run"
         text = (f"forward simulation, {what} ({how}); constants fitted "
                 f"to {1 - W_ACC:.2f} work-energy + {W_ACC:.2f} accel-NRMSE")
     else:
@@ -1549,11 +1556,13 @@ def _sim_data(max_traj, horizon):
     return _SIM_DATA[key]
 
 
-def _window(data):
-    """``SIM_WINDOW`` in seconds for this record (``'auto'`` resolved)."""
+def _window(data, dofs=None):
+    """``SIM_WINDOW`` in seconds for this record, ``'auto'`` resolved for the
+    DOFs ``dofs`` being simulated (default: all) -- one DOF alone gets its own
+    3 periods, a set integrated together restarts at its fastest member's."""
     if SIM_WINDOW == 'auto':
         t, states, accs, _stride, _substeps = data
-        return _ro.auto_window(t, states, accs)
+        return _ro.auto_window(t, states, accs, dofs=dofs)
     return SIM_WINDOW
 
 
@@ -1566,6 +1575,16 @@ def _tf_setup(max_traj, horizon, dof, data):
         t, states, _accs, stride, _substeps = data
         _TF_DATA[key] = _ro.tf_setup(t, states[:, 2 * dof, :], stride)
     return _TF_DATA[key]
+
+
+def _spec_setup(max_traj, horizon, dof, data):
+    """The measured side of DOF ``dof``'s frequency-content term
+    (:func:`discover_rollout.spec_setup`), cached like :func:`_tf_setup`."""
+    key = (_resolve_max_traj(max_traj), horizon, dof)
+    if key not in _SPEC_DATA:
+        t, states, _accs, stride, _substeps = data
+        _SPEC_DATA[key] = _ro.spec_setup(t, states[:, 2 * dof + 1, :], stride)
+    return _SPEC_DATA[key]
 
 
 def _accel_fn(d, expr):
@@ -1591,20 +1610,50 @@ def print_record_summary(max_traj=None, horizon=None):
     log-amplitude, nepers: ~0 for a steady or decaying oscillation, ~0.3 and
     up for clear beats), and the beat period read off the envelope's own
     spectrum.  A trial whose swing stands out is the one carrying the beats;
-    one whose peaks fall outside the bands is invisible to the term."""
+    one whose peaks fall outside the bands is invisible to the term.  Also
+    printed: how many samples per cycle each DOF's fastest motion gets (under
+    ~10 the record is too coarse to compare that motion point by point, or
+    to fit its constants well), the windows ``sim_window='auto'`` picked, and
+    the range the frequency-content term compares when it is weighted."""
     data = _sim_data(max_traj, horizon)
     if data is None:
         return
-    t, states, _accs, stride, _sub = data
+    t, states, accs, stride, _sub = data
     T = float(t[-1] - t[0])
-    D = float(np.median(np.diff(t))) * stride
+    dt = float(np.median(np.diff(t)))
+    D = dt * stride
     print(f"[record] per trial, what the simulation reward compares "
           f"({T:.4g} s per trial, {1.0 / D:.4g} Hz simulation grid):")
-    if SIM_WINDOW == 'auto':
-        win = _window(data)
-        print("  sim_window='auto': pointwise terms restart every "
-              + (f"{win:.4g} s" if win else "-- no motion to time, free runs"))
+    fast = []
     for d in range(N_DOF):
+        w = _ro.fastest_omega(states, accs, d)
+        if w > 0.0:
+            fast.append((d, w / (2.0 * np.pi), 2.0 * np.pi / (w * dt)))
+    if fast:
+        print("  fastest motion: " + ", ".join(
+            f"DOF {d} ~{f:.3g} Hz ({n:.3g} samples/cycle)" for d, f, n in fast)
+              + ("" if min(n for _d, _f, n in fast) >= 10 else
+                 "  -- under ~10 samples a cycle is coarse for the pointwise "
+                 "terms and the constant fit: raise desired_timesteps"))
+    if SIM_WINDOW == 'auto':
+        wins = [_window(data, d) for d in range(N_DOF)]
+        if any(w for w in wins):
+            parts = [f"{w:.3g} s (DOF {d})" if w else f"free (DOF {d})"
+                     for d, w in enumerate(wins)]
+            together = _window(data) if N_DOF > 1 else None
+            print("  sim_window='auto': pointwise terms restart every "
+                  + ", ".join(parts)
+                  + (f"; DOFs simulated together every {together:.3g} s"
+                     if together else ""))
+        else:
+            print("  sim_window='auto': no motion to time -- free runs")
+    for d in range(N_DOF):
+        if SIM_WEIGHTS[4] > 0.0:
+            sp = _spec_setup(max_traj, horizon, d, data)
+            print(f"  DOF {d}: frequency content compared over "
+                  + (f"{sp['f_lo']:.3g}-{sp['f_hi']:.3g} Hz"
+                     if sp['band'] is not None else
+                     "nothing (record too short or motionless)"))
         tf = _tf_setup(max_traj, horizon, d, data)
         if tf['G'] is None:
             print(f"  DOF {d}: no oscillation found -- the time-frequency term "
@@ -1636,10 +1685,11 @@ def simulation_reward(exprs, max_traj=None, horizon=None):
 
     Same argument convention as :func:`energy_reward`.  Each present DOF's
     equation is integrated from the measured initial state of every trial --
-    or of every ``SIM_WINDOW``-second window -- with the OTHER DOFs' states
-    read off the record, and its residual is the ``SIM_WEIGHTS``-weighted sum
-    of the NRMSEs of its simulated displacement, velocity and acceleration
-    against the measured ones and of the time-frequency term; see
+    or of every ``SIM_WINDOW``-second window, ``'auto'`` resolved for that DOF
+    -- with the OTHER DOFs' states read off the record, and its residual is
+    the ``SIM_WEIGHTS``-weighted sum of the NRMSEs of its simulated
+    displacement, velocity and acceleration against the measured ones and of
+    the time-frequency and frequency-content terms; see
     :mod:`discover_rollout`.  Aggregated like the energy reward: mean
     over DOFs per trial, then ``r = 1 / (1 + mean over trials)``.  0 if
     nothing is evaluable.
@@ -1666,9 +1716,12 @@ def simulation_reward(exprs, max_traj=None, horizon=None):
             return 0.0
         tf = (_tf_setup(max_traj, horizon, d, data)
               if SIM_WEIGHTS[3] > 0.0 else None)
-        res = _ro.rollout_residuals(accel, t, states, d, window=_window(data),
-                                    stride=stride, substeps=substeps,
-                                    weights=SIM_WEIGHTS, accs=accs, tf=tf)
+        spec = (_spec_setup(max_traj, horizon, d, data)
+                if SIM_WEIGHTS[4] > 0.0 else None)
+        res = _ro.rollout_residuals(accel, t, states, d,
+                                    window=_window(data, d), stride=stride,
+                                    substeps=substeps, weights=SIM_WEIGHTS,
+                                    accs=accs, tf=tf, spec=spec)
         if not np.all(np.isfinite(res)):
             return 0.0
         per_dof.append(res)
@@ -1709,10 +1762,13 @@ def coupled_simulation_rewards(exprs, score, max_traj=None, horizon=None):
         return out
     tfs = ({d: _tf_setup(max_traj, horizon, d, data) for d in accels}
            if SIM_WEIGHTS[3] > 0.0 else None)
-    res = _ro.rollout_set_residuals(accels, t, states, window=_window(data),
+    specs = ({d: _spec_setup(max_traj, horizon, d, data) for d in accels}
+             if SIM_WEIGHTS[4] > 0.0 else None)
+    res = _ro.rollout_set_residuals(accels, t, states,
+                                    window=_window(data, sorted(accels)),
                                     stride=stride, substeps=substeps,
                                     weights=SIM_WEIGHTS, accs=accs, tfs=tfs,
-                                    score=scored)
+                                    score=scored, specs=specs)
     for d in scored:
         if np.all(np.isfinite(res[d])):
             out[d] = 1.0 / (1.0 + _ro.combine_trials(res[d], TRIAL_DECAY))
