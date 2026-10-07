@@ -166,14 +166,16 @@ use `sim_coupling=(0.5, 0.0), sim_coupling_mode='blend'`. `'blend'` costs one
 alone and one with-top simulation per equation, plus one joint simulation per
 row.
 
-Four more knobs, used only by `'simulation'`:
+Six more knobs, used only by `'simulation'`:
 
 | knob | default | what it does |
 |---|---|---|
-| `sim_window` | `None` | `None` is one free run per trial, from its first sample to its last. A number restarts the simulation from the measured state every that many seconds (multiple shooting). A small frequency error then costs a bounded phase error per window instead of one that grows over the whole record, and it runs faster |
-| `sim_weights` | `(1.0, 0.0, 0.0, 0.0)` | the weights of (displacement, velocity, acceleration, time-frequency): `w_q*NRMSE(q) + w_v*NRMSE(qdot) + w_a*NRMSE(qddot) + w_tf*R_tf`. Non-negative and summing to 1, or the run refuses to start; a 3-tuple means `w_tf = 0`. The acceleration is the equation's own along its simulated trajectory, its right-hand side at the simulated state, compared with the measured acceleration. `R_tf` is below; it needs `sim_window=None` |
+| `sim_window` | `None` | `None` is one free run per trial, from its first sample to its last. A number restarts the simulation from the measured state every that many seconds (multiple shooting); `'auto'` every 3 periods of the fastest measured motion. Windows apply to the pointwise terms: a small frequency error then costs a bounded phase error per window instead of saturating the NRMSE near 1.4 over a long free run, where it stops ranking anything. The time-frequency term always gets a free run of its own |
+| `sim_weights` | `(1.0, 0.0, 0.0, 0.0)` | the weights of (displacement, velocity, acceleration, time-frequency): `w_q*NRMSE(q) + w_v*NRMSE(qdot) + w_a*NRMSE(qddot) + w_tf*R_tf`. Non-negative and summing to 1, or the run refuses to start; a 3-tuple means `w_tf = 0`. The acceleration is the equation's own along its simulated trajectory, its right-hand side at the simulated state, compared with the measured acceleration. `R_tf` is below |
 | `sim_coupling` | `(0.0, 0.0)` | the fractions of each DOF's equations simulated with the other DOFs' top equations and with the other DOFs' equations from the same sample (above). Non-negative, summing to at most 1; the rest are simulated alone. Needs two DOFs or more |
 | `sim_coupling_mode` | `'split'` | `'split'` scores each equation one of those ways; `'blend'` scores it all three ways and weights the rewards by the fractions (above) |
+| `sim_refine` | `0` | per DOF per epoch, the best this many equations get their amplitudes tuned on the simulation itself (below) |
+| `sim_refine_evals` | `60` | simulations per tuned equation |
 
 The integrator is RK4 on the record's own samples. The step is sized from the
 data: at least 50 steps per cycle of the fastest measured motion, so an
@@ -193,18 +195,26 @@ displacement, bands chosen from the record), plus a signed slow trend:
 - **Phase:** a band's amplitude ignores phase. A quarter-period shift of a
   decaying tone costs 0.006, where NRMSE reads 1.42.
 - **Beats:** two close frequencies in one band make its amplitude rise and fall.
-  On two tones 0.05 Hz apart, a single unmodulated tone costs 1.07. Beats off by
-  0.001, 0.003 and 0.005 Hz cost 0.17, 0.41 and 0.55, and wrong-period beats stay
-  between 0.55 and 0.7 out to 0.05 Hz off. The level and modulation depth of each band are also
-  compared regardless of timing, which is why the wrong-period beats stay below
-  the unmodulated tone.
+  The timing of that rise and fall is compared directly, and each band's level
+  and modulation depth regardless of timing.
+- **Beat rate:** timing alone grades a beat period only while the simulated beat
+  slips by less than about half a beat over the record; past that every wrong
+  rate scored the same, so the search had no direction toward the right
+  coupling. Each band's detrended log-amplitude therefore also has its power
+  spectrum compared — a beat is a peak at its rate — by the earth mover's
+  distance along log-frequency, which grows with the rate error at any size (a
+  beat twice too fast costs one octave). On two tones 0.05 Hz apart, beats off
+  by 1 / 3 / 5 mHz cost 0.20 / 0.49 / 0.68, beat rates 1.2× / 1.4× / 2× / 2.6×
+  cost 0.80 / 1.01 / 1.60 / 1.87, rates 0.8× / 0.6× / 0.4× cost 0.90 / 1.36 /
+  2.12, and no beat at all 2.42. A trial whose measured envelope barely moves
+  has no rate to compare and counts in proportion to its envelope swing.
 - **Moving centre:** a slower mode that the motion rides on sits in its own band
   and cannot fake a modulation.
 - **No oscillation:** creep, drift or a decaying offset finds no bands and lands
   in the trend, so the term reduces to a smoothed NRMSE.
 - **Graded on `coupled_beats`:** with mass 1 simulated against the measured mass
-  2, a 0.25 / 1 / 2 / 5 % stiffness error costs 0.06 / 0.24 / 0.50 / 1.17, and
-  dropping the coupling (no beats) costs 1.12.
+  2, a 0.25 / 1 / 2 / 5 % stiffness error costs 0.07 / 0.27 / 0.57 / 1.24, and
+  dropping the coupling (no beats) costs 2.05.
 
 Amplitudes discard the phase between DOFs, so keep some displacement weight, e.g.
 `sim_weights=(0.5, 0, 0, 0.5)`. It costs ~3 ms per candidate on a 1300-sample
@@ -214,6 +224,50 @@ Measured per candidate on the simulated registry (4 trials, 1500–2500 samples)
 a free run costs 25–150 ms and a 2 s window 3–15 ms, against ~2 ms for the energy
 reward. Both rewards share the constant fit, which usually costs more: on an
 untrained policy's free-grammar candidates its median was 0.3 s.
+
+**Tuning the constants on the simulation (`sim_refine`).** Constants come from
+the closed-form fit to the equation error: cheap, but blind to what a free run
+magnifies, and biased whenever the channels were processed differently — with
+`w_acc` near 1 the fit leans on the acceleration channel, so a filter on that
+channel moves every constant. A beat period is a difference of two close
+frequencies, so a coupling constant a few percent off puts the beats in the
+wrong place, and the true structure then scores no better than wrong ones. Each
+epoch, `sim_refine` takes each DOF's best few equations and moves their
+amplitudes (coefficients, never exponents) by up to ±50% with Powell's method to
+maximise their own reward, scored exactly as before, within `sim_refine_evals`
+simulations. A tuned equation replaces its untuned twin in the buffer, and a
+structure that keeps winning resumes from its tuned constants, so tuning
+accumulates over epochs.
+
+Measured on a proxy of a beats-in-one-trial record — `coupled_beats` with five
+trials, four started near a single mode and the fifth with one mass displaced,
+the acceleration channel low-passed — DOF 0's candidates, fitted then tuned (80
+simulations each):
+
+| acceleration filter | true structure | + spurious cubic | no coupling | wrong coupling (ẏ) |
+|---|---|---|---|---|
+| strong (2nd order, 0.6 Hz): fitted | 0.286 | 0.286 | 0.269 | 0.268 |
+| strong: tuned | **0.628** | 0.621 | 0.395 | 0.410 |
+| mild (1st order, 2 Hz): fitted | 0.776 | 0.755 | 0.371 | 0.382 |
+| mild: tuned | **0.968** | 0.915 | 0.527 | 0.532 |
+
+Fitted, the strongly filtered record cannot tell the true structure from wrong
+ones; tuned, the coupled structures pull clear, and on the mild filter the true
+equation comes back as `-4.401*x - 0.02999*xdot + 0.4011*y` (truth `-4.4*x -
+0.03*xdot + 0.4*y`). A tuning simulation costs what a scoring one does — about
+0.3 s on five 660-sample trials with `sim_window='auto'` — so `sim_refine=2,
+sim_refine_evals=40` adds 160 per epoch, spread over the pool.
+
+**What gets printed.** With `reward='simulation'` a run starts with a report per
+DOF and trial: the two strongest spectral peaks, the envelope swing the
+time-frequency term sees (the largest std of a band's detrended log-amplitude;
+~0 for a steady or decaying oscillation, 0.3 and up for clear beats) and the
+beat period read off the envelope's own spectrum. The trial whose swing stands
+out is the one carrying the beats; a peak outside the bands is invisible to the
+term. Every best equation printed each epoch, and in the final summary, comes
+with the equations it was simulated with to earn its score — per mode, each
+other DOF's equation in physical units, or "the measured record" — even when
+that is the other DOF's own best.
 
 To score pasted equations with it afterwards, set `REWARD = 'simulation'` (and
 the same `SIM_WINDOW` / `SIM_WEIGHTS`) in `discover_score.py`; `SIM_COUPLED = True`

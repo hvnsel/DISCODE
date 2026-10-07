@@ -83,8 +83,8 @@ def DISCOVER_MDOF_EXP(
     max_traj         = 10,
     w_acc            = 0.9,
     reward           = 'simulation',   # 'energy' | 'simulation'
-    sim_window       = None,       # simulation: None = one free run per trial,
-                                   #   else restart from the record every N s
+    sim_window       = 'auto',     # simulation: None = one free run per trial,
+                                   #   'auto' or N s = pointwise terms on windows
     sim_weights      = (0.2, 0.2, 0.2, 0.4),  # simulation: (disp, vel, acc,
                                    #   time-frequency) weights, summing to 1
     sim_coupling     = (0.0, 0.0),  # simulation: fractions of each DOF's
@@ -111,6 +111,10 @@ def DISCOVER_MDOF_EXP(
     seed_policy           = None,
     center_features  = False,
     system_data      = None,     # pass a preloaded SystemData to skip loading
+    sim_refine       = 2,        # simulation: per DOF per epoch, the best this
+                                 #   many equations get their amplitudes tuned
+                                 #   on the simulation (0 = off)
+    sim_refine_evals = 40,       # simulations per tuned equation
 ):
     """Identify every DOF of an experimental record with the DISCOVER pipeline."""
     system = system_data
@@ -169,6 +173,8 @@ def DISCOVER_MDOF_EXP(
         term_position_encoding = term_position_encoding,
         seed                  = seed_policy,
         center_features  = center_features,
+        sim_refine       = sim_refine,
+        sim_refine_evals = sim_refine_evals,
     )
 
 

@@ -50,9 +50,10 @@ Amplitudes are compared in log, so a 2x error costs the same at high and low
 amplitude and a low-amplitude regime late in a decay counts as much as the
 start.  Every parameter (frequency range, bands, floors) comes from the
 measured record.  Amplitudes discard phase relations between DOFs, so the
-term complements the pointwise ones rather than replacing them, and it needs
-free runs: a windowed simulation restarts from the data and its signal jumps
-at every window boundary.
+term complements the pointwise ones rather than replacing them.  It always
+gets a free run: with a ``window`` the pointwise terms are taken on the
+restarted windows and the envelope on a separate free run, since a windowed
+signal jumps at every window boundary.
 
 Torch-free, so the engine (:func:`discover_core.simulation_reward`, used in
 training) and the scoring script (:mod:`discover_score`) run this one
@@ -82,7 +83,10 @@ that length and each one is simulated from the measured state at its start
 (multiple shooting).  Every window of every trial is integrated together as
 one vectorised batch, so the sequential cost is the window length rather than
 the record length, and a small frequency error costs a bounded phase error per
-window instead of one that grows over the whole record.
+window instead of one that grows over the whole record -- on a free run the
+pointwise errors saturate near 1.4 for any slightly-off frequency and stop
+ranking anything.  :func:`auto_window` picks a few periods of the fastest
+motion.  The time-frequency term always gets a free run of its own.
 
 Integration
 -----------
@@ -110,6 +114,8 @@ SIM_BLOWUP = 10.0
 # hundred cycles on a perfect equation.
 SIM_STEPS_PER_CYCLE = 50
 MAX_SUBSTEPS = 8
+# sim_window='auto': restart every this many periods of the fastest motion
+SIM_AUTO_PERIODS = 3.0
 
 # Time-frequency term (see the module docstring).
 #   TF_OMEGA0      Morlet centre frequency: a band at f spans f/6 in frequency
@@ -126,6 +132,20 @@ MAX_SUBSTEPS = 8
 #   TF_MAG_FLOOR   per band, amplitudes are floored at this fraction of the
 #                  band's largest measured amplitude before the log (40 dB)
 #   TF_TREND       include the signed slow trend
+#   TF_RATE        include the beat-rate term (tf_residuals)
+#   TF_RATE_LO_CYCLES  slowest modulation it compares: this many cycles over
+#                  the record
+#   TF_RATE_REF    envelope swing (std of a band's detrended log-amplitude,
+#                  nepers) at which a trial's beat-rate term counts in full;
+#                  a trial whose envelope barely moves has no beat rate to
+#                  compare and is scaled down in proportion
+#   TF_RATE_FLOOR  modulation spectra are floored at this fraction of the
+#                  measured one's mean power, so a flat simulated envelope
+#                  reads as "no rate" rather than as its rounding noise
+#   TF_RATE_SHARE  the beat-rate term and the envelope swing use only bands
+#                  whose mean measured amplitude is at least this fraction of
+#                  the trial's strongest band: a band on a filter's tail sees
+#                  the record's edges more than the signal
 TF_OMEGA0 = 6.0
 TF_PER_OCTAVE = 8
 TF_LO_CYCLES = 6.0
@@ -133,6 +153,11 @@ TF_POWER_FRAC = 0.99
 TF_BAND_FLOOR = 1e-2
 TF_MAG_FLOOR = 1e-2
 TF_TREND = True
+TF_RATE = True
+TF_RATE_LO_CYCLES = 1.0
+TF_RATE_REF = 0.3
+TF_RATE_FLOOR = 1e-2
+TF_RATE_SHARE = 0.1
 
 
 def _scale(x):
@@ -217,6 +242,28 @@ def auto_steps(t, states, accs=None, per_cycle=SIM_STEPS_PER_CYCLE):
     if per_sample_cycle >= 2 * per_cycle:
         return int(per_sample_cycle // per_cycle), 1
     return 1, int(min(MAX_SUBSTEPS, max(1, np.ceil(per_cycle / per_sample_cycle))))
+
+
+def auto_window(t, states, accs=None, periods=SIM_AUTO_PERIODS):
+    """The ``sim_window='auto'`` restart interval, in seconds: ``periods``
+    periods of the fastest measured motion, estimated as in :func:`auto_steps`.
+    Short enough that a small frequency error costs a bounded phase error per
+    window, long enough to show each window's frequency and damping.  None if
+    the record has no motion to time."""
+    states = np.asarray(states, dtype=float)
+    omega = 0.0
+    for p in range(states.shape[0]):
+        for d in range(states.shape[1] // 2):
+            rq = float(np.sqrt(np.mean(states[p, 2 * d] ** 2)))
+            rv = float(np.sqrt(np.mean(states[p, 2 * d + 1] ** 2)))
+            if accs is not None:
+                ra = float(np.sqrt(np.mean(np.asarray(accs)[p, d] ** 2)))
+                w = ra / rv if rv > 0 else 0.0
+            else:
+                w = rv / rq if rq > 0 else 0.0
+            if np.isfinite(w):
+                omega = max(omega, w)
+    return periods * 2.0 * np.pi / omega if omega > 0.0 else None
 
 
 def rollout(accel, t, states, dof, window=None, stride=1, substeps=1,
@@ -399,6 +446,60 @@ def _band_stats(logA, valid):
     return mu, sd
 
 
+def _mod_setup(valid, D, N, fk, T):
+    """What the beat-rate term needs, per band: a Hann taper over the band's
+    valid span and the centred sample index there (to remove a straight-line
+    trend), plus the modulation frequencies it compares and their spacing in
+    octaves."""
+    K, M = valid.shape
+    win, xc = np.zeros((K, M)), np.zeros((K, M))
+    sxx = np.ones(K)
+    for k in range(K):
+        idx = np.flatnonzero(valid[k])
+        if idx.size >= 8:
+            win[k, idx] = np.hanning(idx.size)
+            xc[k, idx] = np.arange(idx.size) - (idx.size - 1) / 2.0
+            sxx[k] = float((xc[k, idx] ** 2).sum())
+    nu = np.fft.rfftfreq(N, D)
+    rng = ((nu >= TF_RATE_LO_CYCLES / T)
+           & (nu <= min(2.0 * float(fk.max()) / TF_OMEGA0, 0.25 / D)))
+    return {'win': win, 'xc': xc, 'sxx': sxx, 'n': np.maximum(valid.sum(axis=1), 1),
+            'N': N, 'range': rng, 'du': np.diff(np.log2(nu[rng]))}
+
+
+def _mod_spectrum(L, valid, mod, use):
+    """One trial's modulation power spectrum over the compared range -- the
+    log-amplitude of every band in ``use`` detrended (mean and slope) over its
+    valid span, tapered, transformed and summed in power -- and the largest
+    detrended std among those bands (the envelope swing, nepers)."""
+    mu = (L * valid).sum(axis=1) / mod['n']
+    slope = (L * mod['xc']).sum(axis=1) / mod['sxx']
+    det = (L - mu[:, None] - slope[:, None] * mod['xc']) * valid * use[:, None]
+    swing = float(np.sqrt((det ** 2).sum(axis=1) / mod['n']).max())
+    S = (np.abs(np.fft.rfft(det * mod['win'], mod['N'], axis=1)) ** 2).sum(axis=0)
+    return S[mod['range']], swing
+
+
+def _peak_freq(S, nu):
+    """Frequency of the largest value of ``S`` on the uniform grid ``nu``,
+    refined between bins by a parabola through the peak and its neighbours."""
+    i = int(np.argmax(S))
+    if 0 < i < len(S) - 1:
+        den = S[i - 1] - 2.0 * S[i] + S[i + 1]
+        if den < 0.0:
+            return float(nu[i] + 0.5 * (S[i - 1] - S[i + 1]) / den
+                         * (nu[1] - nu[0]))
+    return float(nu[i])
+
+
+def _rate_distance(S_sim, cdf_meas, floor, du):
+    """Wasserstein-1 distance, in octaves, between the simulated modulation
+    spectrum and the measured one (given as its CDF over the same grid)."""
+    S = S_sim + floor
+    cdf = np.cumsum(S) / S.sum()
+    return float(np.sum(np.abs(cdf[:-1] - cdf_meas[:-1]) * du))
+
+
 def tf_setup(t, x_meas, stride):
     """The measured side of the time-frequency term for one DOF, computed once.
 
@@ -427,7 +528,8 @@ def tf_setup(t, x_meas, stride):
     M = n + 1
     setup = {'stride': s, 'idx': idx, 'M': M, 'N': _next_pow2(2 * M),
              'bands': np.zeros(0), 'G': None, 'valid': None, 'eps': None,
-             'logA': None, 'trend': None, 'f_lo': np.nan, 'f_hi': np.nan}
+             'logA': None, 'trend': None, 'rate': None, 'swing': None,
+             'f_lo': np.nan, 'f_hi': np.nan}
     if M < 16:
         return setup
     tt = t[idx] - t[idx[0]]
@@ -481,6 +583,25 @@ def tf_setup(t, x_meas, stride):
             mu, sd = _band_stats(logA, valid)
             setup.update(bands=fk, G=G, valid=valid, eps=eps, logA=logA,
                          logA_mean=mu, logA_std=sd)
+            mod = _mod_setup(valid, D, N, fk, T)
+            level = np.array([[A[p, k, valid[k]].mean() for k in range(len(fk))]
+                              for p in range(P)])
+            use = level >= TF_RATE_SHARE * level.max(axis=1, keepdims=True)
+            spec = [_mod_spectrum(logA[p], valid, mod, use[p]) for p in range(P)]
+            swing = np.array([w for _S, w in spec])
+            setup['swing'] = swing
+            if TF_RATE and mod['range'].sum() >= 4:
+                floor = np.array([TF_RATE_FLOOR * S.mean() for S, _w in spec])
+                cdf = np.stack([np.cumsum(S + fl) / (S + fl).sum()
+                                if (S + fl).sum() > 0 else np.zeros_like(S)
+                                for (S, _w), fl in zip(spec, floor)])
+                nu = np.fft.rfftfreq(N, D)[mod['range']]
+                setup['rate'] = {'mod': mod, 'cdf': cdf, 'floor': floor,
+                                 'use': use,
+                                 'weight': np.minimum(1.0, swing / TF_RATE_REF)
+                                 * (floor > 0),
+                                 'nu_peak': np.array([_peak_freq(S, nu)
+                                                      for S, _w in spec])}
 
     if TF_TREND:
         f_tr = 0.5 * f_lo
@@ -492,6 +613,35 @@ def tf_setup(t, x_meas, stride):
                 'gain': gain, 'valid': tr_valid,
                 'xbar': np.fft.ifft(X * gain[None, :], axis=1).real[:, :M]}
     return setup
+
+
+def spectral_peaks(t, x_meas, stride, f_lo=0.0, f_hi=np.inf, n_peaks=2):
+    """The ``n_peaks`` strongest local maxima of each trial's displacement
+    spectrum (mean removed, Hann-tapered, on the ``stride`` grid) between
+    ``f_lo`` and ``f_hi``: ``(freqs, rel)``, each (P, n_peaks), ``rel`` the
+    amplitude over the strongest's; NaN where a trial has fewer peaks.  Peaks
+    closer than the record can resolve (1/T) merge into one -- the envelope
+    swing still shows their beat."""
+    t = np.asarray(t, dtype=float)
+    x = np.atleast_2d(np.asarray(x_meas, dtype=float))
+    idx = np.arange((x.shape[1] - 1) // max(1, int(stride)) + 1) * max(1, int(stride))
+    xg = x[:, idx]
+    D = float(np.median(np.diff(t[idx])))
+    n = _next_pow2(4 * len(idx))
+    fr = np.fft.rfftfreq(n, D)
+    amp = np.abs(np.fft.rfft((xg - xg.mean(axis=1, keepdims=True))
+                             * np.hanning(len(idx)), n, axis=1))
+    freqs = np.full((x.shape[0], n_peaks), np.nan)
+    rel = np.full((x.shape[0], n_peaks), np.nan)
+    band = (fr >= f_lo) & (fr <= f_hi)
+    for p in range(x.shape[0]):
+        a = amp[p]
+        loc = np.flatnonzero(band[1:-1] & (a[1:-1] > a[:-2]) & (a[1:-1] >= a[2:])) + 1
+        if loc.size:
+            top = loc[np.argsort(a[loc])[::-1][:n_peaks]]
+            freqs[p, :top.size] = fr[top]
+            rel[p, :top.size] = a[top] / a[top[0]]
+    return freqs, rel
 
 
 def tf_residuals(setup, q_sim):
@@ -506,7 +656,9 @@ def tf_residuals(setup, q_sim):
         R_stat  = mean over bands of  | mean_t L_sim - mean_t L_meas |
                                     + | std_t  L_sim - std_t  L_meas |
         R_trend = RMS(trend_sim - trend_meas) / std(measured)    (sign kept)
-        R_tf    = R_local + R_stat + R_trend
+        R_rate  = W1(modulation spectrum_sim, modulation spectrum_meas)
+                  in octaves, x min(1, measured envelope swing / TF_RATE_REF)
+        R_tf    = R_local + R_stat + R_trend + R_rate
 
     ``R_local`` sees WHEN the amplitude rises and falls, so it grades a beat
     period that is slightly off -- but only while the simulated beat has
@@ -517,6 +669,15 @@ def tf_residuals(setup, q_sim):
     on two tones 0.05 Hz apart over 100 s: with ``R_local`` alone a single
     unmodulated tone scored 0.39 against 0.49-0.53 for beats off by 0.005-0.05
     Hz; with ``R_stat`` added it scores 1.07 against 0.55-0.68.
+
+    Neither grades a beat rate that is far off, and the beat period is what
+    the coupling sets.  ``R_rate`` does: each band's log-amplitude, detrended
+    (so a decay is not a "modulation"), has a power spectrum in which a beat
+    is a peak at its rate; summed over bands, the simulated and measured
+    spectra are compared by the earth mover's distance along log-frequency,
+    which grows with the rate error at any size -- a beat twice too fast
+    costs one octave.  A trial whose measured envelope barely moves has no
+    rate to compare, so its term is scaled by its envelope swing.
 
     Each band counts equally whatever its valid length.  The trend is
     normalised by the whole channel's std, not the trend's own, so a near-zero
@@ -534,6 +695,7 @@ def tf_residuals(setup, q_sim):
         valid = setup['valid']
         n_valid = valid.sum(axis=1)
         eps = setup['eps'][:, None]
+        rate = setup.get('rate')
         for p in range(P):
             A = np.abs(np.fft.ifft(X[p][None, :] * setup['G'], axis=1)[:, :M])
             L = np.log(A + eps)
@@ -542,6 +704,10 @@ def tf_residuals(setup, q_sim):
             out[p] += float(np.mean((d * valid).sum(axis=1) / n_valid))
             out[p] += float(np.mean(np.abs(mu - setup['logA_mean'][p])
                                     + np.abs(sd - setup['logA_std'][p])))
+            if rate is not None and rate['weight'][p] > 0.0:
+                S, _swing = _mod_spectrum(L, valid, rate['mod'], rate['use'][p])
+                out[p] += rate['weight'][p] * _rate_distance(
+                    S, rate['cdf'][p], rate['floor'][p], rate['mod']['du'])
     tr = setup['trend']
     if tr is not None:
         xbar = np.fft.ifft(X * tr['gain'][None, :], axis=1).real[:, :M]
@@ -561,7 +727,9 @@ def rollout_residuals(accel, t, states, dof, window=None, stride=1, substeps=1,
     measured std of the channel.  ``accs`` is the measured acceleration,
     (P, N, m); it is needed only when ``w_a > 0``.  ``tf`` is this DOF's
     :func:`tf_setup` at the same ``stride``; it is needed only when
-    ``w_tf > 0``, which also requires a free run (``window=None``).  The
+    ``w_tf > 0``.  With a ``window`` the NRMSEs are taken over the restarted
+    windows and ``R_tf`` over a free run of its own -- an envelope needs the
+    whole record in one piece.  The
     simulated acceleration of a window that blew up is clipped at ``blowup``
     times the largest measured one, so it too scores large but finite.  See
     :func:`rollout` for the other arguments.
@@ -596,9 +764,6 @@ def rollout_set_residuals(accels, t, states, window=None, stride=1, substeps=1,
         raise ValueError("an acceleration weight needs the measured "
                          "acceleration (accs)")
     if w_tf > 0.0:
-        if window is not None:
-            raise ValueError("the time-frequency weight needs free runs: "
-                             "set sim_window=None")
         if any(tf is None or tf['stride'] != max(1, int(stride))
                for tf in ((tfs or {}).get(d) for d in dofs)):
             raise ValueError("the time-frequency weight needs every "
@@ -607,6 +772,12 @@ def rollout_set_residuals(accels, t, states, window=None, stride=1, substeps=1,
     _dofs, q_sim, v_sim, a_sim, sim, blown = rollout_set(
         accels, t, states, window, stride, substeps, blowup,
         with_acc=w_a > 0.0)
+    q_free = q_sim
+    if w_tf > 0.0 and window is not None:
+        # the envelope needs the whole record in one run: its own free run
+        _d, q_free, _v, _a, _s, blown_free = rollout_set(
+            accels, t, states, None, stride, substeps, blowup, with_acc=False)
+        blown = blown | blown_free
 
     def nrmse(sim_x, meas_x, mk):
         return (np.sqrt(np.mean((sim_x[mk] - meas_x[mk]) ** 2))
@@ -620,7 +791,7 @@ def rollout_set_residuals(accels, t, states, window=None, stride=1, substeps=1,
             a_lim = blowup * float(np.max(np.abs(a_meas))) + 1e-12
             a_d = np.clip(np.where(np.isfinite(a_sim[:, k]), a_sim[:, k], a_lim),
                           -a_lim, a_lim)
-        r_tf = tf_residuals(tfs[d], q_d) if w_tf > 0.0 else None
+        r_tf = tf_residuals(tfs[d], q_free[:, k]) if w_tf > 0.0 else None
         out = np.full(states.shape[0], np.nan)
         for p in range(states.shape[0]):
             mk = sim[p]

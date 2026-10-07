@@ -237,6 +237,33 @@ def _train_critic(st, max_len, device):
 _MODE_LABEL = {'alone': 'alone', 'top': 'with top', 'peer': 'with peers'}
 
 
+def _scored_with(entry, dof, n_dof, indent=10):
+    """Lines naming what DOF ``dof``'s equation was simulated with to earn its
+    score: per mode, every other DOF's equation in physical units -- printed
+    even when it is that DOF's current best -- or the measured record."""
+    sw = entry[3].get('scored_with') if isinstance(entry[3], dict) else None
+    if not sw:
+        return []
+    pad, lines = ' ' * indent, []
+    for m in ('alone', 'top', 'peer'):
+        if m not in sw['modes']:
+            continue
+        partners = sw['partners'].get(m, {})
+        lines.append(f"{pad}scored {_MODE_LABEL[m]} ({sw['modes'][m]:.4f}), "
+                     f"simulated with:")
+        for j in range(n_dof):
+            if j == dof:
+                continue
+            e = partners.get(j)
+            what = ('the measured record' if e is None else
+                    dc.denormalize_expr(e[0], e[1], j)
+                    or dc.expr_to_str(e[0], e[1]))
+            lines.append(f"{pad}  DOF {j}: {what}")
+    if sw.get('tuned'):
+        lines.append(f"{pad}(amplitudes tuned on the simulation)")
+    return lines
+
+
 def check_coupling(sim_coupling, reward, n_dof, mode='split'):
     """``(f_top, f_peer)`` as floats, or a ValueError unless they are two
     non-negative fractions summing to at most 1 -- and, when either is
@@ -318,11 +345,12 @@ def DISCOVER_TRAIN(
                                # 0.5 = halve per rank, 0 = worst trial only
     sim_window       = None,   # simulation: None = one free run per trial,
                                # a number = restart from the record every
-                               # sim_window seconds
+                               # sim_window seconds, 'auto' = every 3 periods
+                               # of the fastest motion; windows apply to the
+                               # pointwise terms, time-frequency runs free
     sim_weights      = (1.0, 0.0, 0.0, 0.0),  # simulation: weights of
                                # (displacement, velocity, acceleration,
-                               # time-frequency), non-negative, summing to 1;
-                               # time-frequency needs sim_window=None
+                               # time-frequency), non-negative, summing to 1
     sim_coupling     = (0.0, 0.0),  # simulation, 2+ DOFs: the fractions of
                                # each DOF's equations simulated with the other
                                # DOFs' top equations, and with the other DOFs'
@@ -332,6 +360,10 @@ def DISCOVER_TRAIN(
                                # ways, drawn with those fractions; 'blend':
                                # each scored all three ways, rewards weighted
                                # by them
+    sim_refine       = 0,      # simulation: per DOF per epoch, the best this
+                               # many equations get their amplitudes tuned on
+                               # the simulation itself (0 = off)
+    sim_refine_evals = 60,     # simulation: simulations per tuned equation
     use_pool         = True,
     center_features  = False,  # see generate_dataset(): scale-only by default
     # ── policy (see discover_policy) ───────────────────────────────────────
@@ -362,10 +394,12 @@ def DISCOVER_TRAIN(
     summing to 1.  The acceleration is the equation's own along its simulated
     trajectory; ``R_tf`` compares the local amplitude in each frequency band
     over time, so it sees beats and is blind to phase drift (see
-    :mod:`discover_rollout`; it needs ``sim_window=None``).
+    :mod:`discover_rollout`).
     ``sim_window`` restarts the simulation from the record every that many
-    seconds instead of one free run per trial.  Constants are fitted the same
-    way under both.
+    seconds (``'auto'``: every 3 periods of the fastest motion) for the
+    pointwise terms, which on one long free run saturate for any slightly-off
+    frequency; the time-frequency term always gets a free run of its own.
+    Constants are fitted the same way under both.
 
     ``trial_decay`` sets how each candidate's trials are combined into its
     reward, under either scheme.  The trials are ranked by how badly the
@@ -384,6 +418,17 @@ def DISCOVER_TRAIN(
     the same sample.  Each equation is still scored on its own channel, but a
     set that blows up charges every equation in it.  The rest are simulated
     alone as before (:func:`discover_core.coupled_worker`).
+
+    ``sim_refine`` tunes, each epoch, the amplitudes of each DOF's best few
+    equations on the simulation itself, scored exactly as they were (same
+    modes and partners), within ``sim_refine_evals`` simulations each --
+    starting from the buffer's tuned copy of the same structure when it has
+    one, so tuning accumulates over the epochs a structure keeps winning.  The
+    closed-form fit targets the equation error, and a free run magnifies what
+    that misses -- a beat period is a difference of two close frequencies,
+    so a 1% coupling error can move it by tens of percent.  A tuned equation
+    replaces its untuned twin in the buffer when it scores higher
+    (:func:`discover_core.refine_worker`).
 
     ``sim_coupling_mode`` says how the fractions apply.  ``'split'`` scores
     each equation ONE way, drawn with those fractions, and its reward is
@@ -421,6 +466,10 @@ def DISCOVER_TRAIN(
     N = system.n_dof
     f_top, f_peer = check_coupling(sim_coupling, reward, N, sim_coupling_mode)
     coupled = f_top + f_peer > 0.0
+    if int(sim_refine) < 0 or int(sim_refine_evals) < 1:
+        raise ValueError("sim_refine must be >= 0 and sim_refine_evals >= 1")
+    if sim_refine and reward != 'simulation':
+        raise ValueError("sim_refine needs reward='simulation'")
 
     dc.configure_grammar(N, system.var_names, directional_leaves,
                          transcendental)
@@ -453,8 +502,16 @@ def DISCOVER_TRAIN(
         print("[config] coupling (blend): every equation scored "
               + ", ".join(_MODE_LABEL[m_] for m_, _w in ways) + "; reward = "
               + " + ".join(f"{w:.2f} {_MODE_LABEL[m_]}" for m_, w in ways))
+    if sim_refine:
+        print(f"[config] tuning: per DOF per epoch, the best {sim_refine} "
+              f"equations' amplitudes tuned on the simulation "
+              f"({sim_refine_evals} runs each)")
     print(f"[config] trajectories used per fit/score: {dc.MAX_TRAJ} "
           f"of {len(raw_trajs)} available\n")
+    if reward == 'simulation':
+        dc.print_record_summary(
+            horizon=dc.get_traj_horizon(0, n_epochs, system.t_end))
+        print()
 
     # Scoring pool (static data injected once).
     pool = saved_env = None
@@ -515,7 +572,7 @@ def DISCOVER_TRAIN(
         # would inflate the pickling cost per candidate; every task carries
         # the (dof, index) slots its results belong to instead.
         t1 = time.time()
-        mode, tops, top_sets = {}, {}, [set() for _ in range(N)]
+        mode, tops, top_sets, blend = {}, {}, [set() for _ in range(N)], None
         iso_tasks, iso_slots, cpl_tasks, cpl_slots = [], [], [], []
         if coupled:
             n_rows = min([batch_size] + [len(c) for c in all_exprs])
@@ -582,32 +639,79 @@ def DISCOVER_TRAIN(
                           f"({100.0*k/n_tasks:5.1f}%)  "
                           f"{rate:6.1f} eq/s  ETA {eta:6.1f}s", flush=True)
 
+        # Every scored candidate as [reward, tau, consts, {mode: reward},
+        # {mode: {dof: (tau, consts)}}, tuned]: the partner equations each mode
+        # simulated it with, empty where a DOF was read off the record.
+        scored = {}
+        for key, res in results.items():
+            if res is None:
+                continue
+            if len(res) > 5:
+                scored[key] = [res[1], res[2], res[3], res[4], res[5], False]
+            else:
+                scored[key] = [res[1], res[2], res[3], {'alone': res[1]},
+                               {'alone': {}}, False]
+        print(f"  [{stage}]   scored  ({time.time()-t1:.2f}s)", flush=True)
+
+        if sim_refine:
+            # Tuning picks up where it left off: a structure the buffer already
+            # holds tuned starts from those constants, not from a fresh fit.
+            t2 = time.time()
+            jobs, keys = [], []
+            for i in range(N):
+                tuned_before = {ps.dedup_key(e[1]): e for e in states[i].buffer
+                                if (e[3].get('scored_with') or {}).get('tuned')}
+                mine = sorted((v[0], k) for (d, k), v in scored.items() if d == i)
+                for _r, k in mine[::-1][:sim_refine]:
+                    r0, tau, c, _md, used, _t = scored[(i, k)]
+                    twin = tuned_before.get(ps.dedup_key(tau))
+                    if twin is not None and twin[0] > r0:
+                        c = twin[2]
+                    w = blend if mode[(i, k)] == 'blend' else {mode[(i, k)]: 1.0}
+                    jobs.append((i, tau, c, w, used.get('top', {}),
+                                 used.get('peer', {}), horizon, sim_refine_evals))
+                    keys.append((i, k))
+            outs = (pool.map(dc.refine_worker, jobs) if pool is not None
+                    else map(dc.refine_worker, jobs))
+            before, after, n_runs = {}, {}, 0
+            for key, out in zip(keys, outs):
+                v = scored[key]
+                before[key[0]] = max(before.get(key[0], 0.0), v[0])
+                n_runs += out[5]
+                if out[1] > v[0]:
+                    v[0], v[2], v[3], v[5] = out[1], out[3], out[4], True
+                after[key[0]] = max(after.get(key[0], 0.0), v[0])
+            print(f"  [2b-tune]  {len(jobs)} equations' amplitudes tuned on the "
+                  f"simulation, {n_runs} runs ({time.time()-t2:.2f}s)", flush=True)
+            for i in sorted(before):
+                print(f"    DOF {i}  best {before[i]:.4f} -> {after[i]:.4f}")
+
         per_dof = [[] for _ in range(N)]
         for i in range(N):
             for k, (_tau, ctx) in enumerate(all_exprs[i]):
-                res = results.get((i, k))
-                if res is not None:
-                    _tgt, r, tau, c = res[:4]
-                    per_dof[i].append((r, tau, c, ctx))
-        print(f"  [{stage}]   scored  ({time.time()-t1:.2f}s)", flush=True)
+                v = scored.get((i, k))
+                if v is None:
+                    continue
+                if reward == 'simulation':
+                    ctx['scored_with'] = {'modes': v[3], 'partners': v[4],
+                                          'tuned': v[5]}
+                per_dof[i].append((v[0], v[1], v[2], ctx))
         if coupled and sim_coupling_mode == 'blend':
             for i in range(N):
-                got = [results[key] for key in mode
-                       if key[0] == i and results.get(key) is not None]
+                got = [v for (d, _k), v in scored.items() if d == i]
                 if got:
-                    best = max(got, key=lambda z: z[1])
-                    print(f"    DOF {i}  best {best[1]:.4f} = "
-                          + "  ".join(f"{_MODE_LABEL[m_]} {best[4][m_]:.4f}"
+                    best = max(got, key=lambda z: z[0])
+                    print(f"    DOF {i}  best {best[0]:.4f} = "
+                          + "  ".join(f"{_MODE_LABEL[m_]} {best[3][m_]:.4f}"
                                       for m_ in ('alone', 'top', 'peer')
-                                      if m_ in best[4]))
+                                      if m_ in best[3]))
         elif coupled:
             for i in range(N):
                 parts = []
                 for m_ in ('alone', 'top', 'peer'):
                     keys = [key for key, md in mode.items()
                             if key[0] == i and md == m_]
-                    rs = [results[key][1] for key in keys
-                          if results.get(key) is not None]
+                    rs = [scored[key][0] for key in keys if key in scored]
                     parts.append(f"{_MODE_LABEL[m_]} {len(keys)}: "
                                  + (f"best {max(rs):.4f}" if rs else "-"))
                 print(f"    DOF {i}  " + "  |  ".join(parts))
@@ -649,13 +753,23 @@ def DISCOVER_TRAIN(
             # expression, and the reward that gates it was computed in
             # isolation either way.  The key is the sorted term multiset, so
             # the same terms drawn in a different order collapse too.
-            seen = set(ps.dedup_key(e[1]) for e in st.buffer)
-            n_added = 0
+            seen = {ps.dedup_key(e[1]): n for n, e in enumerate(st.buffer)}
+            n_added = n_tuned = 0
             for entry in promoted:
                 key = ps.dedup_key(entry[1])
                 if key in seen:
-                    continue
-                seen.add(key); st.buffer.append(entry); n_added += 1
+                    # A repeat is dropped -- unless its amplitudes were tuned
+                    # on the simulation and it now beats the buffer's copy,
+                    # which it then replaces (here and in the hall of fame).
+                    sw = entry[3].get('scored_with') or {}
+                    n_old = seen[key]
+                    if not (sw.get('tuned') and entry[0] > st.buffer[n_old][0]):
+                        continue
+                    st.buffer[n_old] = entry
+                    st.hof = [h for h in st.hof if ps.dedup_key(h[1]) != key]
+                    n_tuned += 1
+                else:
+                    seen[key] = len(st.buffer); st.buffer.append(entry); n_added += 1
                 if entry[0] > st.best_r:
                     st.best_r = entry[0]; st.best_entry = entry
                 st.hof.append(entry)
@@ -667,7 +781,7 @@ def DISCOVER_TRAIN(
 
             st.R_alpha = float(np.percentile([e[0] for e in st.buffer], 10))
             c_loss = _train_critic(st, max_len, device)
-            report[i] = (max(e[0] for e in batch_r), n_added, c_loss)
+            report[i] = (max(e[0] for e in batch_r), n_added, n_tuned, c_loss)
 
         ps.update(states, C, max_len, eps, beta, lam_t, trainable=set(report))
 
@@ -682,9 +796,11 @@ def DISCOVER_TRAIN(
             if st.buffer:
                 st.R_alpha = float(np.percentile([e[0] for e in st.buffer], 5))
 
-            best_raw, n_added, c_loss = report[i]
+            best_raw, n_added, n_tuned, c_loss = report[i]
             c_str = f'  critic_loss={c_loss:.4f}' if c_loss is not None else ''
-            print(f"  DOF {i}: best={best_raw:.4f}  +{n_added} buf={len(st.buffer)}{c_str}")
+            t_str = f' ({n_tuned} replaced by tuned twins)' if n_tuned else ''
+            print(f"  DOF {i}: best={best_raw:.4f}  +{n_added} "
+                  f"buf={len(st.buffer)}{t_str}{c_str}")
         print(f"  [3-train]    ({time.time()-t1:.2f}s)", flush=True)
 
         # ── epoch report ────────────────────────────────────────────────────
@@ -698,6 +814,8 @@ def DISCOVER_TRAIN(
             d = dc.denormalize_expr(be[1], be[2], i)
             if d:
                 print(f"          denorm: {d}")
+            for line in _scored_with(be, i, N):
+                print(line)
 
     # ── Final summary ───────────────────────────────────────────────────────
     print(f"\n{'=' * 64}\n=== DISCOVER done :: {system.name} ===")
@@ -716,6 +834,8 @@ def DISCOVER_TRAIN(
         d = dc.denormalize_expr(best[1], best[2], i)
         if d:
             print(f"  Expr (physical)   : {d}")
+        for line in _scored_with(best, i, N, indent=2):
+            print(line)
         print(f"  --- Hall of Fame (top {len(st.hof)}) ---")
         for rank, hof in enumerate(st.hof, 1):
             dh = dc.denormalize_expr(hof[1], hof[2], i)

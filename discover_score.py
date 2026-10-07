@@ -79,7 +79,8 @@ SIM_OVERRIDES = {}               # e.g. {'n_traj': 2, 'n_pts': 4000}
 TRIALS           = None          # None = every trial; or e.g. [1, 2]
 ENERGY_NORMALIZE = True
 REWARD           = 'energy'      # 'energy' | 'simulation' — as in the run
-SIM_WINDOW       = None          # simulation: None = one free run per trial
+SIM_WINDOW       = None          # simulation: None = one free run per trial,
+                                 # seconds, or 'auto' -- as in the run
 SIM_WEIGHTS      = (1.0, 0.0, 0.0, 0.0)   # simulation: (disp, vel, acc,
                                      # time-frequency) weights, summing to 1
 SIM_COUPLED      = False         # simulation: True = all DOFs integrated
@@ -194,7 +195,8 @@ def score_simulation(system, exprs, trials, window, weights, verbose=True,
                                     coupled=coupled, trial_decay=trial_decay)
     if verbose:
         how = ('one free run per trial' if window is None else
-               f'restarted every {window:g} s')
+               'restarted every 3 periods of the fastest motion'
+               if window == 'auto' else f'restarted every {window:g} s')
         how += (', all DOFs integrated together' if coupled else
                 ', each DOF against the recorded others')
         print(f"\n  forward simulation, {how}, weights "

@@ -828,13 +828,26 @@ def test_simulation_reward():
                    and ro.check_weights((0.5, 0, 0, 0.5)) == (0.5, 0, 0, 0.5))
         check('sim_weights must be three or four non-negatives summing to 1 '
               '(three means no time-frequency term)', bad_ok and good_ok)
+        def det(S):                                    # 3% stiffer
+            return spec.accel_fns[0](S) - 0.03 * S[0]
+        tf_d = ro.tf_setup(t, states[:, 0, :], stride)
+        only_tf = [ro.rollout_residuals(det, t, states, 0, window=w,
+                                        stride=stride, substeps=sub,
+                                        weights=(0, 0, 0, 1), tf=tf_d)
+                   for w in (None, 2.0)]
+        dc.set_reward('simulation', sim_window=2.0, sim_weights=(0.5, 0, 0, 0.5))
+        dc.set_reward('simulation', sim_window='auto',
+                      sim_weights=(0.5, 0, 0, 0.5))
         try:
-            dc.set_reward('simulation', sim_window=2.0,
-                          sim_weights=(0.5, 0, 0, 0.5))
+            dc.set_reward('simulation', sim_window='soon')
             win_ok = False
         except ValueError:
             win_ok = True
-        check('the time-frequency weight is refused with restart windows', win_ok)
+        check("with restart windows the time-frequency term still gets a free "
+              "run of its own; 'auto' windows are accepted, nonsense refused",
+              np.array_equal(only_tf[0], only_tf[1]) and only_tf[0].min() > 0
+              and win_ok, f"R_tf {only_tf[0].mean():.4f} either way")
+        dc.set_reward('simulation')
         def lin(S):                                    # the linear model
             return -1.0 * S[0] - 0.3 * S[1]
         parts = [ro.rollout_residuals(lin, t, states, 0, stride=stride,
@@ -1308,6 +1321,120 @@ def test_trial_decay():
         dc._TF_DATA.clear()
 
 
+def test_beats_tools():
+    """What lets a search capture beats: a beat-rate term graded at any error,
+    pointwise terms on windows while the envelope runs free, tuning the
+    amplitudes on the simulation, the record report, and the partner
+    print-out under every best equation.
+    """
+    import contextlib
+    import io
+
+    import discover_rollout as ro
+    import discover_train as dt
+    from discover_data import build_truth_system, generate_dataset
+    from discover_mdof_sim import get_mdof_system
+
+    print("\nbeats tools")
+    t = np.linspace(0.0, 100.0, 10001)
+    meas = np.cos(2 * np.pi * 1.00 * t) + np.cos(2 * np.pi * 1.05 * t)
+    st = ro.tf_setup(t, meas[None, :], 1)
+
+    def r_tf(x):
+        return float(ro.tf_residuals(st, x[None, :])[0])
+    fast = [r_tf(np.cos(2 * np.pi * t) + np.cos(2 * np.pi * f2 * t))
+            for f2 in (1.05, 1.06, 1.07, 1.08, 1.10, 1.13)]
+    slow = [r_tf(np.cos(2 * np.pi * t) + np.cos(2 * np.pi * f2 * t))
+            for f2 in (1.05, 1.04, 1.03, 1.02)]
+    none = r_tf(np.sqrt(2) * np.cos(2 * np.pi * 1.025 * t))
+    check('the beat rate is graded however far off it is, both ways, and no '
+          'beat at all is worst',
+          all(a < b for a, b in zip(fast, fast[1:]))
+          and all(a < b for a, b in zip(slow, slow[1:]))
+          and none > max(fast + slow),
+          f"rate x1.2..x2.6: {fast[1]:.2f}..{fast[-1]:.2f}; "
+          f"x0.8..x0.4: {slow[1]:.2f}..{slow[-1]:.2f}; none {none:.2f}")
+    st_d = ro.tf_setup(t, (np.exp(-t / 60) * np.cos(2 * np.pi * t))[None, :], 1)
+    f_pk, rel = ro.spectral_peaks(t, meas[None, :], 1, 0.5, 2.0)
+    check('a decay is no modulation, and the report finds both tones',
+          st_d['swing'][0] < 0.05 and st['swing'][0] > 0.3
+          and np.allclose(np.sort(f_pk[0]), [1.00, 1.05], atol=0.005),
+          f"swing {st_d['swing'][0]:.3f} vs {st['swing'][0]:.3f}; "
+          f"peaks {np.round(np.sort(f_pk[0]), 3)}")
+
+    saved = (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+             dc.MAX_TRAJ, dc.W_ACC, dc.REWARD_MODE, dc.SIM_WINDOW,
+             dc.SIM_WEIGHTS, dc.TRIAL_DECAY)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            system = build_truth_system(get_mdof_system('coupled_beats'),
+                                        n_traj=2, n_pts=3300)
+        dc.configure_grammar(2, system.var_names)
+        _X, _y, raw, ns = generate_dataset(system, device=None)
+        dc.set_problem_data(ns, raw, True, None, 0.5)
+        w = (0.2, 0.2, 0.2, 0.4)
+        dc.set_reward('simulation', sim_window='auto', sim_weights=w)
+        tt, states, accs, _stride, _sub = dc._sim_data(None, None)
+        win = ro.auto_window(tt, states, accs)
+        check("'auto' restarts every 3 periods of the fastest motion",
+              8.0 < win < 10.0, f"{win:.2f} s (2.0-2.2 rad/s modes)")
+
+        mask = dc._amplitude_slots(['add', 'intpower', 'x1', 'power', 'x2',
+                                    'x3', 'end'])
+        check('tuning moves amplitudes only: intpower and power exponents stay',
+              mask.tolist() == [True, False, True, True, True, False, True, True])
+
+        T0, T1 = system.truth_taus
+        c0 = dc.optimise_consts_energy(T0, 0)
+        c1 = dc.optimise_consts_energy(T1, 1)
+        off = list(np.array(c0) * np.array([1.0, 1.0, 1.08]))
+        r_off = dc.score_member(0, T0, off, {'alone': 1.0})[0]
+        tuned = dc.refine_worker((0, T0, off, {'alone': 1.0}, {}, {}, None, 40))
+        still = dc.refine_worker((0, T0, off, {'alone': 1.0}, {}, {}, None, 0))
+        check('tuning on the simulation undoes an 8% coupling error, and with '
+              'no budget changes nothing',
+              tuned[1] > r_off + 0.05 and abs(tuned[3][2] / c0[2] - 1.0) < 0.02
+              and still[3] == off and still[5] == 0,
+              f"{r_off:.4f} -> {tuned[1]:.4f} in {tuned[5]} runs; coupling "
+              f"{off[2] / c0[2]:.3f} -> {tuned[3][2] / c0[2]:.4f} of the fit")
+
+        all3 = {'alone': 0.5, 'top': 0.25, 'peer': 0.25}
+        row = dc.coupled_worker(([(0, T0), (1, T1)], {0: (T0, c0), 1: (T1, c1)},
+                                 None, all3))
+        used = row[0][5]
+        r_m, md_m = dc.score_member(0, T0, row[0][3], all3, tops={1: (T1, c1)},
+                                    peers={1: (row[1][2], row[1][3])})
+        check("the coupled worker names each mode's partners, and scoring one "
+              "member with them reproduces its rewards",
+              used['alone'] == {} and list(used['top']) == [1]
+              and used['top'][1] == (T1, c1) and used['peer'][1][0] == T1
+              and abs(r_m - row[0][1]) < 1e-12
+              and all(abs(md_m[m] - row[0][4][m]) < 1e-12 for m in md_m))
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            dc.print_record_summary()
+            best = dt.DISCOVER_TRAIN(
+                system, n_epochs=2, batch_size=4, max_len=12, C=1,
+                use_pool=False, reward='simulation', sim_window='auto',
+                sim_weights=w, sim_refine=1, sim_refine_evals=5,
+                n_layers=1, d_model=16, max_terms=2, max_term_len=4, seed=0)
+        log = buf.getvalue()
+        check('a run reports the record, tunes, and prints what every best '
+              'equation was simulated with',
+              'envelope swing' in log and '<- strongest' in log
+              and '[2b-tune]' in log and 'simulated with:' in log
+              and 'DOF 1: the measured record' in log
+              and all(b is not None for b in best))
+    finally:
+        dc.configure_grammar(N_DOF)
+        (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+         dc.MAX_TRAJ, dc.W_ACC) = saved[:5]
+        dc.set_reward(*saved[5:])
+        dc._SIM_DATA.clear()
+        dc._TF_DATA.clear()
+
+
 def test_scoring_pool():
     """The scoring pool (:func:`discover_core.make_pool`).
 
@@ -1386,6 +1513,7 @@ def main():
     test_tf_term()
     test_coupled_scoring()
     test_trial_decay()
+    test_beats_tools()
     test_scoring_pool()
 
     print(f"\n{'=' * 60}")
