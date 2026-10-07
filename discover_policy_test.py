@@ -1516,7 +1516,7 @@ def test_frequency_content():
 
     w1 = 2 * np.pi * 1.0
 
-    def slow_detuned(S):                                 # DOF 1, 2% too stiff
+    def slow_detuned(S):                     # DOF 1, frequency 2% too high
         return -(1.02 * w1) ** 2 * S[2] - 2 * 0.01 * w1 * S[3]
     stride, sub = ro.auto_steps(tt, states, accs)
     on_fast = ro.rollout_residuals(slow_detuned, tt, states, 1, window=both,
@@ -1527,8 +1527,8 @@ def test_frequency_content():
                                   weights=(1, 0, 0)).mean()
     check("...and on its own windows a slow DOF's frequency error shows",
           on_own > 2.5 * on_fast,
-          f"2% stiffer, displacement NRMSE: {on_fast:.4f} on the fast DOF's "
-          f"windows, {on_own:.4f} on its own")
+          f"frequency 2% high, displacement NRMSE: {on_fast:.4f} on the fast "
+          f"DOF's windows, {on_own:.4f} on its own")
 
     saved = (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
              dc.MAX_TRAJ, dc.W_ACC, dc.REWARD_MODE, dc.SIM_WINDOW,
