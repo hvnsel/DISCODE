@@ -1769,6 +1769,71 @@ def test_derived_channels():
           f"relative error {e_file:.3f} vs {e_disp:.1e}")
 
 
+def test_diagnose_trials():
+    """:mod:`discover_diagnose`'s trial-by-trial check, on two 1-DOF records:
+    trials whose stiffness differs (each fits alone, one equation fits none,
+    and the constants table shows the stiffness each trial has), and trials
+    that share one equation (it serves them all)."""
+    import contextlib
+    import io
+
+    from scipy.integrate import solve_ivp
+
+    from discover_data import SystemData
+    import discover_diagnose as dg
+
+    print("\ndiagnose: trial by trial")
+    t = np.linspace(0.0, 12.0, 1201)
+
+    def record(ks, ics):
+        acc, vel, disp = [], [], []
+        for k, ic in zip(ks, ics):
+            rhs = (lambda kk: lambda _t, s: [s[1], -kk * s[0] - 0.1 * s[1]])(k)
+            S = solve_ivp(rhs, (0, t[-1]), ic, t_eval=t, rtol=1e-10,
+                          atol=1e-12).y
+            disp.append(S[0][:, None])
+            vel.append(S[1][:, None])
+            acc.append((-k * S[0] - 0.1 * S[1])[:, None])
+        return SystemData('trials', np.stack(acc, 2), np.stack(vel, 2),
+                          np.stack(disp, 2), t, var_names=['x'])
+
+    saved = {k: getattr(dg, k) for k in ('SOURCE', 'build_system', 'SIM_WINDOW',
+                                         'SIM_WEIGHTS', 'TRIAL_DECAY',
+                                         'TUNE_EVALS', 'TRIAL_TUNE_EVALS',
+                                         'EXPRS', 'PER_TRIAL')}
+    try:
+        dg.SOURCE, dg.EXPRS, dg.PER_TRIAL = 'simulated', [], True
+        dg.SIM_WINDOW, dg.SIM_WEIGHTS, dg.TRIAL_DECAY = None, (1.0, 0.0, 0.0), 0.5
+        dg.TUNE_EVALS = dg.TRIAL_TUNE_EVALS = 0
+        runs = {}
+        for name, ks in (('differ', (40.0, 46.0, 52.0)), ('agree', (40.0,) * 3)):
+            sy = record(ks, [(1.0, 0.0), (1.2, 0.0), (0.8, 0.0)])
+            dg.build_system = lambda channels=None, sy=sy: sy
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                runs[name] = dg.main()['per_trial'][0]
+            runs[name]['text'] = buf.getvalue()
+    finally:
+        for k, v in saved.items():
+            setattr(dg, k, v)
+
+    s = runs['differ']
+    k_fit = -s['consts'][:, s['terms'].index('x')]
+    check('trials with different stiffness: each fits alone, the all-trials '
+          'equation fits none, and the constants show each trial\'s stiffness',
+          np.all(s['own'] > 0.99) and np.all(s['shared'] < s['own'] - 0.2)
+          and np.allclose(k_fit, (40.0, 46.0, 52.0), rtol=1e-3)
+          and 'fit clearly better on their own' in s['text']
+          and 'do not share one set of constants' in s['text'],
+          f"alone {np.round(s['own'], 3)}, all-trials {np.round(s['shared'], 3)}, "
+          f"stiffness {np.round(k_fit, 2)}")
+    s = runs['agree']
+    check('trials that share one equation read as served by one equation',
+          np.all(s['own'] > 0.99) and np.all(s['shared'] > 0.99)
+          and 'one equation serves all the trials' in s['text']
+          and 'fit clearly better' not in s['text'],
+          f"alone {np.round(s['own'], 3)}, all-trials {np.round(s['shared'], 3)}")
+
+
 def test_scoring_pool():
     """The scoring pool (:func:`discover_core.make_pool`).
 
@@ -1851,6 +1916,7 @@ def main():
     test_frequency_content()
     test_diagnose_tools()
     test_derived_channels()
+    test_diagnose_trials()
     test_scoring_pool()
 
     print(f"\n{'=' * 60}")

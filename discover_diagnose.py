@@ -37,12 +37,27 @@ run's equations scored alongside.
 
 3. **Your equations**, scored the same way, next to the list's best.
 
+4. **Trial by trial.**  The training reward combines the trials, so it cannot
+   say whether one equation could serve them all.  Each trial is scored on its
+   own: the all-trials best, the same terms with constants fitted to that trial
+   alone, and the best of the list fitted (and tuned) to that trial alone --
+   with your equations alongside.
+
+   - A trial that fits well on its own but not with the all-trials equation:
+     the trials need different constants or terms -- the dynamics change
+     between them (amplitude-dependent behaviour outside the list, or trials
+     run under different conditions).  The constants table shows which.
+   - A trial that fits poorly even on its own: something in it lies outside
+     the list (friction, contact, forcing, an unmeasured mode), or its data is
+     bad.
+
 USAGE
 -----
 1. Point the config at the record, with the trim / downsample settings and the
    reward settings of the run.
 2. Paste your run's best equation per DOF into ``EXPRS`` (optional).
-3. ``python discover_diagnose.py``  -- a couple of minutes.
+3. ``python discover_diagnose.py``  -- a few minutes (``PER_TRIAL = False``
+   skips section 4, about half of it).
 """
 
 from __future__ import annotations
@@ -90,6 +105,10 @@ MAX_DEGREE  = 3                  # monomials up to this total degree
 MAX_TERMS   = 8                  # largest sparse equation: the run's max_terms,
                                  #   so the list holds only what the search can write
 TUNE_EVALS  = 60                 # simulations to tune each DOF's best (0 = off)
+
+# ── trial by trial ─────────────────────────────────────────────────────────
+PER_TRIAL        = True          # section 4: every trial on its own
+TRIAL_TUNE_EVALS = 30            # simulations to tune each trial's own best
 
 # Your run's best equation per DOF (optional).
 EXPRS = [
@@ -265,10 +284,14 @@ class Scorer:
     """The training's simulation reward for physical equation strings, each
     DOF alone (partners read off the record) or several together."""
 
-    def __init__(self, system, t, states, accs):
+    def __init__(self, system, t, states, accs, like=None):
+        """``like``: a scorer of the whole record whose step and windows this
+        one shares, so a subset of its trials is integrated the same way."""
         self.system, self.t, self.states, self.accs = system, t, states, accs
         self.N = system.n_dof
-        self.stride, self.sub = ro.auto_steps(t, states, accs)
+        self.like = like
+        self.stride, self.sub = ((like.stride, like.sub) if like is not None
+                                 else ro.auto_steps(t, states, accs))
         self.w = ro.check_weights(SIM_WEIGHTS)
         self.tfs = ({d: ro.tf_setup(t, states[:, 2 * d, :], self.stride)
                      for d in range(self.N)} if self.w[3] > 0 else {})
@@ -279,6 +302,8 @@ class Scorer:
         return expr_accels(exprs, self.system.var_names)
 
     def _window(self, dofs):
+        if self.like is not None:
+            return self.like._window(dofs)
         if SIM_WINDOW == 'auto':
             return ro.auto_window(self.t, self.states, self.accs, dofs=dofs)
         return SIM_WINDOW
@@ -346,6 +371,148 @@ def tune(scorer, d, coefs, exps, names, var_names, evals):
                  options={'maxfev': int(evals), 'xtol': 1e-3, 'ftol': 1e-4})
     return best['r'], best['c']
 
+
+# ── 4. trial by trial ───────────────────────────────────────────────────────
+GOOD, POOR = 0.8, 0.6            # a trial fits well at GOOD, poorly below POOR
+
+
+def trial_by_trial(system, t, states, accs, scorer, Th, exps, col_scale, names,
+                   targets, best_list, exprs):
+    """Every trial on its own, per DOF: the all-trials best, the same terms
+    with constants fitted to that trial, the best of the list fitted (and
+    tuned) to that trial alone, and the run's equations.  Prints the tables
+    and returns, per DOF, the numbers the reading needs."""
+    N, P, M = system.n_dof, system.n_trials, states.shape[2]
+    var_names = system.var_names
+    subs = [Scorer(system, t, states[p:p + 1], accs[p:p + 1], like=scorer)
+            for p in range(P)]
+    print(f"\n[4. trial by trial] each trial scored on its own: the all-trials "
+          f"best; the same terms with constants fitted to that trial; the best "
+          f"of the list fitted to that trial alone"
+          + (f" and tuned on it ({TRIAL_TUNE_EVALS} simulations)"
+             if TRIAL_TUNE_EVALS > 0 else "")
+          + ("; your equations" if exprs else ""))
+    out = {}
+    for d in range(N):
+        _r, expr_all, coefs_all, label = best_list[d]
+        on = np.flatnonzero(coefs_all)
+        terms = [term_name(exps[k], names) for k in on]
+        q = states[:, 2 * d, :]
+        amp = np.sqrt(np.mean((q - q.mean(axis=1, keepdims=True)) ** 2, axis=1))
+        shared, refit, consts, own, own_n, own_exprs, yours = ([] for _ in
+                                                                range(7))
+        for p in range(P):
+            rows = slice(p * M, (p + 1) * M)
+            y = targets[label][p, d]
+            shared.append(subs[p].alone(d, expr_all)[0])
+            c = np.zeros_like(coefs_all)
+            if on.size:
+                c[on] = (np.linalg.lstsq(Th[rows][:, on], y, rcond=None)[0]
+                         / col_scale[on])
+            consts.append(c[on])
+            refit_expr = as_expr(d, c, exps, names, var_names)
+            refit.append(subs[p].alone(d, refit_expr)[0])
+            ys = float(np.std(y)) + 1e-300
+            cands = []
+            for k, (xi, _sse) in stlsq_path(Th[rows], y / ys, MAX_TERMS).items():
+                if k == 'dense':
+                    continue
+                cf = xi * ys / col_scale
+                ex = as_expr(d, cf, exps, names, var_names)
+                cands.append((subs[p].alone(d, ex)[0],
+                              int(np.count_nonzero(cf)), cf, ex))
+            if not cands:
+                cands = [(refit[-1], int(on.size), c, refit_expr)]
+            r_top = max(z[0] for z in cands)
+            r_o, n_o, cf_o, ex_o = min((z for z in cands if z[0] >= r_top - 0.01),
+                                       key=lambda z: (z[1], -z[0]))
+            if TRIAL_TUNE_EVALS > 0:
+                r_t, c_t = tune(subs[p], d, cf_o, exps, names, var_names,
+                                TRIAL_TUNE_EVALS)
+                if r_t > r_o:
+                    r_o, cf_o = r_t, c_t
+                    ex_o = as_expr(d, cf_o, exps, names, var_names)
+            own.append(r_o)
+            own_n.append(n_o)
+            own_exprs.append(ex_o)
+            if exprs:
+                yours.append(subs[p].alone(d, clean_expr(exprs[d]))[0])
+
+        print(f"\n  DOF {d} ({var_names[d]})   all-trials best: {expr_all}")
+        print(f"    trial   {'RMS ' + var_names[d]:>10s}   all-trials best   "
+              f"same terms, own constants   best for this trial alone"
+              + ("   yours" if exprs else ""))
+        for p in range(P):
+            print(f"    {p:5d}   {amp[p]:10.3g}   {shared[p]:15.4f}   "
+                  f"{refit[p]:25.4f}   {own[p]:13.4f} ({own_n[p]} terms)"
+                  + (f"   {yours[p]:5.4f}" if exprs else ""))
+        C = np.array(consts)
+        spread = np.zeros(len(terms))
+        if terms:
+            spread = ((C.max(axis=0) - C.min(axis=0))
+                      / np.maximum(np.abs(C).mean(axis=0), 1e-300))
+            print("    the same terms' constants, fitted trial by trial:")
+            print("    trial " + "".join(f"{nm:>15s}" for nm in terms))
+            for p in range(P):
+                print(f"    {p:5d} " + "".join(f"{v:15.6g}" for v in C[p]))
+            print("    spread" + "".join(f"{100 * x:14.0f}%" for x in spread))
+        print("    best for each trial alone:")
+        for p in range(P):
+            print(f"      trial {p} ({own[p]:.4f}): {own_exprs[p]}")
+        out[d] = dict(shared=np.array(shared), refit=np.array(refit),
+                      own=np.array(own), yours=np.array(yours), amp=amp,
+                      terms=terms, consts=C, spread=spread,
+                      own_exprs=own_exprs)
+    return out
+
+
+def read_trials(d, var_name, s):
+    """The reading's lines for DOF ``d`` from :func:`trial_by_trial`."""
+    own, shared = s['own'], s['shared']
+    P = own.size
+    fmt = lambda idx, v: ', '.join(f'{v[p]:.2f}' for p in idx)
+    lines = []
+    better = [p for p in range(P) if shared[p] < own[p] - 0.2]
+    poor = [p for p in range(P) if own[p] < POOR]
+    if better:
+        lines.append(
+            f"  DOF {d}: trial(s) {', '.join(map(str, better))} fit clearly "
+            f"better on their own ({fmt(better, own)}) than with the "
+            f"all-trials equation ({fmt(better, shared)}) -> the trials need "
+            f"different constants or terms: the dynamics change between trials")
+    if poor:
+        lines.append(
+            f"  DOF {d}: trial(s) {', '.join(map(str, poor))} fit poorly even "
+            f"on their own ({fmt(poor, own)}) -> something in them lies "
+            f"outside the list (friction, contact, forcing, an unmeasured "
+            f"mode), or their data is bad")
+    if not better and not poor:
+        if own.min() >= GOOD:
+            lines.append(
+                f"  DOF {d}: every trial fits well on its own and the "
+                f"all-trials equation does nearly as well on each -> one "
+                f"equation serves all the trials")
+        else:
+            low = [p for p in range(P) if own[p] < GOOD]
+            lines.append(
+                f"  DOF {d}: no trial fits clearly better on its own than with "
+                f"the all-trials equation -> the trials agree; what keeps "
+                f"trial(s) {', '.join(map(str, low))} below {GOOD} "
+                f"({fmt(low, own)} on their own) is in each of them")
+    # the stiffness and damping constants, where the equation has them
+    for term, what, limit in ((var_name, 'stiffness', 0.1),
+                              (var_name + 'dot', 'damping', 0.3)):
+        if term not in s['terms']:
+            continue
+        k = s['terms'].index(term)
+        col = s['consts'][:, k]
+        lines.append(
+            f"  DOF {d}: fitted trial by trial, the {term} constant "
+            f"({what}) runs from {col.min():.4g} to {col.max():.4g} "
+            f"({100 * s['spread'][k]:.0f}% spread)"
+            + (" -> the trials do not share one set of constants"
+               if s['spread'][k] > limit else ""))
+    return lines
 
 def main():
     system = build_system()
@@ -421,7 +588,7 @@ def main():
             if r_t > r_best:
                 r_best, coefs = r_t, c_t
                 expr = as_expr(d, coefs, exps, names, system.var_names)
-        best_list[d] = (r_best, expr)
+        best_list[d] = (r_best, expr, coefs, label)
         print(f"    best: {expr}")
 
     together = scorer.together([best_list[d][1] for d in range(N)])
@@ -446,6 +613,11 @@ def main():
         tog = scorer.together(exprs)
         print("  simulated together: "
               + ", ".join(f"DOF {d} {r:.4f}" for d, r in enumerate(tog)))
+
+    per_trial = None
+    if PER_TRIAL and P > 1:
+        per_trial = trial_by_trial(system, t, states, accs, scorer, Th, exps,
+                                   col_scale, names, targets, best_list, exprs)
 
     print("\n[reading]")
     if flags:
@@ -487,6 +659,11 @@ def main():
                   f"{r_acc:.3f} -> the acceleration channel is biased, and the "
                   f"training's constant fit leans on it (w_acc): its constants "
                   f"come out wrong before the search even starts")
+    if per_trial is not None:
+        for d in range(N):
+            for line in read_trials(d, system.var_names[d], per_trial[d]):
+                print(line)
+    return {'best_list': best_list, 'per_trial': per_trial}
 
 
 if __name__ == '__main__':
