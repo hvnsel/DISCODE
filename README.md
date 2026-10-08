@@ -387,6 +387,13 @@ constant), so the best it could find can be computed without training:
    (what the training's constant fit leans on through `w_acc`) and to the
    derivative of its velocity. With the default `'disp'` the two are the same.
 3. **Your equations** (`EXPRS`, the run's best per DOF), scored the same way.
+4. **Trial by trial** (`PER_TRIAL`). The reward combines the trials, so it
+   cannot say whether one equation could serve them all. Each trial is scored
+   on its own: the all-trials best, the same terms with constants fitted to
+   that trial alone (and a table of those constants, trial by trial), and the
+   best of the list fitted and tuned to that trial alone
+   (`TRIAL_TUNE_EVALS`), with your equations alongside. It adds about 1.5
+   minutes on a NOhit-sized record.
 
 | it prints | which means |
 |---|---|
@@ -394,6 +401,8 @@ constant), so the best it could find can be computed without training:
 | the list's best is poor too (under 0.5) | no equation of this form simulates the record: the data, or physics the measured states do not hold (forcing, friction, an unmeasured mode) |
 | (`CHANNELS='measured'`) fitted to d/dt velocity the list simulates clearly better than fitted to the acceleration | the acceleration channel is biased, and the constant fit leans on it, so the constants come out wrong before the search starts |
 | a channel or sampling flag | fix the data first |
+| a trial fits clearly better on its own than with the all-trials equation (by 0.2+) | the trials need different constants or terms: the dynamics change between trials (amplitude-dependent behaviour outside the list, or trials run under different conditions); the constants table shows which |
+| a trial fits poorly even on its own (under 0.6) | something in that trial lies outside the list (friction, contact, forcing, an unmeasured mode), or its data is bad |
 
 Checked on four stand-ins, 15–60 s each:
 
@@ -413,7 +422,14 @@ Checked on four stand-ins, 15–60 s each:
   channels, 0.99 and 0.99 on the derived ones.
 
 On NOhit it read 1.10 at 6.19 Hz and 1.01 at 19.7 Hz on both pairs and both
-DOFs, and the list's best was 0.59 on the file's channels.
+DOFs, and the list's best was 0.59 on the file's channels and 0.59 / 0.60 on
+the derived ones: the channels disagree, but that is not what caps the fit.
+
+The trial-by-trial check on 1-DOF stand-ins: three trials with stiffness 40,
+46 and 52 fit alone at 1.00 and with the all-trials equation at 0.41–0.69, and
+the constants table reads 40, 46, 52; three trials of one equation score 1.00
+both ways. On the high-pass stand-in the trials agree, their linear constants
+within 1% of each other.
 
 ## Policy architecture
 
