@@ -1424,8 +1424,9 @@ def test_beats_tools():
         check('a run reports the record, tunes, and prints what every best '
               'equation was simulated with',
               'envelope swing' in log and '<- strongest' in log
-              and '[2b-tune]' in log and 'simulated with:' in log
-              and 'DOF 1: the measured record' in log
+              and '[2b-tune]' in log and 'scored alone (' in log
+              and 'DOF 1: no equation -- its measured motion' in log
+              and log.count('simulated TOGETHER') == 2
               and all(b is not None for b in best))
     finally:
         dc.configure_grammar(N_DOF)
