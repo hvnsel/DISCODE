@@ -272,6 +272,71 @@ def _scored_with(entry, dof, n_dof, indent=10):
     return lines
 
 
+def _same_partners(recorded, tops):
+    """Were the equations in ``recorded`` (``{dof: (tau, consts)}``) exactly
+    the ones in ``tops``?"""
+    return (set(recorded) == set(tops)
+            and all(list(recorded[j][0]) == list(tops[j][0])
+                    and np.array_equal(np.asarray(recorded[j][1], dtype=float),
+                                       np.asarray(tops[j][1], dtype=float))
+                    for j in tops))
+
+
+def refresh_partners(states, blend, horizon, max_per_dof=4, max_passes=3):
+    """Re-score every DOF's best equation that was scored with the other
+    DOFs' top equations against their CURRENT tops, until each DOF's best was
+    scored with the others' current bests.
+
+    A score earned with the other DOFs' top equations is stale once their
+    best changes, and the pair then reported as best was never simulated
+    together.  Each DOF's buffer leader, while stale, is re-scored
+    (:func:`discover_core.score_member`: the ways it was scored, ``blend``'s
+    weights under ``'blend'``; peer partners kept) and the buffer re-sorted,
+    at most ``max_per_dof`` times per DOF per pass; a DOF whose best changed
+    makes the others stale again, hence the passes.  The re-scored entry
+    replaces the stale one in the buffer and the hall of fame, and the best
+    is the buffer leader.  Returns ``[(dof, old reward, new reward)]``."""
+    out = []
+    for _pass in range(max_passes):
+        changed = False
+        for i, st in enumerate(states):
+            for _k in range(max_per_dof):
+                if not st.buffer:
+                    break
+                lead = st.buffer[0]
+                sw = (lead[3].get('scored_with')
+                      if isinstance(lead[3], dict) else None) or {}
+                if 'top' not in sw.get('modes', {}):
+                    break
+                tops = {j: (o.best_entry[1], o.best_entry[2])
+                        for j, o in enumerate(states)
+                        if j != i and o.best_entry is not None}
+                if not tops or _same_partners(sw['partners'].get('top', {}),
+                                              tops):
+                    break
+                w = blend if blend is not None else {'top': 1.0}
+                r, md = dc.score_member(i, lead[1], lead[2], w, tops=tops,
+                                        peers=sw['partners'].get('peer', {}),
+                                        horizon=horizon)
+                ctx = dict(lead[3])
+                ctx['scored_with'] = {'modes': md,
+                                      'partners': {**sw['partners'],
+                                                   'top': dict(tops)},
+                                      'tuned': sw.get('tuned', False)}
+                new = (float(r), lead[1], lead[2], ctx)
+                st.buffer[0] = new
+                st.hof = [new if h is lead else h for h in st.hof]
+                st.buffer.sort(key=lambda z: z[0], reverse=True)
+                st.hof.sort(key=lambda z: z[0], reverse=True)
+                out.append((i, lead[0], new[0]))
+                changed = True
+            if st.buffer:
+                st.best_r, st.best_entry = st.buffer[0][0], st.buffer[0]
+        if not changed:
+            break
+    return out
+
+
 def _trial_lines(entry, dof, horizon, cache, indent=10):
     """DOF ``dof``'s best equation scored trial by trial, simulated alone --
     which trials hold its score down -- and the weight ``trial_decay`` gives
@@ -629,12 +694,9 @@ def DISCOVER_TRAIN(
     if seed_list:
         from discover_seed import seed_entries, SEED_DEGREE
         t1 = time.time()
+        h0 = dc.get_traj_horizon(0, n_epochs, system.t_end)
         seeds = seed_entries(system, max_terms, max_term_len, term_grammar,
-                             dc.get_traj_horizon(0, n_epochs, system.t_end),
-                             pool)
-        print(f"[seed] sparse fits over every monomial up to degree "
-              f"{SEED_DEGREE} and the single-variable powers, scored with "
-              f"this run's reward ({time.time() - t1:.1f}s):")
+                             h0, pool)
         for i, st in enumerate(states):
             seen = set()
             for e in seeds[i]:
@@ -642,9 +704,43 @@ def DISCOVER_TRAIN(
                 if key not in seen:
                     seen.add(key)
                     st.buffer.append(e)
+            if st.buffer:
+                st.best_r, st.best_entry = st.buffer[0][0], st.buffer[0]
+        how = "scored with this run's reward"
+        if coupled and f_top > 0.0:
+            # scored as this run scores its candidates: with the other DOFs'
+            # top equations, here their best seeds
+            w0 = ({'alone': 1.0 - f_top - f_peer, 'top': f_top,
+                   'peer': f_peer} if sim_coupling_mode == 'blend'
+                  else {'top': 1.0})
+            for i, st in enumerate(states):
+                tops = {j: (o.best_entry[1], o.best_entry[2])
+                        for j, o in enumerate(states)
+                        if j != i and o.best_entry is not None}
+                if not tops or not st.buffer:
+                    continue
+                again = []
+                for e in st.buffer:
+                    r, md = dc.score_member(i, e[1], e[2], w0, tops=tops,
+                                            horizon=h0)
+                    ctx = dict(e[3])
+                    ctx['scored_with'] = {
+                        'modes': md,
+                        'partners': {m_: (dict(tops) if m_ == 'top' else {})
+                                     for m_ in md},
+                        'tuned': False}
+                    again.append((float(r), e[1], e[2], ctx))
+                st.buffer = sorted(again, key=lambda z: z[0], reverse=True)
+                st.best_r, st.best_entry = st.buffer[0][0], st.buffer[0]
+            refresh_partners(states, w0 if sim_coupling_mode == 'blend'
+                             else None, h0)
+            how += ", with the other DOFs' best seeds as partners"
+        print(f"[seed] sparse fits over every monomial up to degree "
+              f"{SEED_DEGREE} and the single-variable powers, {how} "
+              f"({time.time() - t1:.1f}s):")
+        for i, st in enumerate(states):
             if not st.buffer:
                 print(f"  DOF {i}: none"); continue
-            st.best_r, st.best_entry = st.buffer[0][0], st.buffer[0]
             st.hof = list(st.buffer[:HOF_SIZE])
             be = st.best_entry
             print(f"  DOF {i}: {len(st.buffer)} equations, best "
@@ -921,6 +1017,17 @@ def DISCOVER_TRAIN(
             print(f"  DOF {i}: best={best_raw:.4f}  +{n_added} "
                   f"buf={len(st.buffer)}{t_str}{c_str}")
         print(f"  [3-train]    ({time.time()-t1:.2f}s)", flush=True)
+
+        if coupled and f_top > 0.0:
+            # a best scored with the other DOFs' tops is stale once their best
+            # changes: re-score it with the current ones
+            t2 = time.time()
+            for i, r_old, r_new in refresh_partners(
+                    states, blend if sim_coupling_mode == 'blend' else None,
+                    horizon):
+                print(f"  [3b-partners] DOF {i}: best re-scored with the other "
+                      f"DOFs' current best: {r_old:.4f} -> {r_new:.4f}")
+            print(f"  [3b-partners] ({time.time() - t2:.2f}s)", flush=True)
 
         # ── epoch report ────────────────────────────────────────────────────
         print(f"\n  [EPOCH TOTAL]  {time.time() - t0_ep:.1f}s")

@@ -1953,6 +1953,83 @@ def test_seed_list():
         dc._SIM_DATA.clear()
 
 
+def test_partner_refresh():
+    """Scored with the other DOFs' top equations, each DOF's best is re-scored
+    whenever their best changes, so the pair reported as best is the pair
+    that was simulated: under ``sim_coupling=(1, 0)``, ``'blend'``, each
+    best's training score is its score simulated together with the others'
+    bests."""
+    import contextlib
+    import io
+
+    from discover_data import build_truth_system, generate_dataset
+    from discover_mdof_sim import get_mdof_system
+    import discover_train as dt
+
+    print("\npartner refresh")
+    saved = (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+             dc.MAX_TRAJ, dc.W_ACC, dc.REWARD_MODE, dc.SIM_WINDOW,
+             dc.SIM_WEIGHTS, dc.TRIAL_DECAY)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            system = build_truth_system(get_mdof_system('coupled_beats'),
+                                        n_traj=2, n_pts=3300)
+        w = (0.2, 0.2, 0.2, 0.4)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            best = dt.DISCOVER_TRAIN(
+                system, n_epochs=3, batch_size=4, max_len=12, C=1,
+                use_pool=False, reward='simulation', sim_window='auto',
+                sim_weights=w, sim_coupling=(1.0, 0.0),
+                sim_coupling_mode='blend', n_layers=1, d_model=16,
+                max_terms=3, max_term_len=4, seed=0, seed_list=True)
+        log = buf.getvalue()
+        fresh = all(dt._same_partners(
+            b[3]['scored_with']['partners']['top'],
+            {j: (o[1], o[2]) for j, o in enumerate(best) if j != d})
+            for d, b in enumerate(best))
+        tog = dc.coupled_simulation_rewards(
+            [(b[1], b[2]) for b in best], [0, 1],
+            horizon=dc.get_traj_horizon(2, 3, system.t_end))
+        check("each best was scored with the others' current best, and its "
+              "training score is the pair's score together",
+              '[3b-partners]' in log and fresh
+              and all(abs(tog[d] - b[0]) < 1e-9 for d, b in enumerate(best)),
+              f"trained {[round(b[0], 6) for b in best]}, together "
+              f"{[round(tog[d], 6) for d in (0, 1)]}")
+
+        # a stale leader: scored with a partner that is no longer the best
+        st = [dt.DOFState(12, 'cpu') for _ in range(2)]
+        for d in (0, 1):
+            st[d].buffer = [best[d]]
+            st[d].best_entry, st[d].best_r = best[d], best[d][0]
+            st[d].hof = [best[d]]
+        old = st[1].buffer[0]
+        ctx = dict(old[3])
+        ctx['scored_with'] = dict(ctx['scored_with'])
+        ctx['scored_with']['partners'] = {'top': {0: (best[0][1],
+                                                      [0.0] * len(best[0][2]))}}
+        st[1].buffer[0] = st[1].best_entry = (0.99, old[1], old[2], ctx)
+        st[1].best_r = 0.99
+        st[1].hof = [st[1].buffer[0]]
+        done = dt.refresh_partners(st, {'top': 1.0}, dc.get_traj_horizon(
+            2, 3, system.t_end))
+        check("a best scored with an old partner is re-scored with the "
+              "current one; a fresh one is left alone",
+              [d for d, _a, _b in done] == [1]
+              and abs(st[1].best_r - tog[1]) < 1e-9
+              and st[1].hof[0] is st[1].buffer[0]
+              and st[0].best_entry is best[0],
+              f"{done}")
+    finally:
+        dc.configure_grammar(N_DOF)
+        (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+         dc.MAX_TRAJ, dc.W_ACC) = saved[:5]
+        dc.set_reward(*saved[5:])
+        dc._SIM_DATA.clear()
+        dc._TF_DATA.clear()
+
+
 def test_scoring_pool():
     """The scoring pool (:func:`discover_core.make_pool`).
 
@@ -2037,6 +2114,7 @@ def main():
     test_derived_channels()
     test_diagnose_trials()
     test_seed_list()
+    test_partner_refresh()
     test_scoring_pool()
 
     print(f"\n{'=' * 60}")

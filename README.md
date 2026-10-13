@@ -203,6 +203,16 @@ Each epoch prints the best reward per mode, and the end of the run prints the
 best equations simulated together. The true `coupled_duffing` equations score
 above 0.999 in all three modes.
 
+A score earned with the other DOFs' top equations goes stale when their best
+changes: a DOF's best could carry 0.69 from a partner long replaced and score
+0.56 with the current one. So after each epoch every DOF's best that was scored
+with tops is re-scored with the other DOFs' current bests, the ways it was
+scored, until each best was scored with the others' current bests
+(`refresh_partners`, printed as `[3b-partners]`). Under `sim_coupling=(1, 0)`
+with `'blend'`, each best's training score is then exactly its score simulated
+together with the others' bests. Seeds (`seed_list=True`) are scored the same
+way in a coupled run, with the other DOFs' best seeds as partners.
+
 `sim_coupling_mode` says how the fractions apply:
 
 | `sim_coupling_mode` | each equation is | its reward |
