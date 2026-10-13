@@ -1763,8 +1763,8 @@ def coupled_simulation_rewards(exprs, score, max_traj=None, horizon=None):
     equation driven by the others' SIMULATED states; a DOF without one is read
     off the record.  Each scored DOF gets ``r = 1 / (1 + mean over trials)``
     of its own channel's residual, weighted as in :func:`simulation_reward`,
-    except that a trial where the set blew up charges every DOF the worst
-    residual in it (:func:`discover_rollout.rollout_set_residuals`).  A scored
+    except that a trial where the set blew up scores every DOF in it 0
+    (:func:`discover_rollout.rollout_set_residuals`).  A scored
     DOF whose expression does not compile gets 0 and the rest are integrated
     without it.
     """
@@ -2663,7 +2663,7 @@ def coupled_worker(args):
     Each member's constants are fitted exactly as in :func:`energy_worker` --
     to its own DOF's balance on the measured states -- so only the scoring
     differs.  In a coupled mode each member is scored on its own channel, and
-    a set that blows up charges every equation in it
+    a set that blows up scores every equation in it 0
     (:func:`coupled_simulation_rewards`).  Returns a list aligned with
     ``members`` of ``(dof, reward, tau, consts, {mode: reward},
     {mode: {dof: (tau, consts)}})`` -- the reward the weighted mean over

@@ -137,8 +137,12 @@ other DOFs' states are interpolated linearly between samples at each stage.
 
 A window whose state leaves ``blowup`` times the largest measured magnitude of
 its own channel, or goes non-finite, is frozen at its last in-bound state for
-the rest of the window.  A diverging equation therefore scores a large but
-finite residual -- larger the earlier it diverges -- instead of a NaN.
+the rest of the window, so the arrays stay finite for plotting.  The trial is
+not scored on them: a run that leaves its bounds anywhere in a trial -- a
+window or the free run -- is no model of that trial, and its residual there
+is infinite, so the reward is 0 (:func:`rollout_set_residuals`).  Charged a
+large but finite residual instead, a pair that diverged late in one trial
+still scored 0.36 with its partner, and then blew up in the plot scripts.
 """
 
 from __future__ import annotations
@@ -269,6 +273,9 @@ def combine_trials(res, decay=1.0):
         return float(np.mean(r))
     if r.ndim > 1:
         r = r.reshape(-1, r.shape[-1]).mean(axis=0)
+    if not np.all(np.isfinite(r)):
+        # a zero weight times inf would make an infinite residual NaN
+        return float('nan') if np.isnan(r).any() else float('inf')
     w = float(decay) ** np.arange(r.size)
     return float(np.dot(w, np.sort(r)[::-1]) / w.sum())
 
@@ -893,10 +900,10 @@ def rollout_residuals(accel, t, states, dof, window=None, stride=1, substeps=1,
     both at the same ``stride``; each is needed only when its weight is
     positive.  With a ``window`` the NRMSEs are taken over the restarted
     windows and ``R_tf`` and ``R_f`` over a free run of their own -- an
-    envelope or a spectrum needs the whole record in one piece.  The
-    simulated acceleration of a window that blew up is clipped at ``blowup``
-    times the largest measured one, so it too scores large but finite.  See
-    :func:`rollout` for the other arguments.
+    envelope or a spectrum needs the whole record in one piece.  A trial in
+    which the run leaves its bounds scores ``inf`` (see
+    :func:`rollout_set_residuals`).  See :func:`rollout` for the other
+    arguments.
     """
     return rollout_set_residuals({dof: accel}, t, states, window, stride,
                                  substeps, weights, accs,
@@ -912,11 +919,11 @@ def rollout_set_residuals(accels, t, states, window=None, stride=1, substeps=1,
     ``accels``).
 
     Each is the DOF's own channel residual, exactly as
-    :func:`rollout_residuals` computes it -- except in a trial where the
-    coupled run blew up.  There every DOF of the set is charged the largest
-    residual among them: once the set diverges no equation in it can be said
-    to work, and one whose own channel happened to be in bounds when the
-    window froze would otherwise score as if it had been fine.  ``tfs`` and
+    :func:`rollout_residuals` computes it -- except in a trial where the run
+    left its bounds, in a window or in the free run.  There every DOF of the
+    set scores ``inf``: once the set diverges no equation in it can be said to
+    work, one whose own channel happened to be in bounds included, and an
+    equation that diverges is not a model however late it goes.  ``tfs`` and
     ``specs`` map every integrated DOF to its :func:`tf_setup` and
     :func:`spec_setup`; each is needed only when its weight is positive.  The
     other arguments are as in :func:`rollout_residuals`.
@@ -981,11 +988,5 @@ def rollout_set_residuals(accels, t, states, window=None, stride=1, substeps=1,
             out[p] = res
         return out
 
-    shared = len(dofs) > 1 and blown.any()
-    # the unscored DOFs' channels matter only for charging a blow-up
-    res = {d: channel(k, d) for k, d in enumerate(dofs)
-           if shared or d in score}
-    if shared:
-        worst = np.max(np.stack([res[d] for d in dofs]), axis=0)
-        return {d: np.where(blown, worst, res[d]) for d in score}
-    return {d: res[d] for d in score}
+    return {d: np.where(blown, np.inf, channel(k, d))
+            for k, d in enumerate(dofs) if d in score}

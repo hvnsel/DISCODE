@@ -197,11 +197,21 @@ driven by the others' *simulated* states:
 - the rest are simulated alone, as above.
 
 Constants are fitted the same way in every mode. Each equation is scored on its
-own channel, but a coupled run that blows up charges every equation in it the
-worst residual in the set, because once the set diverges none of them works.
+own channel, but a coupled run that blows up scores every equation in it 0,
+because once the set diverges none of them works.
 Each epoch prints the best reward per mode, and the end of the run prints the
 best equations simulated together. The true `coupled_duffing` equations score
 above 0.999 in all three modes.
+
+A score earned with the other DOFs' top equations goes stale when their best
+changes: a DOF's best could carry 0.69 from a partner long replaced and score
+0.56 with the current one. So after each epoch every DOF's best that was scored
+with tops is re-scored with the other DOFs' current bests, the ways it was
+scored, until each best was scored with the others' current bests
+(`refresh_partners`, printed as `[3b-partners]`). Under `sim_coupling=(1, 0)`
+with `'blend'`, each best's training score is then exactly its score simulated
+together with the others' bests. Seeds (`seed_list=True`) are scored the same
+way in a coupled run, with the other DOFs' best seeds as partners.
 
 `sim_coupling_mode` says how the fractions apply:
 
@@ -241,8 +251,11 @@ same proportions as `(0.2, 0.2, 0.2, 0.4)`, roughly.
 The integrator is RK4 on the record's own samples. The step is sized from the
 data: at least 50 steps per cycle of the fastest measured motion, so an
 oversampled simulated record is stepped every few samples and a coarse one gets
-substeps. An equation that diverges is frozen at 10× the largest measured
-amplitude and scores a large but finite residual.
+substeps. A run that leaves 10× the largest measured amplitude anywhere in a
+trial, alone or with partners, scores 0: an equation that diverges is not a
+model of the record, however late it goes. (It used to be frozen there and
+charged a large but finite residual, which let a pair that diverged late in
+one trial score 0.36 together and then blow up in the plot scripts.)
 
 **The time-frequency term (`w_tf`)** is for beats and anything else that lives in
 how an oscillation's amplitude evolves. Point-by-point NRMSE is phase-sensitive:
@@ -369,7 +382,9 @@ the other DOF was not simulated: wherever the equation uses its displacement
 or velocity, it got the measured data. Each
 epoch then also prints the best equations simulated TOGETHER, every DOF driven
 by the others' simulated motion as the plot scripts run them, next to their
-training scores (computed once per new pair of bests). Under each best is its
+training scores (computed once per new pair of bests), and that pair at full
+precision as a `DISCOVERED_EXPRS` block: paste that into a plot script, not the
+four-figure lines, which can simulate differently. Under each best is its
 score trial by trial, simulated alone as it was scored, and how much the
 worst-fit trial counts under the run's `trial_decay`: a DOF held down by one
 or two trials shows it there.
