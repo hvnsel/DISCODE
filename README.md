@@ -359,11 +359,15 @@ dies a band that goes dark) and the velocity spectrum, measured and — given
 equations — simulated, with every residual term per trial. Every best equation
 printed each epoch, and in the final summary, says what the other DOFs did
 while it earned its score: per mode, each other DOF's equation in physical
-units — even when that is the other DOF's own best — or, scored alone, "no
-equation": that DOF's measured motion was played back from the record. Each
+units — even when that is the other DOF's own best — or, scored alone, that
+the other DOF was not simulated: wherever the equation uses its displacement
+or velocity, it got the measured data. Each
 epoch then also prints the best equations simulated TOGETHER, every DOF driven
 by the others' simulated motion as the plot scripts run them, next to their
-training scores (computed once per new pair of bests).
+training scores (computed once per new pair of bests). Under each best is its
+score trial by trial, simulated alone as it was scored, and how much the
+worst-fit trial counts under the run's `trial_decay`: a DOF held down by one
+or two trials shows it there.
 
 To score pasted equations with it afterwards, set `REWARD = 'simulation'` (and
 the same `SIM_WINDOW` / `SIM_WEIGHTS`) in `discover_score.py`; `SIM_COUPLED = True`

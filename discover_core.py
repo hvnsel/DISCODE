@@ -1711,21 +1711,47 @@ def simulation_reward(exprs, max_traj=None, horizon=None):
 
     per_dof = []
     for d in present:
-        accel = _accel_fn(d, exprs[d])
-        if accel is None:
-            return 0.0
-        tf = (_tf_setup(max_traj, horizon, d, data)
-              if SIM_WEIGHTS[3] > 0.0 else None)
-        spec = (_spec_setup(max_traj, horizon, d, data)
-                if SIM_WEIGHTS[4] > 0.0 else None)
-        res = _ro.rollout_residuals(accel, t, states, d,
-                                    window=_window(data, d), stride=stride,
-                                    substeps=substeps, weights=SIM_WEIGHTS,
-                                    accs=accs, tf=tf, spec=spec)
-        if not np.all(np.isfinite(res)):
+        res = _alone_residuals(d, exprs[d], data, max_traj, horizon)
+        if res is None or not np.all(np.isfinite(res)):
             return 0.0
         per_dof.append(res)
     return 1.0 / (1.0 + _ro.combine_trials(per_dof, TRIAL_DECAY))
+
+
+def _alone_residuals(d, expr, data, max_traj, horizon):
+    """Per-trial simulation residuals of DOF ``d``'s ``(tau, consts)``
+    simulated alone (the other DOFs read off the record); None if it does not
+    compile."""
+    t, states, accs, stride, substeps = data
+    accel = _accel_fn(d, expr)
+    if accel is None:
+        return None
+    tf = (_tf_setup(max_traj, horizon, d, data)
+          if SIM_WEIGHTS[3] > 0.0 else None)
+    spec = (_spec_setup(max_traj, horizon, d, data)
+            if SIM_WEIGHTS[4] > 0.0 else None)
+    return _ro.rollout_residuals(accel, t, states, d,
+                                 window=_window(data, d), stride=stride,
+                                 substeps=substeps, weights=SIM_WEIGHTS,
+                                 accs=accs, tf=tf, spec=spec)
+
+
+def simulation_trial_rewards(expr, dof, max_traj=None, horizon=None):
+    """DOF ``dof``'s ``(tau, consts)`` simulated alone, scored trial by trial
+    as :func:`simulation_reward` scores it before it combines the trials:
+    ``1 / (1 + residual)`` per trial, or None if it cannot be scored.
+    Combining the residuals with :func:`discover_rollout.combine_trials`
+    gives :func:`simulation_reward`'s value back."""
+    if NORM_STATS is None or not RAW_TRAJECTORIES:
+        return None
+    data = _sim_data(max_traj, horizon)
+    if data is None or (SIM_WEIGHTS[2] > 0.0 and data[2] is None):
+        return None
+    res = _alone_residuals(dof, expr, data, max_traj, horizon)
+    if res is None:
+        return None
+    res = np.asarray(res, dtype=float)
+    return np.where(np.isfinite(res), 1.0 / (1.0 + res), 0.0)
 
 
 def coupled_simulation_rewards(exprs, score, max_traj=None, horizon=None):
