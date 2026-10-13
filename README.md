@@ -356,10 +356,13 @@ term. `discover_inspect.py` prints the same for any record and plots one trial:
 per DOF the wavelet map (a beat is a band that swells and fades, a mode that
 dies a band that goes dark) and the velocity spectrum, measured and — given
 equations — simulated, with every residual term per trial. Every best equation
-printed each epoch, and in the final summary, comes
-with the equations it was simulated with to earn its score — per mode, each
-other DOF's equation in physical units, or "the measured record" — even when
-that is the other DOF's own best.
+printed each epoch, and in the final summary, says what the other DOFs did
+while it earned its score: per mode, each other DOF's equation in physical
+units — even when that is the other DOF's own best — or, scored alone, "no
+equation": that DOF's measured motion was played back from the record. Each
+epoch then also prints the best equations simulated TOGETHER, every DOF driven
+by the others' simulated motion as the plot scripts run them, next to their
+training scores (computed once per new pair of bests).
 
 To score pasted equations with it afterwards, set `REWARD = 'simulation'` (and
 the same `SIM_WINDOW` / `SIM_WEIGHTS`) in `discover_score.py`; `SIM_COUPLED = True`

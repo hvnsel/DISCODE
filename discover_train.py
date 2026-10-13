@@ -238,9 +238,11 @@ _MODE_LABEL = {'alone': 'alone', 'top': 'with top', 'peer': 'with peers'}
 
 
 def _scored_with(entry, dof, n_dof, indent=10):
-    """Lines naming what DOF ``dof``'s equation was simulated with to earn its
-    score: per mode, every other DOF's equation in physical units -- printed
-    even when it is that DOF's current best -- or the measured record."""
+    """Lines naming what the other DOFs did while DOF ``dof``'s equation was
+    simulated to earn its score: per mode, each other DOF's equation in
+    physical units -- printed even when it is that DOF's current best -- or,
+    scored alone, that no equation was involved: the other DOF's measured
+    motion was played back from the record."""
     sw = entry[3].get('scored_with') if isinstance(entry[3], dict) else None
     if not sw:
         return []
@@ -249,18 +251,42 @@ def _scored_with(entry, dof, n_dof, indent=10):
         if m not in sw['modes']:
             continue
         partners = sw['partners'].get(m, {})
-        lines.append(f"{pad}scored {_MODE_LABEL[m]} ({sw['modes'][m]:.4f}), "
-                     f"simulated with:")
+        lines.append(f"{pad}scored {_MODE_LABEL[m]} ({sw['modes'][m]:.4f}):")
         for j in range(n_dof):
             if j == dof:
                 continue
             e = partners.get(j)
-            what = ('the measured record' if e is None else
-                    dc.denormalize_expr(e[0], e[1], j)
-                    or dc.expr_to_str(e[0], e[1]))
-            lines.append(f"{pad}  DOF {j}: {what}")
+            if e is None:
+                lines.append(f"{pad}  DOF {j}: no equation -- its measured "
+                             f"motion was played back from the record")
+            else:
+                eq = (dc.denormalize_expr(e[0], e[1], j)
+                      or dc.expr_to_str(e[0], e[1]))
+                lines.append(f"{pad}  DOF {j} simulated alongside with: {eq}")
     if sw.get('tuned'):
         lines.append(f"{pad}(amplitudes tuned on the simulation)")
+    return lines
+
+
+def _together_lines(states, horizon, cache):
+    """Each DOF's best equation simulated TOGETHER with the other DOFs' best
+    equations -- every DOF driven by the others' simulated motion, as the plot
+    scripts run them -- next to its training score.  ``cache`` holds the last
+    pair scored, so an epoch whose bests did not change costs nothing."""
+    bests = [st.best_entry for st in states]
+    if len(bests) < 2 or any(b is None for b in bests):
+        return []
+    key = tuple((tuple(b[1]), tuple(np.round(b[2], 12))) for b in bests)
+    if cache.get('key') != key:
+        cache['key'] = key
+        cache['r'] = dc.coupled_simulation_rewards(
+            [(b[1], b[2]) for b in bests], list(range(len(bests))),
+            horizon=horizon)
+    lines = ["   The best equations above, simulated TOGETHER (each DOF driven "
+             "by the others' simulated motion, as the plot scripts run them):"]
+    for i, b in enumerate(bests):
+        lines.append(f"     DOF {i}: {cache['r'][i]:.4f}   (its training "
+                     f"score {b[0]:.4f})")
     return lines
 
 
@@ -545,6 +571,7 @@ def DISCOVER_TRAIN(
     print(f"[policy] {ps.n_params():,} trainable parameters  "
           f"(critic max_len={max_len})\n")
 
+    together_cache = {}
     for ep in range(n_epochs):
         t0_ep   = time.time()
         horizon = dc.get_traj_horizon(ep, n_epochs, system.t_end)
@@ -820,6 +847,9 @@ def DISCOVER_TRAIN(
             if d:
                 print(f"          denorm: {d}")
             for line in _scored_with(be, i, N):
+                print(line)
+        if reward == 'simulation':
+            for line in _together_lines(states, horizon, together_cache):
                 print(line)
 
     # ── Final summary ───────────────────────────────────────────────────────
