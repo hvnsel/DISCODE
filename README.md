@@ -22,6 +22,7 @@ committed for the others. See [Policy architecture](#policy-architecture).
 | `discover_policy_test.py` | correctness invariants for the above — run it before anything long |
 | `discover_data.py` | everything that produces a `SystemData`: `.mat` loading (velocity and acceleration derived from the displacement by default), truth simulation, dataset prep, ceiling + truth-reward diagnostics |
 | `discover_train.py` | `DISCOVER_TRAIN(system_data, ...)` — the one N-DOF training loop |
+| `discover_seed.py` | sparse regression over the monomials up to cubic (the diagnostic's list) and the single-variable powers: the warm start `seed_list=True` gives training |
 | `discover_analysis.py` | post-hoc: expression parsing, forward simulation, energy residual, comparison plots |
 
 **Drivers** — what you open and run:
@@ -41,7 +42,7 @@ committed for the others. See [Policy architecture](#policy-architecture).
 | `discover_plot_sim.py` | forward-simulates discovered equations vs simulated truth |
 | `discover_plot_exp.py` | forward-simulates discovered equations vs the experimental record |
 | `discover_inspect.py` | one trial as the simulation reward sees it: per DOF the wavelet map and velocity spectrum, measured and (with equations) simulated, plus the sampling, windows and per-term residuals |
-| `discover_diagnose.py` | is it the data, the setup or the search? Checks that the channels agree and how finely each DOF is sampled, finds the best equations the search space holds by sparse regression, scores them with the run's reward, and puts your run's equations next to them ([below](#data-setup-or-search-discover_diagnosepy)) |
+| `discover_diagnose.py` | is it the data, the setup or the search? Checks that the channels agree and how finely each DOF is sampled, finds the best polynomial equations by sparse regression, scores them with the run's reward, and puts your run's equations next to them ([below](#data-setup-or-search-discover_diagnosepy)) |
 
 All five handle any number of DOFs.
 
@@ -371,9 +372,12 @@ scores them integrated together instead.
 ## Data, setup or search? (`discover_diagnose.py`)
 
 When a run stalls, the record, the reward settings and the search itself can
-all be at fault. With integer powers up to 3, every candidate the search can
-write is a weighted sum of a fixed list of monomials (34 for two DOFs, plus a
-constant), so the best it could find can be computed without training:
+all be at fault. Every equation the grammar writes with `add`, `mul` and
+`intpower` up to cubic is a weighted sum of a fixed list of monomials (34 for
+two DOFs, plus a constant), so the best polynomial can be computed without
+training. The grammar holds more than the list (`power` with a fitted real
+exponent, for friction, drag and contact; products above cubic; directional
+leaves), so this is the polynomials' best, not the search's ceiling:
 
 1. **The data.** Per DOF, the samples per cycle of its fastest motion, and at
    its main spectral peaks the gain and phase of velocity against d/dt
@@ -381,7 +385,7 @@ constant), so the best it could find can be computed without training:
    0°), on the file's own channels whatever `CHANNELS` the run uses. These
    come from cross-spectra, so no numerical derivative enters. Beyond 5% or
    5°, or under 10 samples per cycle, it is flagged.
-2. **The search space's best.** Sparse regression on the monomials
+2. **The polynomials' best.** Sparse regression on the monomials
    (SINDy-style thresholded least squares) gives the best equation of each
    size up to `MAX_TERMS` (the run's `max_terms`). Each is simulated and
    scored with the run's `SIM_WINDOW`, `SIM_WEIGHTS` and `TRIAL_DECAY`, and
@@ -400,8 +404,8 @@ constant), so the best it could find can be computed without training:
 
 | it prints | which means |
 |---|---|
-| the list's best simulates clearly better than your run's (by 0.1+) | the space holds a better equation and the search does not find it: settings or method |
-| the list's best is poor too (under 0.5) | no equation of this form simulates the record: the data, or physics the measured states do not hold (forcing, friction, an unmeasured mode) |
+| the list's best simulates clearly better than your run's (by 0.1+) | the grammar holds a better equation and the search does not find it: settings or method |
+| the list's best is poor too (under 0.5) | no polynomial simulates the record: the data, or physics outside the list: friction or contact (which `power` writes, and `seed_list` seeds), forcing or an unmeasured mode (which nothing here can) |
 | (`CHANNELS='measured'`) fitted to d/dt velocity the list simulates clearly better than fitted to the acceleration | the acceleration channel is biased, and the constant fit leans on it, so the constants come out wrong before the search starts |
 | a channel or sampling flag | fix the data first |
 | a trial fits clearly better on its own than with the all-trials equation (by 0.2+) | the trials need different constants or terms: the dynamics change between trials (amplitude-dependent behaviour outside the list, or trials run under different conditions); the constants table shows which |
@@ -415,7 +419,7 @@ Checked on four stand-ins, 15–60 s each:
   list simulates at 0.04–0.06; fitted to d/dt velocity, it recovers `-4.402*x -
   0.02999*xdot + 0.4000*y` (truth `-4.4*x - 0.03*xdot + 0.4*y`) at 0.85.
 - **An unmeasured third mass** driving q2: q1 recovered exactly at 0.999; q2's
-  best is 0.45, reported as nothing in the space doing well.
+  best is 0.45, reported as no polynomial doing well.
 - **20 Hz and 6.5 Hz modes sampled at 102 Hz** (noise-free): flagged at 5
   samples per cycle, and still recovered within 7% on every coefficient, 0.99
   for each DOF simulated together.
@@ -433,6 +437,40 @@ The trial-by-trial check on 1-DOF stand-ins: three trials with stiffness 40,
 the constants table reads 40, 46, 52; three trials of one equation score 1.00
 both ways. On the high-pass stand-in the trials agree, their linear constants
 within 1% of each other.
+
+## Starting from sparse regression (`seed_list=True`)
+
+`DISCOVER_TRAIN(seed_list=True)` starts the search from equations instead of
+from nothing. Before the first epoch, sparse regression (`discover_seed.py`)
+gives each DOF's best equation of every size, twice: over every monomial of
+the states up to cubic (the list `discover_diagnose.py` searches), and over
+those plus the single-variable `power` terms at the points of its exponent
+grid: sgn(x) (dry friction), |x|, |x|^1.5 both ways (contact), x|x|
+(quadratic drag) and |x|^3. Each is written as a term bag, scored with the
+run's own reward (its constants and exponents fitted exactly as a sampled
+candidate's are) and put in that DOF's buffer, so the policy learns from
+them from its first update. The start-up report prints what they score:
+
+```
+[seed] sparse fits over every monomial up to degree 3 and the single-variable powers, scored with this run's reward (13.5s):
+  DOF 0: 8 equations, best 0.xxxx (8 terms): q1ddot = ...
+          the others: ...
+```
+
+The seeds are what a linear fit reaches, not the grammar's ceiling: `power`
+exponents off the grid, products of powers, monomials above cubic and
+directional leaves are left to the search, so a run can climb above them.
+On a simulated two-DOF record with a cubic coupling on q1 and quadratic drag
+on q2, the seeds include both true structures, the drag as `power(q2dot)`,
+and a one-epoch run starts at 0.993 and 0.997. On the NOhit-sized high-pass
+stand-in, seeding takes 13.5 s with three workers and starts the DOFs at
+0.815 and 0.956 (0.765 and 0.956 from the monomials alone).
+
+A power over a directional leaf, `(a*q1 + b*q2)**3`, costs about 6× a plain
+monomial to score (1.6 s against 0.28 s per candidate on a NOhit-sized
+record): its inner weights go to the nonlinear optimiser, where the same
+physics written as monomials fits in closed form. `directional_leaves=False`
+in `DISCOVER_TRAIN` leaves them out of the grammar.
 
 ## Policy architecture
 

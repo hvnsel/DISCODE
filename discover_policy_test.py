@@ -1835,6 +1835,100 @@ def test_diagnose_trials():
           f"alone {np.round(s['own'], 3)}, all-trials {np.round(s['shared'], 3)}")
 
 
+def test_seed_list():
+    """``DISCOVER_TRAIN(seed_list=True)``: the list's terms are written as the
+    grammar's term bags, sparse regression's bags include the truth's -- a
+    drag term, a ``power``, among them -- and a seeded run starts from the
+    true structures, scored by the run's own reward, and never falls below
+    them."""
+    import contextlib
+    import io
+
+    from scipy.integrate import solve_ivp
+
+    from discover_data import SystemData
+    import discover_seed as ds
+    import discover_train as dt
+
+    print("\nseed list")
+    check('monomials become the grammar\'s term bags',
+          ds.monomial_term((0, 1, 0, 0)) == ['x2']
+          and ds.monomial_term((0, 0, 3, 0)) == ['intpower', 'x3']
+          and ds.monomial_term((1, 0, 2, 0)) == ['mul', 'x1', 'intpower', 'x3',
+                                                 'end']
+          and ds.monomial_term((0, 0, 0, 0)) == ['const'])
+    z = np.linspace(-2.0, 2.0, 9)
+    cols = ds.power_columns(1)
+    check('the power terms are the parts of power(x) no monomial is: '
+          'sgn x, |x|, |x|^1.5 both ways, x|x|, |x|^3',
+          cols == [(0, 0.0, True), (0, 1.0, False), (0, 1.5, False),
+                   (0, 1.5, True), (0, 2.0, True), (0, 3.0, False)]
+          and np.allclose(ds.power_theta(z[:, None], cols),
+                          np.stack([np.sign(z), np.abs(z), np.abs(z) ** 1.5,
+                                    np.sign(z) * np.abs(z) ** 1.5,
+                                    z * np.abs(z), np.abs(z) ** 3], axis=1)))
+
+    def rhs(_t, s):
+        q1, v1, q2, v2 = s
+        return [v1, -40.0 * q1 - 0.1 * v1 + 5.0 * q2 + 30.0 * q2 ** 3,
+                v2, 5.0 * q1 - 30.0 * q2 - 0.5 * v2 * abs(v2)]
+    t = np.linspace(0.0, 8.0, 801)
+    disp, vel, acc = [], [], []
+    for ic in ([0.5, 0.0, 0.0, 0.0], [0.0, 0.0, 0.6, 0.0]):
+        S = solve_ivp(rhs, (0, t[-1]), ic, t_eval=t, rtol=1e-10, atol=1e-12).y
+        A = np.array([rhs(0, S[:, i]) for i in range(S.shape[1])]).T
+        disp.append(S[[0, 2]].T)
+        vel.append(S[[1, 3]].T)
+        acc.append(A[[1, 3]].T)
+    sy = SystemData('seed', np.stack(acc, 2), np.stack(vel, 2),
+                    np.stack(disp, 2), t, var_names=['q1', 'q2'])
+    truth = [{('x1',), ('x2',), ('x3',), ('intpower', 'x3')},
+             {('x1',), ('x3',), ('power', 'x4')}]
+
+    def structure(tau):
+        return {tuple(term) for term in dc.split_terms(tau)}
+
+    saved = (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+             dc.MAX_TRAJ, dc.W_ACC, dc.REWARD_MODE, dc.SIM_WINDOW,
+             dc.SIM_WEIGHTS, dc.TRIAL_DECAY)
+    try:
+        dc.configure_grammar(2, ['q1', 'q2'], False, False)
+        bags = ds.seed_bags(sy, max_terms=6, max_term_len=5)
+        found = [any(structure(tau) == truth[d] for tau in bags[d])
+                 for d in range(2)]
+        check("sparse regression's bags include each DOF's true structure, "
+              "the drag's power(q2dot) included",
+              all(found), f"{[len(b) for b in bags]} bags per DOF")
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            best = dt.DISCOVER_TRAIN(
+                sy, n_epochs=1, batch_size=4, max_len=24, C=1, use_pool=False,
+                reward='simulation', sim_window='auto',
+                sim_weights=(0.2, 0.2, 0.2, 0.4), max_terms=6, max_term_len=5,
+                n_layers=1, d_model=16, seed=0, seed_list=True,
+                directional_leaves=False)
+        log = buf.getvalue()
+        seeds = ds.seed_entries(sy, 6, 5, 'free',
+                                dc.get_traj_horizon(0, 1, sy.t_end))
+        truth_r = [max((e[0] for e in seeds[d] if structure(e[1]) == truth[d]),
+                       default=0.0) for d in range(2)]
+        check('a seeded run starts from the true structures, scored ~1 by its '
+              'own reward, and never falls below its best seed',
+              '[seed]' in log and min(truth_r) > 0.99
+              and all(b is not None and b[0] >= s[0][0] - 1e-9
+                      for b, s in zip(best, seeds)),
+              f"truth seeds {[round(r, 4) for r in truth_r]}, best seeds "
+              f"{[round(s[0][0], 4) for s in seeds]}, run "
+              f"{[round(b[0], 4) for b in best]}")
+    finally:
+        dc.configure_grammar(N_DOF)
+        (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+         dc.MAX_TRAJ, dc.W_ACC) = saved[:5]
+        dc.set_reward(*saved[5:])
+        dc._SIM_DATA.clear()
+
+
 def test_scoring_pool():
     """The scoring pool (:func:`discover_core.make_pool`).
 
@@ -1918,6 +2012,7 @@ def main():
     test_diagnose_tools()
     test_derived_channels()
     test_diagnose_trials()
+    test_seed_list()
     test_scoring_pool()
 
     print(f"\n{'=' * 60}")
