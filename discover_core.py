@@ -2886,8 +2886,13 @@ MAX_GRPO_BATCH = 32
 
 
 # ── Denormalisation to physical units ───────────────────────────────────────
-def denormalize_expr(tau, consts, dof):
-    """Return ``"<accel name> = <physical expression>"`` for DOF ``dof``."""
+PASTE_DIGITS = 12          # significant figures in the paste-ready block
+def denormalize_expr(tau, consts, dof, digits=4):
+    """Return ``"<accel name> = <physical expression>"`` for DOF ``dof``, its
+    constants to ``digits`` significant figures.  Four read well; an equation
+    meant to be pasted and simulated wants :data:`PASTE_DIGITS`, since a
+    sensitive one drifts visibly within a fraction of a second on constants
+    rounded to four."""
     if NORM_STATS is None: return None
     X_mean, X_std, y_mean, y_std = NORM_STATS
     try:
@@ -2905,6 +2910,6 @@ def denormalize_expr(tau, consts, dof):
         sym_expr = sym_expr.subs(subs)
         sym_expr = sp.expand(float(y_mean[dof]) + float(y_std[dof]) * sym_expr)
         accel_name = VAR_NAMES[dof] + 'ddot'
-        return f"{accel_name} = {sp.N(sym_expr, 4)}"
+        return f"{accel_name} = {sp.N(sym_expr, digits)}"
     except Exception as e:
         return f"(denorm failed: {e})"

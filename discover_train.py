@@ -969,13 +969,17 @@ def DISCOVER_TRAIN(
             print(f"  DOF {i}: {r:.6f}   (its training score "
                   f"{best_per_dof[i][0]:.6f})")
 
-    # Paste-ready block for discover_score.py / discover_plot_*.py
+    # Paste-ready block for discover_score.py / discover_plot_*.py, its
+    # constants in full: rounded to the four figures printed above, a
+    # sensitive equation simulates visibly differently within a fraction of a
+    # second.
     print(f"\n{'=' * 64}\nDISCOVERED_EXPRS = [")
     for i, best in enumerate(best_per_dof):
         if best is None:
             print(f'    "",   # DOF {i}: nothing found')
             continue
-        phys = dc.denormalize_expr(best[1], best[2], i) or dc.expr_to_str(best[1], best[2])
+        phys = (dc.denormalize_expr(best[1], best[2], i, dc.PASTE_DIGITS)
+                or dc.expr_to_str(best[1], best[2]))
         print(f'    "{phys}",')
     print("]\n", flush=True)
 

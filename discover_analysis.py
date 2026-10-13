@@ -163,6 +163,10 @@ def build_rhs(cleans, var_names):
     return rhs
 
 
+SIM_RTOL = 1e-10          # forward_simulate's solver tolerances: relative,
+SIM_ATOL = 1e-13          # and absolute (state units -- metres, m/s)
+
+
 def forward_simulate(cleans, var_names, t_eval, ic, solver='LSODA',
                      max_step=None, blow_up_limit=1e4, progress=True):
     """Integrate the discovered system from ``ic`` over ``t_eval``.
@@ -172,6 +176,11 @@ def forward_simulate(cleans, var_names, t_eval, ic, solver='LSODA',
     component exceeds ``blow_up_limit``, and the (possibly partial) solution is
     returned rather than raised.  Check ``sol.t[-1]`` against ``t_eval[-1]``
     before trusting a comparison.
+
+    Tolerances are tight (``SIM_RTOL``, ``SIM_ATOL``): an equation that
+    amplifies small differences -- a negative spring pumped by its partner,
+    say -- drifts from the exact solution after about a second at rtol 1e-6,
+    and holds about twice as long at 1e-10 for twice the solver work.
     """
     rhs  = build_rhs(cleans, var_names)
     dt   = float(np.mean(np.diff(t_eval)))
@@ -207,14 +216,14 @@ def forward_simulate(cleans, var_names, t_eval, ic, solver='LSODA',
 
     try:
         sol = solve_ivp(integrand, (t0, t1), list(ic), t_eval=t_eval,
-                        method=solver, rtol=1e-6, atol=1e-9,
+                        method=solver, rtol=SIM_RTOL, atol=SIM_ATOL,
                         max_step=mxst, dense_output=False, events=events)
     except ValueError:
         # A rapidly diverging RHS can jump past blow_up_limit within a single
         # step, so the event's root search brackets two same-sign values and
         # brentq raises.  Re-integrate without the event and truncate below.
         sol = solve_ivp(integrand, (t0, t1), list(ic), t_eval=t_eval,
-                        method=solver, rtol=1e-6, atol=1e-9,
+                        method=solver, rtol=SIM_RTOL, atol=SIM_ATOL,
                         max_step=mxst, dense_output=False)
     if pbar is not None:
         pbar.n = pbar.total
