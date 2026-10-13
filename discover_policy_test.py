@@ -1425,7 +1425,8 @@ def test_beats_tools():
               'equation was simulated with',
               'envelope swing' in log and '<- strongest' in log
               and '[2b-tune]' in log and 'scored alone (' in log
-              and 'DOF 1: no equation -- its measured motion' in log
+              and 'DOF 1 was not simulated: ' in log
+              and 'dot in this equation are your measured data' in log
               and log.count('simulated TOGETHER') == 2
               and all(b is not None for b in best))
     finally:
@@ -1921,6 +1922,22 @@ def test_seed_list():
               f"truth seeds {[round(r, 4) for r in truth_r]}, best seeds "
               f"{[round(s[0][0], 4) for s in seeds]}, run "
               f"{[round(b[0], 4) for b in best]}")
+
+        import discover_rollout as ro
+        per_trial = [dc.simulation_trial_rewards(
+            (b[1], b[2]), d, horizon=dc.get_traj_horizon(0, 1, sy.t_end))
+            for d, b in enumerate(best)]
+        back = [1.0 / (1.0 + ro.combine_trials(1.0 / r - 1.0, dc.TRIAL_DECAY))
+                for r in per_trial]
+        check('each epoch prints every best trial by trial, and its trials '
+              'combine back to its score',
+              'trial by trial, alone: 0: ' in log
+              and 'trial by trial, alone: 0: ' in log.split('[EPOCH TOTAL]')[-1]
+              and all(len(r) == 2 for r in per_trial)
+              and all(abs(x - b[0]) < 1e-9 for x, b in zip(back, best)),
+              f"{[np.round(r, 4).tolist() for r in per_trial]} -> "
+              f"{[round(x, 6) for x in back]} vs "
+              f"{[round(b[0], 6) for b in best]}")
     finally:
         dc.configure_grammar(N_DOF)
         (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,

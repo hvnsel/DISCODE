@@ -241,8 +241,8 @@ def _scored_with(entry, dof, n_dof, indent=10):
     """Lines naming what the other DOFs did while DOF ``dof``'s equation was
     simulated to earn its score: per mode, each other DOF's equation in
     physical units -- printed even when it is that DOF's current best -- or,
-    scored alone, that no equation was involved: the other DOF's measured
-    motion was played back from the record."""
+    scored alone, that the other DOF was not simulated: wherever the equation
+    uses that DOF's displacement or velocity, it got the measured data."""
     sw = entry[3].get('scored_with') if isinstance(entry[3], dict) else None
     if not sw:
         return []
@@ -256,16 +256,43 @@ def _scored_with(entry, dof, n_dof, indent=10):
             if j == dof:
                 continue
             e = partners.get(j)
+            q = dc.VAR_NAMES[j] if j < len(dc.VAR_NAMES) else f'DOF {j}'
             if e is None:
-                lines.append(f"{pad}  DOF {j}: no equation -- its measured "
-                             f"motion was played back from the record")
+                lines.append(f"{pad}  DOF {j} was not simulated: {q} and "
+                             f"{q}dot in this equation are your measured "
+                             f"data")
             else:
                 eq = (dc.denormalize_expr(e[0], e[1], j)
                       or dc.expr_to_str(e[0], e[1]))
-                lines.append(f"{pad}  DOF {j} simulated alongside with: {eq}")
+                lines.append(f"{pad}  DOF {j} was simulated too ({q} and "
+                             f"{q}dot in this equation come from that "
+                             f"simulation), with: {eq}")
     if sw.get('tuned'):
         lines.append(f"{pad}(amplitudes tuned on the simulation)")
     return lines
+
+
+def _trial_lines(entry, dof, horizon, cache, indent=10):
+    """DOF ``dof``'s best equation scored trial by trial, simulated alone --
+    which trials hold its score down -- and the weight ``trial_decay`` gives
+    each rank.  ``cache`` holds the last equation scored per DOF."""
+    key = (tuple(entry[1]), tuple(np.round(entry[2], 12)))
+    if cache.get(dof, (None,))[0] != key:
+        cache[dof] = (key, dc.simulation_trial_rewards((entry[1], entry[2]),
+                                                       dof, horizon=horizon))
+    r = cache[dof][1]
+    if r is None or len(r) < 2:
+        return []
+    pad = ' ' * indent
+    w = dc.TRIAL_DECAY ** np.arange(len(r))
+    w = 100.0 * w / w.sum()
+    how = ('the score is their plain mean' if dc.TRIAL_DECAY == 1.0 else
+           'the score weights the worst-fit trial '
+           + ', the next '.join(f"{x:.0f}%" for x in w[:3])
+           + (', ...' if len(w) > 3 else ''))
+    return [f"{pad}trial by trial, alone: "
+            + "  ".join(f"{p}: {x:.3f}" for p, x in enumerate(r)),
+            f"{pad}({how})"]
 
 
 def _together_lines(states, horizon, cache):
@@ -282,8 +309,10 @@ def _together_lines(states, horizon, cache):
         cache['r'] = dc.coupled_simulation_rewards(
             [(b[1], b[2]) for b in bests], list(range(len(bests))),
             horizon=horizon)
-    lines = ["   The best equations above, simulated TOGETHER (each DOF driven "
-             "by the others' simulated motion, as the plot scripts run them):"]
+    lines = ["   The best equations above, simulated TOGETHER (all DOFs at "
+             "once, each equation using the others' simulated displacement "
+             "and velocity instead of the measured ones, as the plot scripts "
+             "run them):"]
     for i, b in enumerate(bests):
         lines.append(f"     DOF {i}: {cache['r'][i]:.4f}   (its training "
                      f"score {b[0]:.4f})")
@@ -619,7 +648,7 @@ def DISCOVER_TRAIN(
                   + (f", ... {len(rest) - 8} more" if len(rest) > 8 else ""))
         print()
 
-    together_cache = {}
+    together_cache, trial_cache = {}, {}
     for ep in range(n_epochs):
         t0_ep   = time.time()
         horizon = dc.get_traj_horizon(ep, n_epochs, system.t_end)
@@ -896,6 +925,9 @@ def DISCOVER_TRAIN(
                 print(f"          denorm: {d}")
             for line in _scored_with(be, i, N):
                 print(line)
+            if reward == 'simulation':
+                for line in _trial_lines(be, i, horizon, trial_cache):
+                    print(line)
         if reward == 'simulation':
             for line in _together_lines(states, horizon, together_cache):
                 print(line)
