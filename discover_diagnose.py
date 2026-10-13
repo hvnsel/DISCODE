@@ -13,17 +13,21 @@ run's equations scored alongside.
    simulated displacement: if those channels disagree, no equation can
    satisfy both.
 
-2. **What the search space can do.**  With integer powers up to 3, every
-   candidate is a weighted sum of a fixed list of monomials -- 34 for two
-   DOFs, plus a constant.  Sparse regression on that list (SINDy-style: least
-   squares, drop the small terms, refit) finds the best equations of every
-   size directly, with no search; each is then simulated and scored with the
-   training reward, and the best is tuned on the simulation as the trainer
-   tunes its own.
+2. **What polynomials can do.**  Every equation the grammar writes with
+   ``add``, ``mul`` and ``intpower`` up to cubic is a weighted sum of a fixed
+   list of monomials -- 34 for two DOFs, plus a constant.  Sparse regression
+   on that list (SINDy-style: least squares, drop the small terms, refit)
+   finds the best equations of every size directly, with no search; each is
+   then simulated and scored with the training reward, and the best is tuned
+   on the simulation as the trainer tunes its own.  The grammar holds more
+   than the list -- ``power`` with a fitted real exponent (friction, drag,
+   contact), products above cubic, directional leaves -- so this is the
+   polynomials' best, not the search's ceiling.
 
-   - No equation from the list simulates well: the search cannot succeed
-     whatever its settings -- the data, or physics these states do not hold
-     (forcing, friction, a mode that is not measured).
+   - No equation from the list simulates well: no polynomial does -- the
+     data, or physics outside the list: friction or contact (which ``power``
+     writes, and ``seed_list`` seeds), forcing or a mode that is not
+     measured (which nothing here can).
    - Some do, and your run's best is far below them: the search is what
      fails -- its settings or the method.
 
@@ -588,18 +592,20 @@ def main():
         if yours is not None:
             line += f", your run's at {yours[d]:.3f}"
             if r_list > yours[d] + 0.1:
-                line += (" -> an equation the search space holds does clearly "
+                line += (" -> a polynomial the grammar holds does clearly "
                          "better: the search is falling short (settings or "
                          "method)")
             elif r_list < 0.5:
-                line += (" -> nothing in the search space does well either: "
-                         "the limit is the data or physics these states do "
-                         "not hold, not the search")
+                line += (" -> no polynomial does well either: the limit is "
+                         "the data, or physics outside them -- friction or "
+                         "contact (power terms; try seed_list=True), forcing "
+                         "or an unmeasured mode")
             else:
-                line += (" -> the search found about what the space allows")
+                line += (" -> the search found about what polynomials allow")
         elif r_list < 0.5:
-            line += (" -> nothing in the search space does well: the data, or "
-                     "physics these states do not hold")
+            line += (" -> no polynomial does well: the data, or physics "
+                     "outside them -- friction or contact (power terms; try "
+                     "seed_list=True), forcing or an unmeasured mode")
         print(line)
         if 'd/dt velocity' not in targets:
             continue

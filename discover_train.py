@@ -394,6 +394,7 @@ def DISCOVER_TRAIN(
     sim_refine_evals = 60,     # simulation: simulations per tuned equation
     seed_list        = False,  # True: before epoch 1, put each DOF's best
                                # sparse fits over the monomials up to cubic
+                               # and the single-variable powers
                                # (discover_seed) in its buffer, scored by this
                                # run's reward, so training starts from them
     use_pool         = True,
@@ -466,13 +467,15 @@ def DISCOVER_TRAIN(
     (:func:`discover_core.refine_worker`).
 
     ``seed_list`` starts the search from equations instead of from nothing:
-    sparse regression over every monomial of the states up to cubic gives the
-    best equation of each size per DOF (:mod:`discover_seed`, the list
-    :mod:`discover_diagnose` searches), and each is scored with this run's
-    reward -- its constants fitted exactly as a sampled candidate's are -- and
+    sparse regression over every monomial of the states up to cubic, and over
+    those plus the single-variable ``power`` terms (sgn x, |x|, |x|^1.5,
+    x|x|, ...), gives the best equation of each size per DOF
+    (:mod:`discover_seed`), and each is scored with this run's reward -- its
+    constants and exponents fitted exactly as a sampled candidate's are -- and
     put in its DOF's buffer before the first epoch.  The policy learns from
-    them from its first update, and the start-up report shows what they score,
-    which is also how far a polynomial equation gets under these settings.
+    them from its first update, and the start-up report shows what they
+    score.  They are not the grammar's ceiling: ``power`` exponents off the
+    grid, products of powers and directional leaves are left to the search.
 
     ``sim_coupling_mode`` says how the fractions apply.  ``'split'`` scores
     each equation ONE way, drawn with those fractions, and its reward is
@@ -591,8 +594,8 @@ def DISCOVER_TRAIN(
                              dc.get_traj_horizon(0, n_epochs, system.t_end),
                              pool)
         print(f"[seed] sparse fits over every monomial up to degree "
-              f"{SEED_DEGREE}, scored with this run's reward "
-              f"({time.time() - t1:.1f}s):")
+              f"{SEED_DEGREE} and the single-variable powers, scored with "
+              f"this run's reward ({time.time() - t1:.1f}s):")
         for i, st in enumerate(states):
             seen = set()
             for e in seeds[i]:
@@ -609,9 +612,11 @@ def DISCOVER_TRAIN(
                   f"{be[0]:.4f} ({len(dc.split_terms(be[1]))} terms): "
                   + (dc.denormalize_expr(be[1], be[2], i)
                      or dc.expr_to_str(be[1], be[2])))
+            rest = st.buffer[1:]
             print("          the others: "
                   + ", ".join(f"{e[0]:.4f} ({len(dc.split_terms(e[1]))})"
-                              for e in st.buffer[1:]))
+                              for e in rest[:8])
+                  + (f", ... {len(rest) - 8} more" if len(rest) > 8 else ""))
         print()
 
     together_cache = {}
