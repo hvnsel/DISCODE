@@ -392,6 +392,10 @@ def DISCOVER_TRAIN(
                                # many equations get their amplitudes tuned on
                                # the simulation itself (0 = off)
     sim_refine_evals = 60,     # simulation: simulations per tuned equation
+    seed_list        = False,  # True: before epoch 1, put each DOF's best
+                               # sparse fits over the monomials up to cubic
+                               # (discover_seed) in its buffer, scored by this
+                               # run's reward, so training starts from them
     use_pool         = True,
     center_features  = False,  # see generate_dataset(): scale-only by default
     # ── policy (see discover_policy) ───────────────────────────────────────
@@ -460,6 +464,15 @@ def DISCOVER_TRAIN(
     so a 1% coupling error can move it by tens of percent.  A tuned equation
     replaces its untuned twin in the buffer when it scores higher
     (:func:`discover_core.refine_worker`).
+
+    ``seed_list`` starts the search from equations instead of from nothing:
+    sparse regression over every monomial of the states up to cubic gives the
+    best equation of each size per DOF (:mod:`discover_seed`, the list
+    :mod:`discover_diagnose` searches), and each is scored with this run's
+    reward -- its constants fitted exactly as a sampled candidate's are -- and
+    put in its DOF's buffer before the first epoch.  The policy learns from
+    them from its first update, and the start-up report shows what they score,
+    which is also how far a polynomial equation gets under these settings.
 
     ``sim_coupling_mode`` says how the fractions apply.  ``'split'`` scores
     each equation ONE way, drawn with those fractions, and its reward is
@@ -570,6 +583,36 @@ def DISCOVER_TRAIN(
           f"slice_order={slice_order}  sample_order={sample_order}")
     print(f"[policy] {ps.n_params():,} trainable parameters  "
           f"(critic max_len={max_len})\n")
+
+    if seed_list:
+        from discover_seed import seed_entries, SEED_DEGREE
+        t1 = time.time()
+        seeds = seed_entries(system, max_terms, max_term_len, term_grammar,
+                             dc.get_traj_horizon(0, n_epochs, system.t_end),
+                             pool)
+        print(f"[seed] sparse fits over every monomial up to degree "
+              f"{SEED_DEGREE}, scored with this run's reward "
+              f"({time.time() - t1:.1f}s):")
+        for i, st in enumerate(states):
+            seen = set()
+            for e in seeds[i]:
+                key = ps.dedup_key(e[1])
+                if key not in seen:
+                    seen.add(key)
+                    st.buffer.append(e)
+            if not st.buffer:
+                print(f"  DOF {i}: none"); continue
+            st.best_r, st.best_entry = st.buffer[0][0], st.buffer[0]
+            st.hof = list(st.buffer[:HOF_SIZE])
+            be = st.best_entry
+            print(f"  DOF {i}: {len(st.buffer)} equations, best "
+                  f"{be[0]:.4f} ({len(dc.split_terms(be[1]))} terms): "
+                  + (dc.denormalize_expr(be[1], be[2], i)
+                     or dc.expr_to_str(be[1], be[2])))
+            print("          the others: "
+                  + ", ".join(f"{e[0]:.4f} ({len(dc.split_terms(e[1]))})"
+                              for e in st.buffer[1:]))
+        print()
 
     together_cache = {}
     for ep in range(n_epochs):

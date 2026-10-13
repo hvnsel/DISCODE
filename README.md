@@ -22,6 +22,7 @@ committed for the others. See [Policy architecture](#policy-architecture).
 | `discover_policy_test.py` | correctness invariants for the above — run it before anything long |
 | `discover_data.py` | everything that produces a `SystemData`: `.mat` loading (velocity and acceleration derived from the displacement by default), truth simulation, dataset prep, ceiling + truth-reward diagnostics |
 | `discover_train.py` | `DISCOVER_TRAIN(system_data, ...)` — the one N-DOF training loop |
+| `discover_seed.py` | sparse regression over the monomials up to cubic: the diagnostic's list, and the warm start `seed_list=True` gives training |
 | `discover_analysis.py` | post-hoc: expression parsing, forward simulation, energy residual, comparison plots |
 
 **Drivers** — what you open and run:
@@ -433,6 +434,34 @@ The trial-by-trial check on 1-DOF stand-ins: three trials with stiffness 40,
 the constants table reads 40, 46, 52; three trials of one equation score 1.00
 both ways. On the high-pass stand-in the trials agree, their linear constants
 within 1% of each other.
+
+## Starting from sparse regression (`seed_list=True`)
+
+`DISCOVER_TRAIN(seed_list=True)` starts the search from equations instead of
+from nothing. Before the first epoch, sparse regression over every monomial of
+the states up to cubic (`discover_seed.py`, the list `discover_diagnose.py`
+searches) gives each DOF's best equation of every size. Each is written as a
+term bag, scored with the run's own reward — its constants fitted exactly as a
+sampled candidate's are — and put in that DOF's buffer, so the policy learns
+from them from its first update. The start-up report prints what they score:
+
+```
+[seed] sparse fits over every monomial up to degree 3, scored with this run's reward (4.2s):
+  DOF 0: 6 equations, best 0.xxxx (5 terms): q1ddot = ...
+          the others: ...
+```
+
+That is also how far a polynomial equation gets under the run's settings: a
+run whose best stays near it has found what the list allows, and one that
+climbs well above it has found something the list does not hold. On a
+simulated two-DOF record with a cubic coupling the seeds include both DOFs'
+true structures, and a one-epoch run starts at 0.994 and 0.995.
+
+A power over a directional leaf, `(a*q1 + b*q2)**3`, costs about 6× a plain
+monomial to score (1.6 s against 0.28 s per candidate on a NOhit-sized
+record): its inner weights go to the nonlinear optimiser, where the same
+physics written as monomials fits in closed form. `directional_leaves=False`
+in `DISCOVER_TRAIN` leaves them out of the grammar.
 
 ## Policy architecture
 

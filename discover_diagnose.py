@@ -63,7 +63,6 @@ USAGE
 from __future__ import annotations
 
 import sys
-from itertools import combinations_with_replacement
 
 import numpy as np
 
@@ -72,6 +71,7 @@ sys.path.insert(0, '.')
 import discover_rollout as ro
 from discover_analysis import clean_expr, expr_accels, record_states
 from discover_data import time_derivative
+from discover_seed import monomials, stlsq_path, theta
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ── CONFIG ─────────────────────────────────────────────────────────────────
@@ -220,57 +220,9 @@ def check_data(system, t, states, accs):
 
 
 # ── 2. the list ─────────────────────────────────────────────────────────────
-def monomials(n_vars, max_degree):
-    """Exponent tuples of every monomial up to ``max_degree``, constant first."""
-    out = [(0,) * n_vars]
-    for deg in range(1, max_degree + 1):
-        for combo in combinations_with_replacement(range(n_vars), deg):
-            e = [0] * n_vars
-            for i in combo:
-                e[i] += 1
-            out.append(tuple(e))
-    return out
-
-
-def theta(Z, exps):
-    """Library matrix: one column per monomial of the columns of ``Z``."""
-    return np.stack([np.prod(Z ** np.array(e)[None, :], axis=1) for e in exps],
-                    axis=1)
-
-
 def term_name(e, names):
     parts = [n if p == 1 else f"{n}**{p}" for n, p in zip(names, e) if p]
     return '*'.join(parts) if parts else '1'
-
-
-def stlsq_path(Th, y, max_terms, n_lam=60):
-    """Sequentially thresholded least squares over a sweep of thresholds:
-    ``{n_terms: coef}``, the best fit found for each equation size, plus
-    ``'dense'``.  Columns are scaled to unit RMS so one threshold fits all."""
-    norm = np.sqrt(np.mean(Th ** 2, axis=0)) + 1e-300
-    A = Th / norm
-    dense = np.linalg.lstsq(A, y, rcond=None)[0]
-    best = {'dense': (dense / norm, float(np.sum((A @ dense - y) ** 2)))}
-    for lam in np.geomspace(1e-4, 1.0, n_lam) * float(np.std(y)):
-        xi = dense.copy()
-        for _ in range(20):
-            small = np.abs(xi) < lam
-            xi[small] = 0.0
-            big = ~small
-            if not big.any():
-                break
-            new = np.zeros_like(xi)
-            new[big] = np.linalg.lstsq(A[:, big], y, rcond=None)[0]
-            if np.array_equal(np.abs(new) < lam, small):
-                xi = new
-                break
-            xi = new
-        k = int(np.count_nonzero(xi))
-        if 1 <= k <= max_terms:
-            sse = float(np.sum((A @ xi - y) ** 2))
-            if k not in best or sse < best[k][1]:
-                best[k] = (xi / norm, sse)
-    return best
 
 
 def as_expr(dof, coefs, exps, names, var_names):
