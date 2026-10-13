@@ -55,16 +55,21 @@ python discover_mdof_sim.py     # does it work with coupled DOFs?
 python discover_mdof_exp.py     # the real problem
 ```
 
-Each run ends with a paste-ready block:
+Each run ends with a paste-ready block, its constants to 12 significant figures:
 
 ```
 DISCOVERED_EXPRS = [
-    "xddot = -0.5001*x**3 - 1.0*x - 0.3*xdot",
+    "xddot = -0.500103917466*x**3 - 1.00001270235*x - 0.299984512301*xdot",
 ]
 ```
 
 Paste it into `discover_score.py` or a plotter, point the config at the same data
 (the trim/downsample settings change the time grid, so they must match), and run.
+Paste this block rather than the four-figure equations printed during the run: an
+equation that amplifies small differences (a negative spring its partner keeps
+pumping, say) simulates visibly differently within a fraction of a second on
+constants rounded to four figures. The plotters integrate at rtol 1e-10 for the
+same reason (`discover_analysis.SIM_RTOL`).
 
 ## Two numbers to read before the reward
 
