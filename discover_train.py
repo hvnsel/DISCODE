@@ -309,13 +309,23 @@ def _together_lines(states, horizon, cache):
         cache['r'] = dc.coupled_simulation_rewards(
             [(b[1], b[2]) for b in bests], list(range(len(bests))),
             horizon=horizon)
+        cache['paste'] = [dc.denormalize_expr(b[1], b[2], i, dc.PASTE_DIGITS)
+                          or dc.expr_to_str(b[1], b[2])
+                          for i, b in enumerate(bests)]
     lines = ["   The best equations above, simulated TOGETHER (all DOFs at "
              "once, each equation using the others' simulated displacement "
              "and velocity instead of the measured ones, as the plot scripts "
              "run them):"]
     for i, b in enumerate(bests):
-        lines.append(f"     DOF {i}: {cache['r'][i]:.4f}   (its training "
-                     f"score {b[0]:.4f})")
+        r = cache['r'][i]
+        lines.append(f"     DOF {i}: {r:.4f}   (its training score "
+                     f"{b[0]:.4f})"
+                     + ("   -- together they blow up" if r == 0.0 else ""))
+    lines.append("   That pair at full precision, for the plot scripts (the "
+                 "four-figure lines above can simulate differently):")
+    lines.append("   DISCOVERED_EXPRS = [")
+    lines += [f'       "{e}",' for e in cache['paste']]
+    lines.append("   ]")
     return lines
 
 
@@ -481,7 +491,7 @@ def DISCOVER_TRAIN(
     so far), and a fraction ``f_peer`` of the jointly sampled rows is
     integrated whole: each DOF's equation with the other DOFs' equations from
     the same sample.  Each equation is still scored on its own channel, but a
-    set that blows up charges every equation in it.  The rest are simulated
+    set that blows up scores every equation in it 0.  The rest are simulated
     alone as before (:func:`discover_core.coupled_worker`).
 
     ``sim_refine`` tunes, each epoch, the amplitudes of each DOF's best few

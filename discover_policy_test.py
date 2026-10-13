@@ -920,10 +920,10 @@ def test_simulation_reward():
             ok = True
         check('an unknown reward name is refused', ok)
 
-        # A diverging equation: a large finite residual, not a NaN.
+        # A diverging equation: a reward of 0, not a NaN.
         r_bad = dc.candidate_reward([(wrong, [3.0, 2.0])])
-        check('a diverging equation scores small but finite',
-              np.isfinite(r_bad) and 0.0 < r_bad < 0.3, f"r = {r_bad:.4f}")
+        check('a diverging equation scores 0, not a NaN',
+              r_bad == 0.0, f"r = {r_bad:.4f}")
 
         # The scoring script reproduces the engine from the printed equation.
         phys = dc.denormalize_expr(truth, ct, 0)
@@ -1140,11 +1140,10 @@ def test_coupled_scoring():
         only0 = ro.rollout_set_residuals({0: f0, 1: diverge}, t, states,
                                          stride=stride, substeps=sub, weights=w,
                                          accs=accs, score=[0])
-        check('a set that blows up charges its sound equation the worst '
-              'residual, scored or not',
-              blown.all() and np.allclose(both[0], both[1])
-              and np.allclose(only0[0], both[1]) and both[0].min() > 1.0,
-              f"sound DOF charged {both[0].mean():.2f}")
+        check('a set that blows up scores every equation in it inf, its '
+              'sound one included, scored or not',
+              blown.all() and np.isinf(both[0]).all()
+              and np.isinf(both[1]).all() and np.isinf(only0[0]).all())
 
         # The engine: the worker's modes on the true equations, and a wrong
         # partner.
@@ -1259,6 +1258,10 @@ def test_trial_decay():
           and ro.combine_trials(miss, 0.5) > ro.combine_trials(fair, 0.5),
           f"mean {ro.combine_trials(miss, 1.0):.2f} vs 0.30; "
           f"halving {ro.combine_trials(miss, 0.5):.3f} vs 0.300")
+    blew = [np.inf, np.inf, 0.2]
+    check('trials that blew up make the combination infinite at every decay, '
+          'never NaN',
+          all(ro.combine_trials(blew, dk) == np.inf for dk in (1.0, 0.5, 0.0)))
 
     saved = (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
              dc.MAX_TRAJ, dc.W_ACC, dc.REWARD_MODE, dc.SIM_WINDOW,
@@ -1415,11 +1418,14 @@ def test_beats_tools():
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             dc.print_record_summary()
+            # seeded, so both DOFs have a best from the start: four samples
+            # an epoch can all diverge, and a diverging one scores 0
             best = dt.DISCOVER_TRAIN(
                 system, n_epochs=2, batch_size=4, max_len=12, C=1,
                 use_pool=False, reward='simulation', sim_window='auto',
                 sim_weights=w, sim_refine=1, sim_refine_evals=5,
-                n_layers=1, d_model=16, max_terms=2, max_term_len=4, seed=0)
+                n_layers=1, d_model=16, max_terms=2, max_term_len=4, seed=0,
+                seed_list=True)
         log = buf.getvalue()
         check('a run reports the record, tunes, and prints what every best '
               'equation was simulated with',
@@ -1427,7 +1433,8 @@ def test_beats_tools():
               and '[2b-tune]' in log and 'scored alone (' in log
               and 'DOF 1 was not simulated: ' in log
               and 'dot in this equation are your measured data' in log
-              and log.count('simulated TOGETHER') == 2
+              and 'simulated TOGETHER' in log
+              and 'DISCOVERED_EXPRS = [' in log.split('=== DISCOVER done')[0]
               and all(b is not None for b in best))
     finally:
         dc.configure_grammar(N_DOF)
