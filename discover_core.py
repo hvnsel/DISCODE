@@ -355,6 +355,9 @@ W_ACC = 0.0
 #                ranked from worst fit to best, the k-th worst weighted
 #                TRIAL_DECAY**(k-1); 1 = plain mean, 0 = worst trial only
 #                (discover_rollout.combine_trials)
+# Each trial's number in the record, for reports, when the run uses only some
+# of its trials (discover_data.select_trials); None numbers them 0, 1, ...
+TRIAL_IDS = None
 REWARD_MODES = ('energy', 'simulation')
 REWARD_MODE  = 'energy'
 SIM_WINDOW   = None
@@ -1676,7 +1679,8 @@ def print_record_summary(max_traj=None, horizon=None):
                     if tf['rate'] is not None and swing[p] >= 0.1
                     else f"{'-':>13s}")
             mark = "   <- strongest" if p == strongest else ""
-            print(f"     {p:5d} {f1:9.4g}   {second}   {swing[p]:14.3f}   "
+            label = TRIAL_IDS[p] if TRIAL_IDS and p < len(TRIAL_IDS) else p
+            print(f"     {label:5d} {f1:9.4g}   {second}   {swing[p]:14.3f}   "
                   f"{beat}{mark}")
 
 
