@@ -462,6 +462,15 @@ the constants table reads 40, 46, 52; three trials of one equation score 1.00
 both ways. On the high-pass stand-in the trials agree, their linear constants
 within 1% of each other.
 
+## Training on some trials only (`trials=[...]`)
+
+`DISCOVER_TRAIN(trials=[4])` trains and scores on trial 4 of the record alone
+(numbered from 0); `[1, 2, 4]` on those three. Every report keeps the record's
+trial numbers. One trial is the cleanest test of whether the search can
+capture what that trial shows: no equation is asked to serve trials whose
+dynamics differ, and `trial_decay` has nothing to weigh. The plot scripts pick
+their trial with their own `TRIAL`.
+
 ## Starting from sparse regression (`seed_list=True`)
 
 `DISCOVER_TRAIN(seed_list=True)` starts the search from equations instead of

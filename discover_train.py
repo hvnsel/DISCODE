@@ -59,7 +59,7 @@ import torch.nn.functional as F
 
 import discover_core as dc
 import discover_policy as dp
-from discover_data import generate_dataset
+from discover_data import generate_dataset, select_trials
 
 N_WORKERS = max(1, min(os.cpu_count() or 4, 3))
 HOF_SIZE = 10
@@ -355,8 +355,10 @@ def _trial_lines(entry, dof, horizon, cache, indent=10):
            'the score weights the worst-fit trial '
            + ', the next '.join(f"{x:.0f}%" for x in w[:3])
            + (', ...' if len(w) > 3 else ''))
+    ids = dc.TRIAL_IDS if dc.TRIAL_IDS and len(dc.TRIAL_IDS) == len(r) \
+        else range(len(r))
     return [f"{pad}trial by trial, alone: "
-            + "  ".join(f"{p}: {x:.3f}" for p, x in enumerate(r)),
+            + "  ".join(f"{p}: {x:.3f}" for p, x in zip(ids, r)),
             f"{pad}({how})"]
 
 
@@ -501,6 +503,9 @@ def DISCOVER_TRAIN(
                                # and the single-variable powers
                                # (discover_seed) in its buffer, scored by this
                                # run's reward, so training starts from them
+    trials           = None,   # None: every trial of the record; a list of
+                               # trial numbers (from 0), e.g. [4], trains and
+                               # scores on those alone
     use_pool         = True,
     center_features  = False,  # see generate_dataset(): scale-only by default
     # ── policy (see discover_policy) ───────────────────────────────────────
@@ -570,6 +575,11 @@ def DISCOVER_TRAIN(
     replaces its untuned twin in the buffer when it scores higher
     (:func:`discover_core.refine_worker`).
 
+    ``trials`` trains on some of the record's trials only
+    (:func:`discover_data.select_trials`): ``[4]`` fits trial 4 alone, so an
+    equation is never asked to serve trials whose dynamics differ.  Reports
+    keep the record's trial numbers.
+
     ``seed_list`` starts the search from equations instead of from nothing:
     sparse regression over every monomial of the states up to cubic, and over
     those plus the single-variable ``power`` terms (sgn x, |x|, |x|^1.5,
@@ -614,6 +624,9 @@ def DISCOVER_TRAIN(
     """
     device = dc.DEVICE
     system = system_data
+    if trials is not None:
+        system = select_trials(system, trials)
+    dc.TRIAL_IDS = list(getattr(system, 'trial_ids', range(system.n_trials)))
     N = system.n_dof
     f_top, f_peer = check_coupling(sim_coupling, reward, N, sim_coupling_mode)
     coupled = f_top + f_peer > 0.0
@@ -633,9 +646,12 @@ def DISCOVER_TRAIN(
         print(f"[vocab]  blend(u) = e^(a u)(c1 cos(b u) + c2 sin(b u)): "
               f"a grid {dc.BLEND_A_GRID}, b grid {dc.BLEND_B_GRID}")
     print(f"[config] System='{system.name}'  N_DOF={N}  reward={reward}")
+    picked = dc.TRIAL_IDS != list(range(system.n_trials))
     print(f"[config] {len(system.time)} pts  {system.t_end:.4g} s  "
           f"{(len(system.time)-1)/system.t_end:.0f} Hz eff  "
-          f"{system.n_trials} trials")
+          f"{system.n_trials} trials"
+          + (f" -- only the record's trial(s) {dc.TRIAL_IDS}" if picked
+             else ""))
 
     X_torch, y_list, raw_trajs, norm_stats = generate_dataset(
         system, device, center=center_features)

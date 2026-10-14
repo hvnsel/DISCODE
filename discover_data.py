@@ -83,6 +83,8 @@ class SystemData:
         # No ground truth for experimental data.
         self.truth_strs = truth_strs or ['unknown'] * n_dof
         self.truth_taus = truth_taus or [None] * n_dof
+        # Each trial's number in the record it came from (select_trials).
+        self.trial_ids  = list(range(p))
 
     def __repr__(self):
         fs = (len(self.time) - 1) / self.t_end if self.t_end > 0 else 0.0
@@ -316,6 +318,33 @@ def select_dof(system, dof_index, var_name='x'):
         truth_strs=[system.truth_strs[dof_index]],
         truth_taus=[system.truth_taus[dof_index]],
     )
+
+
+def select_trials(system, trials):
+    """Return a new ``SystemData`` keeping only the trials ``trials`` -- their
+    numbers in ``system``, counted from 0 -- in that order.  ``trial_ids``
+    keeps the record's numbering, so reports still say which trial is which."""
+    ids = [int(p) for p in np.atleast_1d(trials)]
+    if not ids:
+        raise ValueError("trials must name at least one trial")
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"trials {ids} repeats a trial")
+    bad = [p for p in ids if not 0 <= p < system.n_trials]
+    if bad:
+        raise ValueError(f"trials {bad} out of range: the record has "
+                         f"{system.n_trials} (0-{system.n_trials - 1})")
+    out = SystemData(
+        name=f"{system.name}_trial{'_'.join(str(system.trial_ids[p]) for p in ids)}",
+        acc=system.acc[:, :, ids],
+        vel=system.vel[:, :, ids],
+        disp=system.disp[:, :, ids],
+        time=system.time,
+        var_names=list(system.var_names),
+        truth_strs=list(system.truth_strs),
+        truth_taus=list(system.truth_taus),
+    )
+    out.trial_ids = [system.trial_ids[p] for p in ids]
+    return out
 
 
 # ── Simulated truth ─────────────────────────────────────────────────────────

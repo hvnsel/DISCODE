@@ -1953,6 +1953,74 @@ def test_seed_list():
         dc._SIM_DATA.clear()
 
 
+def test_select_trials():
+    """``trials=[...]``: a run on some of the record's trials keeps their
+    data, says which they are, and refuses a trial the record does not
+    have."""
+    import contextlib
+    import io
+
+    from discover_data import SystemData, select_trials
+    import discover_train as dt
+
+    print("\nselect trials")
+    t = np.linspace(0.0, 4.0, 401)
+    amp = np.array([0.5, 0.8, 1.1])
+    disp = np.stack([np.stack([a * np.cos(3 * t), 0.2 * a * np.cos(5 * t)], 1)
+                     for a in amp], 2)
+    vel = np.stack([np.stack([-3 * a * np.sin(3 * t),
+                              -a * np.sin(5 * t)], 1) for a in amp], 2)
+    acc = np.stack([np.stack([-9 * a * np.cos(3 * t),
+                              -5 * a * np.cos(5 * t)], 1) for a in amp], 2)
+    sy = SystemData('three', acc, vel, disp, t, var_names=['q1', 'q2'])
+    two = select_trials(sy, [2, 0])
+    one = select_trials(two, [1])
+    refused = []
+    for bad in ([3], [1, 1], []):
+        try:
+            select_trials(sy, bad)
+        except ValueError:
+            refused.append(bad)
+    check('selecting trials keeps their data in the order asked, numbered as '
+          'in the record, and refuses ones it does not have',
+          two.n_trials == 2 and two.trial_ids == [2, 0]
+          and np.array_equal(two.disp[:, :, 0], sy.disp[:, :, 2])
+          and np.array_equal(two.acc[:, :, 1], sy.acc[:, :, 0])
+          and one.trial_ids == [0]
+          and np.array_equal(one.vel[:, :, 0], sy.vel[:, :, 0])
+          and len(refused) == 3)
+
+    saved = (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+             dc.MAX_TRAJ, dc.W_ACC, dc.REWARD_MODE, dc.SIM_WINDOW,
+             dc.SIM_WEIGHTS, dc.TRIAL_DECAY, dc.TRIAL_IDS)
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            dc.configure_grammar(2, ['q1', 'q2'])
+            dt.DISCOVER_TRAIN(
+                sy, n_epochs=1, batch_size=4, max_len=12, C=1,
+                use_pool=False, reward='simulation', sim_window='auto',
+                sim_weights=(0.2, 0.2, 0.2, 0.4), max_terms=2,
+                max_term_len=3, n_layers=1, d_model=16, seed=0,
+                trials=[1, 2])
+        log = buf.getvalue()
+        lines = [ln.strip() for ln in log.splitlines()
+                 if 'trial by trial, alone:' in ln]
+        check('a run on trials [1, 2] says so and reports them as 1 and 2',
+              "2 trials -- only the record's trial(s) [1, 2]" in log
+              and lines and all(ln.split(':', 1)[1].split()[0] == '1:'
+                                and ' 2: ' in ln for ln in lines),
+              lines[0] if lines else 'no trial lines')
+    finally:
+        dc.configure_grammar(N_DOF)
+        (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+         dc.MAX_TRAJ, dc.W_ACC) = saved[:5]
+        dc.set_reward(*saved[5:9])
+        dc.TRIAL_IDS = saved[9]
+        dc._SIM_DATA.clear()
+        dc._TF_DATA.clear()
+
+
 def test_partner_refresh():
     """Scored with the other DOFs' top equations, each DOF's best is re-scored
     whenever their best changes, so the pair reported as best is the pair
@@ -2115,6 +2183,7 @@ def main():
     test_diagnose_trials()
     test_seed_list()
     test_partner_refresh()
+    test_select_trials()
     test_scoring_pool()
 
     print(f"\n{'=' * 60}")
