@@ -20,20 +20,30 @@ Newton's third law by construction, and the search also decides which DOFs are
 connected and fits the mass ratios. The scoring (RK4 rollout, restart windows,
 R_tf, R_f, trial weighting) is unchanged.
 
+Masses and springs are only one instance. Section 2.0 states the idea for any
+system whose parts exchange a conserved quantity (lumped ODEs, finite-volume
+and FEM discretizations of PDEs). The method must not depend on any particular
+dataset; the LO–NO rig below is an illustration only.
+
+**Dropped 2026-10-16:** momentum balance and the test on measured data (old
+Phase 0). The structure guarantees action–reaction, so the method never needs
+to check it.
+
 ## 1. Why: what is wrong today
 
-### 1.1 The law in the form we can test
+### 1.1 Action–reaction, stated pairwise
 
-For lumped masses mᵢ in absolute coordinates, the connection forces cancel when
-the equations are added:
+Every coupling term must appear in the equations of both entities it joins,
+with opposite signs, scaled by one ratio for the whole pair (for masses,
+c2 / c1 = −m1 / m2). Three ways to break it:
 
-    Σᵢ mᵢ q̈ᵢ = forces from the ground and from outside only
+1. the term has the **same sign** in both equations (would need a negative ratio);
+2. the term is in **only one** equation;
+3. different coupling terms imply **different ratios**.
 
-The LO–NO rig (Wang & Moore 2021 Eq. 7; SIVA parameters, Lopez & Moore approach
-III; already in `lono_comparison_plot.py`): q1 = LO (column 0, the only DOF
-attached to the ground), q2 = NO (column 1), both masses 1.370 kg. So
-
-    q̈1 + q̈2 = −(k1/m) q1 − (b1/m) q̇1 = −14 070 q1 − 2.80 q̇1
+Illustration used below: the LO–NO rig (Wang & Moore 2021 Eq. 7; SIVA
+parameters, Lopez & Moore approach III; already in `lono_comparison_plot.py`),
+q1 = LO, q2 = NO, equal masses.
 
 ### 1.2 Our discovered equations break it
 
@@ -42,23 +52,19 @@ The pair the user asked LaTeX for on 2026-10-14:
     q̈1 = −4.585e8 q1³ − 1.512e4 q1 − 72.62 q̇1³ − 1.495 q̇1 + 2.593e7 q2³ + 1241 q2 + 132 q̇2³ − 2.989 q̇2
     q̈2 = 5.046e7 q1 q2² + 1314 q1 − 3.592e7 q2³ − 1182 q2 + 15.68 q̇2³ + 4.793 q̇2² − 0.5087 q̇2
 
-Their sum, term by term (computed with sympy):
+Coupling terms, with coefficient c1 in q̈1 and c2 in q̈2:
 
-| term in q̈1 + q̈2 | value | allowed? |
-|---|---|---|
-| q1 | −1.381e4 | yes (truth −1.407e4) |
-| q1³ | −4.585e8 | yes by the law (not in the truth) |
-| q̇1 | −1.495 | yes (truth −2.80) |
-| q̇1³ | −72.62 | yes by the law (not in the truth) |
-| q2 | +59 | no; nearly cancels (each equation has ~1250) |
-| q2³ | −9.99e6 | **no** |
-| q1 q2² | +5.046e7 | **no** |
-| q̇2 | −3.498 | **no** |
-| q̇2³ | +147.7 | **no** |
-| q̇2² | +4.793 | **no** |
+| term | c1 | c2 | implied ratio −c2/c1 | verdict |
+|---|---|---|---|---|
+| q2 | +1241 | −1182 | 0.95 | fine |
+| q2³ | +2.593e7 | −3.592e7 | 1.39 | ✗ rule 3 (disagrees with 0.95) |
+| q1 q2² | 0 | +5.046e7 | none | ✗ rule 2 |
+| q̇2 | −2.989 | −0.509 | negative | ✗ rule 1 |
+| q̇2³ | +132 | +15.68 | negative | ✗ rule 1 |
+| q̇2² | 0 | +4.793 | none | ✗ rule 2 |
 
-The linear springs nearly obey the law; the cubic coupling and the damping do
-not, and those are the parts with the least signal in the data. Two terms are
+The linear spring nearly pairs up; the cubic coupling and the damping do not,
+and those are the parts with the least signal in the data. Two terms are
 not physical at all: +15.68 q̇2³ in q̈2 pushes along the velocity (injects
 energy), and 4.793 q̇2² has the same sign whichever way the mass moves.
 
@@ -90,6 +96,31 @@ to approximate it.
 
 ## 2. The idea
 
+### 2.0 The general form (not just masses and springs)
+
+A system is a set of **entities** (a DOF, a mesh node, a finite-volume cell, a
+finite element) that exchange some conserved quantity (momentum, energy, mass,
+heat). Each entity's equation has two kinds of terms:
+
+- **local terms**: depend only on that entity's own state (a support, a
+  foundation, a body force, a source);
+- **exchange terms**: one law per interaction, depending on the relative state
+  of the entities it joins, computed **once** and added to one side and
+  subtracted from the other.
+
+Because every exchange term is added and subtracted, the exchanged quantity is
+conserved by construction, whatever the policy writes. Instances:
+
+| system | entity | exchanged quantity | exchange law |
+|---|---|---|---|
+| lumped ODE (masses) | mass / DOF | momentum | connection force |
+| finite-volume PDE | cell | mass, momentum, energy | flux across a face |
+| FEM | node (exchange via elements) | momentum | element force vector (sums to zero) |
+| heat conduction | node / cell | heat | heat flux |
+
+The method is the same in every case: the policy writes local laws and exchange
+laws; the code assembles the equations.
+
 ### 2.1 Graph view
 
 - **Nodes** are the masses, plus the ground.
@@ -105,9 +136,8 @@ signs, so the policy can never get the signs wrong.
 
     mᵢ q̈ᵢ = Gᵢ(qᵢ, q̇ᵢ) + Σ_{j≠i} Fᵢⱼ(Δᵢⱼ, Δ̇ᵢⱼ),   Fⱼᵢ = −Fᵢⱼ,   Δᵢⱼ = qᵢ − qⱼ
 
-so, for whatever Gᵢ and Fᵢⱼ the policy writes,
-
-    Σᵢ mᵢ q̈ᵢ = Σᵢ Gᵢ
+Every Fᵢⱼ enters exactly twice with opposite signs, whatever the policy writes,
+so the law holds by construction; nothing in the method needs to check it.
 
 Three DOFs, every connection allowed:
 
@@ -182,9 +212,9 @@ test, costs extra simulations.
 ### 3.5 Why symmetry methods don't cover it
 
 Yang et al. (NeurIPS 2024) impose symmetries of the whole vector field. On a
-grounded rig the ground breaks translation symmetry, so momentum balance is not
-a symmetry of the equations; it is a structure (ground terms plus
-equal-and-opposite bonds). Only a structured generator can impose it.
+grounded system the ground breaks translation symmetry, so action–reaction is
+not a symmetry of the equations; it is a structure (local terms plus paired
+exchange terms). Only a structured generator can impose it.
 
 ### 3.6 Still to do before claiming anything
 
@@ -359,32 +389,24 @@ with −wⱼ), DOF rows stacked, masses fixed or scanned. This doubles as the
 
 - Structured: `ground 0: ...`, `bond 0–1: ...`, `m1/m0 = ...`.
 - Flat per-DOF denormalized equations, paste-ready for the plot scripts.
-- A momentum-check line (zero to rounding by construction).
 
 ## 6. Phases
 
-### Phase 0 — measure (small)
+### Phase 0 — dropped (2026-10-16)
 
-- **0a Diagnostic** for any discovered set: fit mass weights so Σ wᵢ q̈ᵢ has the
-  smallest cross part, list every term that fails to cancel (the table in 1.2).
-  Any N. Report only, no training change.
-- **0b Test on measured data before training**: regress Σ wᵢ q̈ᵢ,meas (w₁ = 1)
-  on a library of each DOF's own-state functions only (no cross terms); choose
-  w to minimize the residual. Reports mass ratios, which DOFs carry ground
-  terms, the unexplained fraction, and a verdict that gates bond mode (catches
-  relative sensors, base motion, unmeasured neighbours).
-- Done when: 0a reproduces the 1.2 table for the latest pair; 0b on the rig gives
-  m2/m1 ≈ 1 with ground terms only on DOF 0.
-- Tests: synthetic 2- and 3-DOF truths (0b recovers known mass ratios; 0a reads
-  0 on the truth and nonzero when a coupling term is perturbed).
+The momentum-balance diagnostic and the test on measured data are out. The
+method enforces action–reaction by construction, so it never needs to check
+it, and a test tied to one dataset is not part of a general method. Counting
+unpaired coupling terms (the rules in 1.1) survives only as an evaluation
+metric in section 7.
 
 ### Phase 1 — bond mode, fixed topology (large)
 
 - Sections 5.1–5.10 with the topology given (one bond for 2 DOF, 'chain' for
   more) and masses fixed or fitted.
-- Done when: the LO–NO run recovers the 5-term structure (G1: q1, q̇1; G2 empty;
-  F: Δ, Δ̇, Δ³) with constants near SIVA's; the momentum check reads 0; free
-  mode unchanged.
+- Done when: on simulated 2–3 DOF truths the exact structure is recovered; on
+  the LO–NO record the 5-term structure (G1: q1, q̇1; G2 empty; F: Δ, Δ̇, Δ³)
+  comes out with constants near SIVA's; free mode unchanged.
 - Tests:
   - assembly property test: random bags → Σ mᵢ aᵢ contains no bond terms;
   - relative-channel normalization;
@@ -444,7 +466,8 @@ with −wⱼ), DOF rows stacked, masses fixed or scanned. This doubles as the
 
 ## 7. Experiments that prove the claim
 
-1. Third law: violation metric, current DISCOVER vs bonds.
+1. Action–reaction: number of unpaired coupling terms (rules in 1.1), current
+   DISCOVER vs bonds (zero by construction).
 2. Topology: simulated 3–8 DOF with unknown graph; topology F1, spurious
    couplings.
 3. Masses: unequal masses; mass-ratio error; vs tied-coefficient SINDy given true
@@ -481,19 +504,23 @@ solution.
 - Small ground terms vs noise when deciding which DOFs are grounded.
 - Measured coordinates must be absolute; check the sensors.
 - Novelty: the literature review is not done.
+- With no test on the data, the structure is an assumption: state it in the
+  paper (section 2.4).
 
 ## 10. Teaching plan (check off as we go)
 
-- [ ] L1 Newton's third law as momentum balance; reading the violation table (Phase 0)
-- [ ] L2 The test on measured data: least squares with unknown mass weights (Phase 0)
-- [ ] L3 Graph view: ground terms, bonds, assembly; why the law holds by construction (Phase 1)
-- [ ] L4 Relative variables and normalization (Phase 1)
-- [ ] L5 Joint least squares: shared coefficients, masses, identifiability, variable projection (Phase 1)
-- [ ] L6 Policy internals today (slices, terms, embeddings, attention mask, STOP) and what changes (Phases 1–2)
-- [ ] L7 RL training: GRPO, advantages, buffers; system vs per-slice credit (Phases 1–3)
-- [ ] L8 Topology as an action; empty bags; what NRI does differently (Phase 2)
-- [ ] L9 Experiments, baselines, ablations and the novelty argument (Phases 2–3)
-- [ ] L10 Beyond ODEs: k-node interactions, energies, the PDE limit, FEM joints, red flags (Phase 4)
+Restarted 2026-10-16 from the general form; the momentum-balance lessons were
+dropped with Phase 0. Examples are illustrations; nothing depends on one
+dataset.
+
+- [ ] L1 The general form: entities, local terms, exchange terms, assembly; instances from ODEs to PDEs and FEM (section 2.0)
+- [ ] L2 Exchange laws depend on relative state; relative variables and normalization (Phase 1)
+- [ ] L3 The joint fit: shared coefficients, unknown scale factors (masses), variable projection (Phase 1)
+- [ ] L4 Policy internals today (slices, terms, embeddings, attention mask, STOP) and what changes (Phases 1–2)
+- [ ] L5 RL training: system-level reward, GRPO, buffers, per-slice credit (Phases 1–3)
+- [ ] L6 Discovering which exchanges exist, as actions; empty bags; what NRI does differently (Phase 2)
+- [ ] L7 Experiments, baselines, ablations and the novelty argument (Phases 2–3)
+- [ ] L8 Beyond pairs: exchanges over k entities (elements), energies, the PDE limit, FEM, red flags (Phase 4)
 
 ## 11. Rules once the user approves
 
