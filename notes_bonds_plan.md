@@ -29,6 +29,12 @@ dataset; the LO–NO rig below is an illustration only.
 Phase 0). The structure guarantees action–reaction, so the method never needs
 to check it.
 
+**Added 2026-10-16:** qᵢ − qⱼ is the simplest coupling, not the only one. In
+general each interaction has a deformation (some function of the entities it
+joins), one law, and passes that law to each entity through the transpose of
+its kinematics (section 2.0). Newton's third law is the case where moving all
+participants together leaves the deformation unchanged.
+
 ## 1. Why: what is wrong today
 
 ### 1.1 Action–reaction, stated pairwise
@@ -40,6 +46,13 @@ c2 / c1 = −m1 / m2). Three ways to break it:
 1. the term has the **same sign** in both equations (would need a negative ratio);
 2. the term is in **only one** equation;
 3. different coupling terms imply **different ratios**.
+
+These rules hold only for two-entity interactions on one axis (deformation
+qᵢ − qⱼ, or qᵢ − ρqⱼ with ρ > 0; section 2.0), and only on terms the other
+equation's local law cannot also contain (mixed terms such as q1 q2² are always
+clean). Other couplings break them legitimately: two pistons on one sealed air
+volume give same-sign terms (rule 1); gyroscopic coupling puts q̇2 in one
+equation and q̇1 in the other (rule 2).
 
 Illustration used below: the LO–NO rig (Wang & Moore 2021 Eq. 7; SIVA
 parameters, Lopez & Moore approach III; already in `lono_comparison_plot.py`),
@@ -98,30 +111,79 @@ to approximate it.
 
 ### 2.0 The general form (not just masses and springs)
 
-A system is a set of **entities** (a DOF, a mesh node, a finite-volume cell, a
-finite element) that exchange some conserved quantity (momentum, energy, mass,
-heat). Each entity's equation has two kinds of terms:
+A system is a set of **entities** (a DOF, a mesh node, a finite-volume cell)
+that interact. Every interaction e has:
 
-- **local terms**: depend only on that entity's own state (a support, a
-  foundation, a body force, a source);
-- **exchange terms**: one law per interaction, depending on the relative state
-  of the entities it joins, computed **once** and added to one side and
-  subtracted from the other.
+- **participants**: one or more entities; the ground is a participant that
+  never moves, so a local term (a support, a foundation) is an interaction with
+  the ground;
+- a **deformation** δₑ: a function of the participants' states saying how
+  strained the interaction is (a stretch, a volume change, a curvature, a
+  temperature difference);
+- **one law** Fₑ = Φₑ(δₑ, δ̇ₑ), the only part the policy writes;
+- the **transpose rule**: participant p receives (∂δₑ/∂qₚ)·Fₑ. The code applies
+  it, so the policy can never get the distribution wrong.
 
-Because every exchange term is added and subtracted, the exchanged quantity is
-conserved by construction, whatever the policy writes. Instances:
+What the rule guarantees, whatever law the policy writes:
 
-| system | entity | exchanged quantity | exchange law |
+- **action–reaction**: the forces on the participants sum to zero exactly when
+  moving all participants together leaves δₑ unchanged (Σₚ ∂δₑ/∂qₚ = 0).
+  Newton's third law is this case with two participants. Conservation alone
+  needs less: +F out of one participant and −F into the other, whatever F
+  depends on. That is all a finite-volume flux needs (an advective flux depends
+  on the cell states themselves, not their difference); the deformation and the
+  next two guarantees are what mechanics adds;
+- **energy bookkeeping**: the work an interaction does on all its participants
+  together is Fₑ·δ̇ₑ, so energy moves between entities only through the
+  interaction's own law; a mismatch between two equations cannot pump energy in
+  (with the dissipative-only option, 5.4, the law itself can only store or
+  dissipate);
+- **reciprocity**: with linear kinematics, every interaction contributes
+  symmetric stiffness and damping (Maxwell–Betti).
+
+**When qᵢ − qⱼ is forced.** A massless element touching exactly two entities on
+one axis: its own Newton's second law with zero mass balances its end forces,
+and moving both ends together does not strain it, so δ = qᵢ − qⱼ. Every other
+form below relaxes one of those conditions (a third party such as the ground, a
+fulcrum or a gas; more participants; different axes or units; an element with
+its own mass or power supply).
+
+| coupling | example | deformation δ | each participant gets |
 |---|---|---|---|
-| lumped ODE (masses) | mass / DOF | momentum | connection force |
-| finite-volume PDE | cell | mass, momentum, energy | flux across a face |
-| FEM | node (exchange via elements) | momentum | element force vector (sums to zero) |
-| heat conduction | node / cell | heat | heat flux |
+| difference | spring, damper, contact; heat flux; circuit branch | qᵢ − qⱼ | +F, −F |
+| ground (local term) | support, foundation | qᵢ | F |
+| weighted difference | lever, gear pair, pulley (rotation vs translation) | qᵢ − ρqⱼ | F, −ρF (the fulcrum or housing takes the rest) |
+| weighted sum | two pistons on one sealed air volume | A₁q₁ + A₂q₂ | A₁F, A₂F, same sign (the walls take the reaction) |
+| three or more entities | beam bending | wᵢ₋₁ − 2wᵢ + wᵢ₊₁ | F, −2F, F |
+| FEM element | any element | strain ε = B·uₑ | Bᵀ times the stress; sums to zero (partition of unity) |
+| finite volume | cell faces | diffusion: difference of cell states; advection: none (the flux depends on the states themselves) | the face flux, out of one cell and into the other |
+| continuum PDE | bar, rod | ε = ∂u/∂x | transpose of ∂/∂x is −∂/∂x, so ρu_tt = ∂σ/∂x |
+| large motion | spring between points moving in 2D/3D | ‖rᵢ − rⱼ‖ − L | F along the line between them (Jacobian of δ) |
 
-The method is the same in every case: the policy writes local laws and exchange
-laws; the code assembles the equations.
+Couplings the rule **cannot** express:
+
+- **gyroscopic** (a spinning rotor, Coriolis, magnetic): +g q̇ⱼ in equation i,
+  −g q̇ᵢ in equation j; does no work. Could be a second structured class, with
+  the skew sign applied by the code;
+- **inertial**: q̈ⱼ in equation i (angles of linked bodies, consistent-mass
+  FEM). Assume a lumped (diagonal) mass in the measured coordinates;
+- **non-reciprocal**, with an outside power source (follower loads, flutter, a
+  brake pad on a spinning disc, feedback control, active metamaterials). No
+  structure applies; the free mode stays available;
+- **through an unmeasured part with its own mass** (a flexible base): not an
+  interaction among the measured entities, and it adds memory. The part must
+  become an entity.
+
+The structure itself is textbook: compatibility, constitutive law, equilibrium
+(Strang's AᵀCA; incidence matrices in networks; B and Bᵀ in FEM; gradient and
+divergence in PDEs). It is not our claim. The novelty stays in the policy
+(section 3): it writes the laws and decides which interactions exist inside
+this structure.
 
 ### 2.1 Graph view
+
+The two-participant, one-axis case of 2.0 (a bond is an interaction with
+δ = qᵢ − qⱼ). Interactions over more participants are hyperedges.
 
 - **Nodes** are the masses, plus the ground.
 - **Bonds** are the springs, dampers and contacts between masses.
@@ -138,6 +200,14 @@ signs, so the policy can never get the signs wrong.
 
 Every Fᵢⱼ enters exactly twice with opposite signs, whatever the policy writes,
 so the law holds by construction; nothing in the method needs to check it.
+
+Matrix form, covering ground terms, bonds and elements at once (section 2.0):
+
+    M q̈ = Aᵀ F(A q, A q̇)
+
+Row e of A is interaction e's kinematics: a single 1 for a ground term, +1 and
+−1 for a bond, (1, −2, 1) for bending, B for an FEM element. With nonlinear
+kinematics A becomes the Jacobian of δ.
 
 Three DOFs, every connection allowed:
 
@@ -161,8 +231,11 @@ variables, so 9 each.
 ### 2.4 Assumptions to state in the paper
 
 - Every DOF is measured in absolute (inertial) coordinates.
-- Connections act through the relative motion of their two ends (any spring,
-  damper or contact between two masses does).
+- Every interaction acts through a deformation of its participants and passes
+  its law back by the transpose rule (section 2.0); in Phase 1 the deformation
+  is the difference of two DOFs on one axis.
+- No gyroscopic, inertial or non-reciprocal coupling, and no coupling through
+  an unmeasured part with mass (the list in 2.0).
 - Lumped translational DOFs with a diagonal mass matrix.
 - External forcing enters as ground (node) terms.
 
@@ -208,6 +281,7 @@ test, costs extra simulations.
 - "First to enforce Newton's third law" (neural ODEs, FEM and constrained
   SINDy already do).
 - "First to use relative coordinates" (textbook).
+- The transpose (AᵀCA) structure itself (textbook).
 
 ### 3.5 Why symmetry methods don't cover it
 
@@ -296,6 +370,11 @@ missed, then run the framing past the PI.
   means and scales, so it is not proportional to q1 − q2.
 - In simulation the assembled equations compute Δ from the simulated states at
   every RK4 stage.
+- Other kinematics (section 2.0, the `kinematics` option): δₑ = Σₚ aₑₚ qₚ, same
+  build-in-physical-units-then-normalize rule. A fitted ratio (qᵢ − ρqⱼ) is the
+  existing `dleaf` restricted to the bond's two DOFs, except that the same
+  weights also distribute the force (the transpose rule); ρ is fitted per
+  candidate like an exponent, so the normalization of δ is recomputed per ρ.
 
 ### 5.3 Assembly (`assemble_system`, new)
 
@@ -378,6 +457,7 @@ with −wⱼ), DOF rows stacked, masses fixed or scanned. This doubles as the
 ### 5.9 Options (all off by default; 'free' stays byte-identical to today)
 
 - `structure = 'free' | 'bonds'`
+- `kinematics = 'difference' | 'ratio' | A` (A given, e.g. from a mesh; Phase 4)
 - `topology = 'chain' | 'all' | [(i, j), ...]`
 - `masses = None (fit ratios) | [m1, ..., mN]`
 - `dissipative_only = False`
@@ -438,7 +518,9 @@ metric in section 7.
 
 - **k-node interactions**: k = 1 ground, k = 2 bond, k ≥ 3 element. Needed for
   beam bending (curvature uses wᵢ₋₁, wᵢ, wᵢ₊₁, so pairwise bonds only give
-  string/wave equations) and for FEM elements.
+  string/wave equations) and for FEM elements. In the matrix form of 2.2 these
+  are rows of A with three or more entries; with a mesh, A (the B matrices) is
+  given and the policy writes only the laws.
 - **Energy-based laws**: generate a potential and a dissipation function;
   derivatives give self-equilibrated forces for any k, and invariance to rigid
   rotation gives moment balance.
@@ -489,10 +571,18 @@ solution.
    fitting for the paper, fixed as a check.
 2. Dissipative-only rule on by default?
 3. Topology default for N ≥ 3 ('all' with the topology action, or 'chain').
-4. Is assuming "connections act through relative motion" acceptable for the
-   claims?
+4. Is assuming "interactions act through a deformation, by the transpose rule"
+   acceptable for the claims (section 2.4)?
 5. Reward weights stay the user's own (the user reports NRMSE-only works well).
 6. Scope and timeline against the PI's expectations.
+7. Headline: "Newton's third law by construction" (pairs on one axis only) or
+   "interactions by the transpose rule" (energy bookkeeping and reciprocity
+   always, Newton's third law whenever the row sums to zero)? Suggest the
+   second: it is the version that carries to FEM and PDEs.
+8. Kinematics in Phase 1: difference only (suggested); fitted ratio as an
+   option later; rows of A from a mesh in Phase 4.
+9. Gyroscopic (skew) interactions as a second structured class: later, or out
+   of scope?
 
 ## 9. Risks
 
@@ -513,8 +603,8 @@ Restarted 2026-10-16 from the general form; the momentum-balance lessons were
 dropped with Phase 0. Examples are illustrations; nothing depends on one
 dataset.
 
-- [ ] L1 The general form: entities, local terms, exchange terms, assembly; instances from ODEs to PDEs and FEM (section 2.0)
-- [ ] L2 Exchange laws depend on relative state; relative variables and normalization (Phase 1)
+- [ ] L1 The general form: entities, interactions, deformations, one law each, the transpose rule; what it guarantees; which couplings it can and cannot express; instances from ODEs to PDEs and FEM (section 2.0)
+- [ ] L2 Deformation variables: the difference and beyond (ratios, sums, stencils, B matrices); building and normalizing them (Phase 1)
 - [ ] L3 The joint fit: shared coefficients, unknown scale factors (masses), variable projection (Phase 1)
 - [ ] L4 Policy internals today (slices, terms, embeddings, attention mask, STOP) and what changes (Phases 1–2)
 - [ ] L5 RL training: system-level reward, GRPO, buffers, per-slice credit (Phases 1–3)
