@@ -2203,6 +2203,9 @@ def test_coupling_levels():
                 check("newton3: the relative term's forces cancel",
                       float(np.max(np.abs(f0 + f1))) < 1e-9 * float(np.max(np.abs(f0)) + 1),
                       f"max |m0 F0 + m1 F1| {float(np.max(np.abs(f0 + f1))):.1e}")
+                eq = dc.denormalize_expr(*exprs[1], 1)
+                check("newton3 prints a coupling as powers of the difference, "
+                      "never expanded", '(x-y)' in eq and 'x**2*y' not in eq, eq)
                 zero = lambda pre: [t for t, m in zip(dc.ALL_TOKENS,
                                                       dc.newton3_mask(0, pre))
                                     if m == 0]
@@ -2221,6 +2224,18 @@ def test_coupling_levels():
                       len(out) == 2 and '[config] coupling=newton3' in buf.getvalue(),
                       [ln.strip() for ln in buf.getvalue().splitlines()
                        if 'best row' in ln][-1:])
+        # A curve a bit stiffer than cubic, the exponent capped at 3: without
+        # the ridge a cube plus a power tuned to 2.999998 fake it with
+        # coefficients of +-3e4 that cancel; the joint fit must not.
+        u = np.linspace(-2.0, 2.0, 4000)
+        design = lambda ev: np.column_stack(
+            [u ** 3, np.sign(u) * np.abs(u) ** ev['p']])
+        coef, ev = dc._varpro(design, np.sign(u) * np.abs(u) ** 3.05, ['p'],
+                              {'p': 'power'}, ridge=dcp.RIDGE)
+        big = np.max(np.abs(design(ev) * coef)) / np.max(np.abs(design(ev) @ coef))
+        check("the joint fit's ridge keeps near-identical terms from huge "
+              "opposite coefficients", big < 2.0,
+              f"largest term {big:.2f}x the fit, coefficients {coef}")
     finally:
         dc.configure_grammar(N_DOF)
         (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,

@@ -1997,14 +1997,15 @@ def _basis_rows(ctx, phi, ys, setup):
     return np.concatenate(parts)
 
 
-def _varpro(design, b, exp_slots, slot_kind, limits=None):
+def _varpro(design, b, exp_slots, slot_kind, limits=None, ridge=0.0):
     """Variable projection: given the exponent-like slot values ``ev`` the fit
     is the linear least-squares ``design(ev) @ coef ~= b``.  The slots are
     searched on their grids -- exhaustively up to ``MAX_GRID_COMBOS``
     combinations, by coordinate descent beyond that, up to ``MAX_EXP_SLOTS``
     slots -- and then polished.  ``slot_kind[s]`` picks slot ``s``'s grid and
-    bound, which ``limits[s] = (lo, hi)`` narrows.  Returns ``(coef, ev)``, or
-    ``(None, None)``.
+    bound, which ``limits[s] = (lo, hi)`` narrows.  ``ridge`` > 0 adds
+    ``ridge * sum_j |coef_j * column_j|^2`` to the cost, searched and polished
+    on alike.  Returns ``(coef, ev)``, or ``(None, None)``.
     """
     limits = limits or {}
 
@@ -2012,8 +2013,13 @@ def _varpro(design, b, exp_slots, slot_kind, limits=None):
         A = design(ev)
         if not np.all(np.isfinite(A)):
             return None, None, np.inf
-        coef, *_ = np.linalg.lstsq(A, b, rcond=None)
-        res = A @ coef - b
+        bb = b
+        if ridge:
+            A = np.vstack([A, np.diag(np.sqrt(ridge)
+                                      * np.linalg.norm(A, axis=0))])
+            bb = np.concatenate([b, np.zeros(A.shape[1])])
+        coef, *_ = np.linalg.lstsq(A, bb, rcond=None)
+        res = A @ coef - bb
         return coef, res, float(res @ res)
 
     # ── no exponents: a single exact least-squares solve ────────────────────
@@ -2106,13 +2112,14 @@ def _varpro(design, b, exp_slots, slot_kind, limits=None):
         # oscillation -- the damped-oscillator truth came back with a = 0.000
         # pinned against the lower bound.
         bnds = [_bound(s) for s in cont_slots]
+        n_res = len(b) + (design(best_ev).shape[1] if ridge else 0)
 
         def _resid(p):
             ev = dict(best_ev)
             for i, s in enumerate(cont_slots):
                 ev[s] = float(np.clip(p[i], *bnds[i]))
             _c, r, _cost = _solve(ev)
-            return r if r is not None else np.full(len(b), 1e6)
+            return r if r is not None else np.full(n_res, 1e6)
 
         try:
             # diff_step MUST exceed the column caches' key granularity.  They
@@ -2727,10 +2734,8 @@ def denormalize_expr(tau, consts, dof, digits=4):
             if k < 2 * N_DOF:
                 subs[SYMS[v]] = ((sp.Symbol(disp[v]) - float(X_mean[k]))
                                  / float(X_std[k]))
-            else:                                   # a relative leaf
-                a, b = PAIRS[(k - 2 * N_DOF) // 2]
-                subs[SYMS[v]] = ((sp.Symbol(disp[VARIABLES[2 * a + k % 2]])
-                                  - sp.Symbol(disp[VARIABLES[2 * b + k % 2]]))
+            else:   # a relative leaf: one symbol, so it is never expanded
+                subs[SYMS[v]] = (sp.Symbol(disp[v])
                                  / float(PAIR_STD[k - 2 * N_DOF]))
         sym_expr = sym_expr.subs(subs)
         sym_expr = sp.expand(float(y_mean[dof]) + float(y_std[dof]) * sym_expr)

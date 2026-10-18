@@ -526,14 +526,17 @@ integrated over DOF i's own variable, times m_i/m_j, so
 m_i ∂q̈_i/∂q_j = m_j ∂q̈_j/∂q_i. Under `'newton3'` that partner is the mirror,
 −(m_i/m_j) times the term, so the coupling forces cancel. A term and its
 partners share their constants. The row's constants, and the mass ratios m_d/m_0
-unless `masses=[m_0, m_1, ...]` fixes them, are fitted in one closed-form fit;
-then the DOFs are scored together (simulated together under
+unless `masses=[m_0, m_1, ...]` fixes them, are fitted in one closed-form fit,
+with a small ridge so two near-identical terms can't take huge opposite
+coefficients that cancel; then the DOFs are scored together (simulated together under
 `reward='simulation'`). A term the closed form cannot complete is dropped: a
 power of something other than a bare variable, or a coupling product with
 a variable repeated or a `blend`. Each term's tokens are credited with the
 mean of the advantages of the DOFs whose equations it ends up in, so a coupling
 term learns from the equations its partners land in. The best output is the
-best row, not each DOF's best from different rows. Beam search,
+best row, not each DOF's best from different rows. A coupling prints as
+powers of the difference, `(q1-q2)**3`, never expanded into monomials of q1
+and q2. Beam search,
 `sim_coupling`, `seed_list` and `sim_refine` are off at these levels.
 
 ## Policy architecture

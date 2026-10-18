@@ -382,6 +382,11 @@ must-include constraints (NeuroLogic decoding) already exist.
   their grids, limited for coupling factors so the partner's exponents stay
   in [0, MAX_EXP], and mass ratios as extra slots (grid 0.25–4, polished in
   [0.01, 100]).
+- The joint fit carries a ridge (`discover_coupling.RIDGE`, 1e-6 of each
+  term's squared contribution): without it a cube of (q1 − q2) and a `power`
+  of it with the exponent tuned to 2.9999 took coefficients of ±1e12 that
+  cancel, and no rounded print of the equation survived. Couplings print as
+  powers of (q1 − q2), never expanded.
 - Credit per term: the mean of its own DOF's advantage and, for each DOF it
   reaches, the z-score of that DOF's reward in the same row over the batch's
   rows, in log-residual units.
