@@ -186,7 +186,8 @@ def make_context(order_row, slot, slice_taus):
 
 
 # ── Term grammar ────────────────────────────────────────────────────────────
-def term_valid_mask(term_prefix, position, max_term_len, term_grammar='free'):
+def term_valid_mask(term_prefix, position, max_term_len, term_grammar='free',
+                    dof=None):
     """Validity over ``dc.ALL_TOKENS`` for the next token of ONE term.
 
     Term mode differs from the flat grammar in exactly the ways
@@ -194,13 +195,18 @@ def term_valid_mask(term_prefix, position, max_term_len, term_grammar='free'):
     below an implicit root ``add`` (``depth_offset=1``), it may be a bare
     variable, it must not itself be ``add``-rooted, and it has a per-term
     length floor of 1.  ``'varpro'`` additionally restricts a power op's child
-    to a bare variable — the constant-fitter's closed-form domain.
+    to a bare variable — the constant-fitter's closed-form domain.  With the
+    relative leaves on (``coupling='newton3'``), a term of DOF ``dof`` is also
+    kept local or relative (:func:`discover_core.newton3_mask`).
     """
-    return torch.as_tensor(dc.get_valid_tokens(
+    mask = dc.get_valid_tokens(
         term_prefix, position, max_term_len,
         depth_offset=1, min_len=1, allow_leaf_at_zero=True,
         forbid_at_root=('add',),
-        power_child_vars_only=(term_grammar == 'varpro')), dtype=torch.float32)
+        power_child_vars_only=(term_grammar == 'varpro'))
+    if dof is not None and dc.PAIRS:
+        mask = mask * dc.newton3_mask(dof, term_prefix)
+    return torch.as_tensor(mask, dtype=torch.float32)
 
 
 def stop_allowed(term_index, bag):
@@ -211,11 +217,7 @@ def stop_allowed(term_index, bag):
     grammar never produces (no leaf at the root).  Every other one-term bag is
     op-rooted and is a legal flat expression on its own.
     """
-    if term_index == 0:
-        return False
-    if term_index == 1 and len(bag[0]) == 1:
-        return False
-    return True
+    return not (term_index == 0 or (term_index == 1 and len(bag[0]) == 1))
 
 
 # ── Attention mask ──────────────────────────────────────────────────────────
@@ -354,14 +356,11 @@ class TermBagPolicy(nn.Module):
 
 
 # ── Sampling ────────────────────────────────────────────────────────────────
-def sample_term_batch(policy, batch_size, n_dof, dof_order, term_grammar='free',
-                      fixed_slices=None, device=None):
+def sample_term_batch(policy, batch_size, n_dof, dof_order, term_grammar='free'):
     """Sample ``batch_size`` joint sequences, one term at a time.
 
-    ``dof_order``    : ``(n_dof,)`` — one order for the whole batch — or
-                       ``(B, n_dof)`` for a per-row order.
-    ``fixed_slices`` : optional ``{dof: tau}`` pinned (split into terms and
-                       written into ``x``) instead of sampled.
+    ``dof_order`` : ``(n_dof,)`` — one order for the whole batch — or
+                    ``(B, n_dof)`` for a per-row order.
 
     returns a list of ``B`` dicts ``{dof: tau}``, where each ``tau`` is the
     ASSEMBLED sum of the terms drawn for that slice, in the order they were
@@ -390,7 +389,7 @@ def sample_term_batch(policy, batch_size, n_dof, dof_order, term_grammar='free',
         raise ValueError(f"term_grammar must be one of {TERM_GRAMMARS}, "
                          f"got {term_grammar!r}")
     policy.eval()
-    device = next(policy.parameters()).device if device is None else device
+    device = next(policy.parameters()).device
     K, Lt, STOP = policy.max_terms, policy.max_term_len, policy.stop_idx
 
     order = np.asarray(dof_order, dtype=np.int64)
@@ -405,19 +404,6 @@ def sample_term_batch(policy, batch_size, n_dof, dof_order, term_grammar='free',
                       dtype=torch.long, device=device)
     bags = [[[] for _ in range(n_dof)] for _ in range(batch_size)]   # [b][slot] -> [term, ...]
     closed = [[False] * n_dof for _ in range(batch_size)]
-
-    fixed = dict(fixed_slices or {})
-    for b in range(batch_size):
-        for s in range(n_dof):
-            d = int(order[b, s])
-            if d not in fixed:
-                continue
-            terms = dc.split_terms(fixed[d])[:K]
-            bags[b][s] = [list(t)[:Lt] for t in terms]
-            for j, t in enumerate(bags[b][s]):
-                for p, tk in enumerate(t):
-                    x[b, s, j, p] = dc.tok2idx(tk)
-            closed[b][s] = True
 
     for slot in range(n_dof):
         for j in range(K):
@@ -434,7 +420,8 @@ def sample_term_batch(policy, batch_size, n_dof, dof_order, term_grammar='free',
                 for b in range(batch_size):
                     if tdone[b]:
                         continue
-                    r = term_valid_mask(cur[b], p, Lt, term_grammar)
+                    r = term_valid_mask(cur[b], p, Lt, term_grammar,
+                                        dof=int(order[b, slot]))
                     can_stop = p == 0 and stop_allowed(j, bags[b][slot])
                     r_full = torch.cat([r, torch.tensor([1.0 if can_stop else 0.0])])
                     p_b = prob[b] * r_full
@@ -488,7 +475,8 @@ def build_term_inputs(entries, n_dof, max_terms, max_term_len, device):
     order = torch.zeros(B, n_dof, dtype=torch.long)
     slots = []
     for bi, entry in enumerate(entries):
-        tau, ctx = entry[1], entry[3]
+        ctx = entry[3]
+        tau = ctx.get('own', entry[1])
         dord, slot = ctx['dof_order'], int(ctx['slot'])
         order[bi] = torch.as_tensor(dord, dtype=torch.long)
         slots.append(slot)
@@ -566,7 +554,7 @@ def beam_search_term(policy, x, dof_order, slot, term_index, beam_width,
 
 
 def beam_term_candidates(policy, dof_order, n_dof, beam_width, n_return=10,
-                         term_grammar='free', device=None):
+                         term_grammar='free'):
     """One beam-searched term per DOF, **appended to a sampled bag**.
 
     A joint prefix is sampled exactly as in :func:`sample_term_batch`, so the
@@ -578,33 +566,22 @@ def beam_term_candidates(policy, dof_order, n_dof, beam_width, n_return=10,
 
     Returns ``[(dof, assembled_tau, context), ...]``.
     """
-    device = next(policy.parameters()).device if device is None else device
+    device = next(policy.parameters()).device
     K, Lt  = policy.max_terms, policy.max_term_len
     order  = np.asarray(dof_order, dtype=np.int64).reshape(-1)
 
-    prefix = sample_term_batch(policy, 1, n_dof, order, term_grammar,
-                               device=device)[0]
+    prefix = sample_term_batch(policy, 1, n_dof, order, term_grammar)[0]
     out = []
     for slot in range(n_dof):
         d = int(order[slot])
-        x = torch.full((1, n_dof, K, Lt), dc.MASK_TOKEN,
-                       dtype=torch.long, device=device)
-        slice_taus = []
-        for s in range(n_dof):
-            tau_s = prefix[int(order[s])] if s < slot else []
-            slice_taus.append(tau_s)
-            for j, term in enumerate(dc.split_terms(tau_s)[:K]):
-                for p, tk in enumerate(term[:Lt]):
-                    x[0, s, j, p] = dc.tok2idx(tk)
         bag = [list(t)[:Lt] for t in dc.split_terms(prefix[d])[:K]]
         if len(bag) < K:
             j, base = len(bag), bag
         else:
             j, base = K - 1, bag[:-1]
-        for jj, term in enumerate(base):
-            for p, tk in enumerate(term):
-                x[0, slot, jj, p] = dc.tok2idx(tk)
-        ctx = make_context(order, slot, slice_taus)
+        ctx = make_context(order, slot, [prefix[int(o)] for o in order])
+        x, _order, _slots = build_term_inputs(
+            [(0.0, dc.assemble_terms(base), [], ctx)], n_dof, K, Lt, device)
         for term in beam_search_term(policy, x, order, slot, j, beam_width,
                                      term_grammar, n_return=n_return):
             if not base and len(term) == 1:
@@ -615,7 +592,7 @@ def beam_term_candidates(policy, dof_order, n_dof, beam_width, n_return=10,
 
 # ── J-GRPO for the term layout ──────────────────────────────────────────────
 def jgrpo_terms(policy, policy_old, policy_ref, S_alpha, R_alpha, dof, n_dof,
-                eps, beta, critic=None, critic_max_len=None):
+                eps, beta):
     """J-GRPO objective for one DOF against the shared term-structured policy.
 
     The input is the teacher-forced joint tensor from :func:`build_term_inputs`
@@ -639,11 +616,10 @@ def jgrpo_terms(policy, policy_old, policy_ref, S_alpha, R_alpha, dof, n_dof,
     compressed r-scale.
 
     Returns ``(objective, entropy, contributed)``.  ``contributed=False`` means
-    this DOF has nothing to say this step — nothing above ``R_alpha``, a
-    degenerate advantage spread, or no scorable position.  Under a *shared*
-    policy that must zero out this DOF alone and leave the others' gradients
-    intact, which is why the degenerate cases return a flag instead of
-    aborting the step.
+    this DOF has nothing to say this step — nothing above ``R_alpha`` or a
+    degenerate advantage spread.  Under a *shared* policy that must zero out
+    this DOF alone and leave the others' gradients intact, which is why the
+    degenerate cases return a flag instead of aborting the step.
     """
     device = next(policy.parameters()).device
     zero   = torch.zeros((), device=device)
@@ -685,18 +661,19 @@ def jgrpo_terms(policy, policy_old, policy_ref, S_alpha, R_alpha, dof, n_dof,
         return zero, zero, False
     group_adv = (batch_rewards - adv_mean) / (adv_std + 1e-6)
 
-    # NOTE: critic baseline kept for reference but intentionally NOT used for
-    # the advantage.  Left here so the critic pathway stays available.
-    if critic is not None and critic_max_len is not None:
-        with torch.no_grad():
-            crit_in = []
-            for e in valid:
-                tokens = ([dc.tok2idx(tk) for tk in e[1]]
-                          + [dc.MASK_TOKEN] * (critic_max_len - len(e[1])))
-                crit_in.append(tokens[:critic_max_len])
-            _critic_baselines = critic(
-                torch.tensor(crit_in, dtype=torch.long, device=device)
-            ).cpu().numpy()
+    # Per-term credit (``coupling`` levels): a term whose partners sit in other
+    # DOFs' equations is credited with the mean of their advantages and this
+    # DOF's, each the z-score over these entries' rows in that DOF's own
+    # log-residual units.  A DOF that scored nothing in a row, or whose
+    # rewards here do not spread, adds nothing.
+    others = {}
+    for j in range(n_dof):
+        got = [(bi, e[3]['row_r'][j]) for bi, e in enumerate(valid)
+               if j != dof and j in e[3].get('row_r', {})]
+        s = dc.log_residual_score(np.array([r for _bi, r in got]))
+        if len(got) > 1 and s.std() >= 1e-3:
+            others.update({(j, bi): float(z) for (bi, _r), z
+                           in zip(got, (s - s.mean()) / (s.std() + 1e-6))})
 
     log_p_cur = F.log_softmax(logits_cur, dim=-1)
     total_obj = torch.zeros((), device=device)
@@ -704,10 +681,13 @@ def jgrpo_terms(policy, policy_old, policy_ref, S_alpha, R_alpha, dof, n_dof,
     n_scored  = 0                                   # token positions (incl. STOP)
 
     for bi, entry in enumerate(valid):
-        tau  = entry[1]
+        tau  = entry[3].get('own', entry[1])
         slot = slots[bi]
         A_i  = float(group_adv[bi])
         terms = dc.split_terms(tau)[:K]
+        A_t = [float(np.mean([A_i] + [others[(r, bi)] for r in dofs
+                                      if (r, bi) in others]))
+               for dofs in entry[3].get('term_dofs', [[]] * len(terms))]
 
         positions = [(j, p, dc.tok2idx(tok))
                      for j, term in enumerate(terms)
@@ -716,6 +696,7 @@ def jgrpo_terms(policy, policy_old, policy_ref, S_alpha, R_alpha, dof, n_dof,
             positions.append((len(terms), 0, STOP))
 
         for j, p, ti in positions:
+            A        = A_t[j] if j < len(terms) else A_i    # STOP: the entry's
             lp_cur_k = log_p_cur[bi, slot, j, p, ti]
             lp_old_k = F.log_softmax(logits_old[bi, slot, j, p], dim=-1)[ti].detach()
             h        = torch.exp(lp_cur_k - lp_old_k)
@@ -723,7 +704,7 @@ def jgrpo_terms(policy, policy_old, policy_ref, S_alpha, R_alpha, dof, n_dof,
             # is only equivalent for A >= 0; for A < 0 it leaves the ratio
             # unclipped below 1-eps, giving unbounded down-weighting gradients
             # on tokens shared with good expressions.
-            obj_k    = torch.min(h * A_i, torch.clamp(h, 1 - eps, 1 + eps) * A_i)
+            obj_k    = torch.min(h * A, torch.clamp(h, 1 - eps, 1 + eps) * A)
             p_ref    = torch.softmax(logits_ref[bi, slot, j, p], dim=-1).detach()
             kl_k     = F.kl_div(log_p_cur[bi, slot, j, p], p_ref,
                                 reduction='sum', log_target=False)
@@ -732,6 +713,4 @@ def jgrpo_terms(policy, policy_old, policy_ref, S_alpha, R_alpha, dof, n_dof,
                 logits=logits_cur[bi, slot, j, p]).entropy()
             n_scored += 1
 
-    if n_scored == 0:
-        return zero, zero, False
     return total_obj / n_scored, total_ent / n_scored, True

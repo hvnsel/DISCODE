@@ -43,9 +43,12 @@ is not swamped by a high-velocity one) and only then averaged::
     r = 1 / ( 1 + mean_i mean_t E_i(t) )
 
 Consequences worth keeping in mind: constants for DOF ``i`` are fit against
-DOF ``i``'s balance alone (``_energy_contexts`` sets ``cum_other = 0``), and
-candidate scoring likewise evaluates one DOF at a time (see
-:func:`energy_worker`).  There is no co-simulation anywhere in the reward path.
+DOF ``i``'s balance alone (see :func:`_energy_contexts`), and candidate
+scoring likewise evaluates one DOF at a time (see :func:`energy_worker`).
+The work-energy reward never co-simulates.  The simulation reward does where
+the trainer's ``sim_coupling`` asks for it: those candidates go to
+:func:`coupled_worker` and are integrated together with other DOFs'
+equations (:func:`coupled_simulation_rewards`).
 
 ``r = 1`` is a perfect energy match.  The reward needs **no forward ODE
 integration**: it uses the *measured* velocities together with the predicted
@@ -129,6 +132,7 @@ any models, and :func:`set_problem_data` once the training data exist.
 
 from __future__ import annotations
 
+import math
 import multiprocessing as _mp
 import os
 from concurrent.futures import ProcessPoolExecutor
@@ -190,7 +194,7 @@ POWER_OPS    = ('power',)
 DIR_LEAVES   = ('dleaf', 'vleaf')
 BINARY_OPS   = ['add', 'mul']            # ['add', 'sub', 'mul']
 UNARY_OPS    = [INTPOWER_OP] + list(POWER_OPS)     # every power operator
-N_ARY_OPS    = ['add', 'sub', 'mul']
+N_ARY_OPS    = ['add', 'mul']
 CONSTANTS    = ['const']
 # Depth 5 (not 4): the root ``add`` of a sum-of-terms costs a whole level, and
 # van der Pol's ``mu*(1 - x^2)*xdot`` needs four levels *below* it.  At 4 the
@@ -252,6 +256,12 @@ BLEND_A_GRID  = (-1.0, -0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5, 1.0)
 BLEND_B_GRID  = (0.0, 0.5, 1.0, 1.5, 2.0)       # frequency
 BLEND_A_BOUND = (-2.0, 2.0)                     # polish bound for a
 BLEND_B_BOUND = (0.0, 3.0)                      # polish bound for b
+
+# The mass ratios m_d/m_0 a coupled system fit searches when masses are not
+# given (discover_coupling): geometric, since only ratios matter.
+MASS_GRID  = (0.25, 0.5, 1.0, 2.0, 4.0)
+MASS_BOUND = (0.01, 100.0)
+
 # MIN_EXP is 0.0, not 0.5, deliberately: sgnpower's exponent is a CHARACTER
 # dial.  sgn(u)*|u|^p is u at p = 1 and sgn(u) at p = 0, continuously in
 # between, so the range [0, 1] interpolates viscous damping into Coulomb
@@ -262,9 +272,6 @@ BLEND_B_BOUND = (0.0, 3.0)                      # polish bound for b
 MIN_EXP      = 0.0
 MAX_EXP      = 3.0
 
-# Tokens that carry an implicit leading coefficient / extra constants.
-# COEFF_TOKENS is rebuilt in configure_grammar (it is the variable set).
-COEFF_TOKENS      = set()
 # Per-operator const-block sizes.  ``intpower`` takes TWO slots (amplitude,
 # exponent) and ``power`` THREE (even amplitude, odd amplitude, exponent), so
 # read the count from ``CONST_SLOTS`` and never assume either.
@@ -277,7 +284,7 @@ CONST_SLOTS       = {}
 
 _OP_TOKENS         = set(BINARY_OPS + UNARY_OPS) | {BLEND_OP}
 _FORBIDDEN_NESTING = {
-    'add': {'add'}, 'sub': {'add'}, 'mul': {'mul'},
+    'add': {'add'}, 'mul': {'mul'},
     # nested fitted powers are degenerate ((|u|^p)^q == |u|^(p*q), and the same
     # for u^n under either op) — forbid any power op directly under another
     **{p: set(UNARY_OPS) for p in UNARY_OPS},
@@ -301,6 +308,8 @@ MASK_TOKEN = N_TOKENS
 VOCAB_SIZE = N_TOKENS + 1
 ARITY      = {}
 SYMS       = {}                       # sympy symbols x1..x{2N}
+PAIRS      = []                       # DOF pairs behind the relative leaves
+PAIR_STD   = None                     # their normalising stds (q, qd per pair)
 VAR_NAMES  = ['x', 'y']               # per-DOF display names (positions)
 
 # ── Problem-data state (set by set_problem_data) ────────────────────────────
@@ -370,7 +379,7 @@ _SPEC_DATA   = {}          # (max_traj, horizon, dof) -> spec_setup, per process
 
 # ── Grammar configuration ───────────────────────────────────────────────────
 def configure_grammar(n_dof: int, var_names=None, directional_leaves=False,
-                      transcendental=False):
+                      transcendental=False, relative_leaves=False):
     """Initialise the global token table for an ``n_dof`` system (2*n_dof vars).
 
     Leaf tokens are the bare state variables (each with an implicit leading
@@ -389,17 +398,24 @@ def configure_grammar(n_dof: int, var_names=None, directional_leaves=False,
     ``intpower(dleaf)`` is how ``(q_1 - q_2)^3`` becomes ONE term instead of
     the four monomials its expansion needs.  Bare variables are kept, so the
     default table is unchanged when this is off.
+
+    ``relative_leaves`` (``coupling='newton3'``) appends, for every pair of
+    DOFs a < b, two more variables after the states: q_a - q_b and
+    qd_a - qd_b, each normalised by its own std (``PAIR_STD``).  They are
+    variables in every respect (``x{2N+1}``, ``x{2N+2}``, ...), evaluated from
+    the states by :func:`_feats`; odd columns are still velocities.
     """
-    global N_DOF, N_VARS, VARIABLES, VAR_SET, COL_MAP, COEFF_TOKENS
+    global N_DOF, N_VARS, VARIABLES, VAR_SET, COL_MAP, PAIRS
     global ALL_TOKENS, N_TOKENS, MASK_TOKEN, VOCAB_SIZE, ARITY, SYMS, VAR_NAMES
     global DIR_LEAF_SET, LEAF_CHANNELS, CONST_SLOTS, TRANSCENDENTAL_OPS
 
     N_DOF  = int(n_dof)
-    N_VARS = 2 * N_DOF
+    PAIRS  = ([(a, b) for a in range(N_DOF) for b in range(a + 1, N_DOF)]
+              if relative_leaves else [])
+    N_VARS = 2 * N_DOF + 2 * len(PAIRS)
     VARIABLES = [f'x{i + 1}' for i in range(N_VARS)]
     VAR_SET   = set(VARIABLES)
     COL_MAP   = {v: i for i, v in enumerate(VARIABLES)}
-    COEFF_TOKENS = set(VARIABLES)
 
     if directional_leaves:
         DIR_LEAF_SET  = set(DIR_LEAVES)
@@ -451,7 +467,12 @@ def set_problem_data(norm_stats, raw_trajectories, energy_normalize=True,
     ``max_traj=None`` means "use every registered trajectory".
     """
     global NORM_STATS, RAW_TRAJECTORIES, ENERGY_NORMALIZE, MAX_TRAJ, W_ACC
+    global PAIR_STD
     NORM_STATS       = norm_stats
+    PAIR_STD = (np.array([np.concatenate([tr[2][2 * a + v] - tr[2][2 * b + v]
+                                          for tr in raw_trajectories]).std()
+                          + 1e-8 for a, b in PAIRS for v in (0, 1)])
+                if PAIRS else None)
     RAW_TRAJECTORIES = raw_trajectories
     ENERGY_NORMALIZE = bool(energy_normalize)
     MAX_TRAJ = len(raw_trajectories) if max_traj is None else int(max_traj)
@@ -540,23 +561,8 @@ def describe_reward():
     return text
 
 
-def set_energy_options(energy_normalize=True):
-    global ENERGY_NORMALIZE
-    ENERGY_NORMALIZE = bool(energy_normalize)
-
-
 def _resolve_max_traj(max_traj):
     return MAX_TRAJ if max_traj is None else int(max_traj)
-
-
-def set_blend_weight(w_acc):
-    """Set the acceleration/energy blend weight (see W_ACC)."""
-    global W_ACC
-    W_ACC = float(np.clip(w_acc, 0.0, 1.0))
-
-
-def _resolve_w_acc(w_acc):
-    return W_ACC if w_acc is None else float(np.clip(w_acc, 0.0, 1.0))
 
 
 def tok2idx(t): return ALL_TOKENS.index(t)
@@ -564,12 +570,29 @@ def idx2tok(i): return ALL_TOKENS[i]
 
 
 def _var_display_map():
-    """x{2d+1} -> position name, x{2d+2} -> velocity name."""
+    """x{2d+1} -> position name, x{2d+2} -> velocity name, and a relative
+    leaf -> its difference, e.g. ``(x-y)``."""
     disp = {}
     for d in range(N_DOF):
         disp[f'x{2 * d + 1}'] = VAR_NAMES[d]
         disp[f'x{2 * d + 2}'] = VAR_NAMES[d] + 'dot'
+    for k, (a, b) in enumerate(PAIRS):
+        for v, dot in enumerate(('', 'dot')):
+            disp[VARIABLES[2 * (N_DOF + k) + v]] = \
+                f'({VAR_NAMES[a]}{dot}-{VAR_NAMES[b]}{dot})'
     return disp
+
+
+def _feats(S):
+    """Normalised leaf columns of physical states ``S`` (rows q1, qd1, q2,
+    ...): the states, then each relative leaf's difference."""
+    X_mean, X_std = NORM_STATS[0], NORM_STATS[1]
+    f = (S - X_mean[:, None]) / X_std[:, None]
+    if not PAIRS:
+        return f
+    rel = np.stack([S[2 * a + v] - S[2 * b + v]
+                    for a, b in PAIRS for v in (0, 1)])
+    return np.concatenate([f, rel / PAIR_STD[:, None]])
 
 
 # ── Numeric power helpers ───────────────────────────────────────────────────
@@ -599,6 +622,7 @@ def exp_slot_grid(kind):
     if kind == 'blend_a': return list(BLEND_A_GRID)
     if kind == 'blend_b': return list(BLEND_B_GRID)
     if kind == INTPOWER_OP: return list(INTPOWER_GRID)
+    if kind == 'mass': return list(MASS_GRID)
     return list(POWER_EXP_GRID)
 
 
@@ -611,6 +635,7 @@ def exp_slot_bound(kind):
     if kind == 'blend_a': return BLEND_A_BOUND
     if kind == 'blend_b': return BLEND_B_BOUND
     if kind == INTPOWER_OP: return (1.0, float(INTPOWER_MAX))
+    if kind == 'mass': return MASS_BOUND
     return (MIN_EXP, MAX_EXP)
 
 
@@ -631,15 +656,22 @@ def count_total_consts(tau):
     return sum(CONST_SLOTS.get(t, 0) for t in tau)
 
 
-# ── sympy <-> tau conversion ────────────────────────────────────────────────
-def expr_to_sympy_str(tau: list, consts: list) -> str:
+def _const_reader(consts):
+    """``_next_const(default=1.0)`` handing out ``consts`` in pre-order as
+    floats, and ``float(default)`` once they run short."""
     const_list = list(consts) if consts else []
     const_idx  = [0]
-    pos        = [0]
 
     def _next_const(default=1.0):
         ci = const_idx[0]; const_idx[0] += 1
         return float(const_list[ci]) if ci < len(const_list) else float(default)
+    return _next_const
+
+
+# ── tau -> sympy conversion ─────────────────────────────────────────────────
+def expr_to_sympy_str(tau: list, consts: list) -> str:
+    _next_const = _const_reader(consts)
+    pos         = [0]
 
     def node_to_str():
         if pos[0] >= len(tau): return '0'
@@ -679,131 +711,10 @@ def expr_to_sympy_str(tau: list, consts: list) -> str:
                 children.append(node_to_str())
             if pos[0] < len(tau): pos[0] += 1
             if tok == 'add': return '(' + ' + '.join(children) + ')'
-            if tok == 'sub': return '(' + ' - '.join(children) + ')'
             if tok == 'mul': return '(' + ' * '.join(children) + ')'
         return tok
 
     return node_to_str()
-
-
-def sympy_to_tau(expr):
-    """Best-effort conversion of a sympy expression into ``(tau, consts)``.
-
-    Handles numbers, bare symbols (with optional numeric coefficient), powers of
-    a symbol, ``Abs(sym)**p`` and ``sign(sym)*Abs(sym)**p``, and Add/Mul of the
-    above.  A plain integer power of a symbol is the standard ``intpower``;
-    every other power form emits ``power``, choosing which of its two
-    amplitudes carries the coefficient by PARITY:
-
-        s**n, n in INTPOWER_GRID  -> intpower, c = coeff
-        Abs(s)**p                 -> even, so c1 = coeff, c2 = 0
-        sign(s)*Abs(s)**p         -> odd,  so c1 = 0,     c2 = coeff
-        s**p, other even integer  -> even (s**p == Abs(s)**p)
-        s**p, anything else       -> odd  (s**p == sign(s)*Abs(s)**p)
-
-    Returns ``None`` on anything unsupported.
-    """
-    tau = []; consts = []
-
-    def _emit_var(sym, coeff):
-        name = str(sym)
-        if name not in VAR_SET:
-            raise ValueError(f"Unknown symbol: {name}")
-        tau.append(name); consts.append(float(coeff))
-
-    def _emit_power(op, sym, p, coeff):
-        """``op`` is 'int' for ``intpower``, else 'even' or 'odd' -- which
-        amplitude of ``power`` gets ``coeff``."""
-        name = str(sym)
-        if name not in VAR_SET:
-            raise ValueError(f"Unknown symbol: {name}")
-        if op == 'int':
-            tau.append(INTPOWER_OP)
-            consts.extend([float(coeff), float(p)])
-        else:
-            c1 = float(coeff) if op == 'even' else 0.0
-            c2 = 0.0 if op == 'even' else float(coeff)
-            tau.append(POWER_OPS[0])
-            consts.extend([c1, c2, float(p)])
-        tau.append(name); consts.append(1.0)     # inner variable coefficient
-
-    def _as_signed_abs_power(e):
-        """Return ('odd', sym, p) for sign(s)*Abs(s)**p patterns."""
-        if isinstance(e, sp.Mul) and len(e.args) == 2:
-            # sympy canonicalises Mul args, so sign(s) may come either side.
-            for a, b in (e.args, e.args[::-1]):
-                if isinstance(a, sp.sign) and isinstance(b, sp.Pow):
-                    base, ex = b.args
-                    if (isinstance(base, sp.Abs) and isinstance(ex, sp.Number)
-                            and a.args[0] == base.args[0]
-                            and isinstance(base.args[0], sp.Symbol)):
-                        return ('odd', base.args[0], float(ex))
-        return None
-
-    def _as_power(e):
-        sap = _as_signed_abs_power(e)
-        if sap is not None:
-            return sap
-        if isinstance(e, sp.Pow):
-            base, ex = e.args
-            if isinstance(ex, sp.Number) and isinstance(base, sp.Symbol):
-                e = float(ex)
-                is_int = abs(e - round(e)) < 1e-12
-                if is_int and float(round(e)) in INTPOWER_GRID:
-                    return ('int', base, float(round(e)))
-                # Outside intpower's range, s**n is Abs(s)**n for even n and
-                # sign(s)*Abs(s)**n for odd n; a non-integer exponent of a bare
-                # symbol is only real for s >= 0, so treat it as the odd branch
-                # (sign(s)|s|^p), which agrees there.
-                is_even = is_int and (int(round(e)) % 2 == 0)
-                return ('even' if is_even else 'odd', base, e)
-            if isinstance(ex, sp.Number):
-                if isinstance(base, sp.Abs) and isinstance(base.args[0], sp.Symbol):
-                    return ('even', base.args[0], float(ex))
-        return None
-
-    def traverse(e, coeff=1.0):
-        if isinstance(e, sp.Symbol):
-            _emit_var(e, coeff); return
-        pw = _as_power(e)
-        if pw is not None:
-            _emit_power(pw[0], pw[1], pw[2], coeff); return
-        if isinstance(e, (sp.Integer, sp.Float, sp.Rational,
-                          sp.core.numbers.NegativeOne, sp.core.numbers.Half)):
-            tau.append('const'); consts.append(float(e) * coeff); return
-        if isinstance(e, sp.Add):
-            if coeff != 1.0:
-                raise ValueError("coefficient on Add unsupported")
-            tau.append('add')
-            for a in list(e.args): traverse(a)
-            tau.append('end'); return
-        if isinstance(e, sp.Mul):
-            args    = list(e.args)
-            nums    = [a for a in args if isinstance(a, sp.Number)]
-            nonnums = [a for a in args if not isinstance(a, sp.Number)]
-            cnum    = coeff * float(np.prod([float(a) for a in nums])) if nums else coeff
-            if len(nonnums) == 1:
-                traverse(nonnums[0], cnum); return
-            # Test the NON-NUMERIC part, not the whole Mul: a scaled
-            # ``-2.5*sign(s)*Abs(s)**p`` has three args, so matching against
-            # ``e`` itself fails the two-arg check and the whole expression is
-            # rejected.  The numeric factors are already folded into ``cnum``.
-            sap = _as_signed_abs_power(sp.Mul(*nonnums, evaluate=False)
-                                       if len(nonnums) == 2 else e)
-            if sap is not None:
-                _emit_power(sap[0], sap[1], sap[2], cnum); return
-            if cnum != 1.0:
-                raise ValueError("coefficient on multi-factor Mul unsupported")
-            tau.append('mul')
-            for a in nonnums: traverse(a)
-            tau.append('end'); return
-        raise ValueError(f"Unsupported: {type(e)} — {e}")
-
-    try:
-        traverse(expr)
-    except ValueError:
-        return None
-    return tau, consts
 
 
 def _parse_local_dict():
@@ -969,6 +880,23 @@ def get_valid_tokens(tau, position, max_len, max_consts=20,
     return mask
 
 
+def newton3_mask(dof, term_prefix):
+    """``'newton3'`` leaf mask over ``ALL_TOKENS`` for one term of DOF
+    ``dof``'s slice: the term is LOCAL (its own q and qd only) or RELATIVE
+    (the two leaves of one pair that contains ``dof``), never both, and never
+    uses another DOF's own variables or a directional leaf."""
+    own = set(VARIABLES[2 * dof:2 * dof + 2])
+    pairs = [set(VARIABLES[2 * (N_DOF + k):2 * (N_DOF + k) + 2])
+             for k, p in enumerate(PAIRS) if dof in p]
+    used = [t for t in term_prefix if t in VAR_SET]
+    ok = (own if used and used[0] in own
+          else next(p for p in pairs if used[0] in p) if used
+          else own.union(*pairs))
+    return np.array([0.0 if (t in VAR_SET or t in DIR_LEAF_SET)
+                     and t not in ok else 1.0 for t in ALL_TOKENS],
+                    dtype=np.float32)
+
+
 # ── Sum-of-terms helpers (term-structured policy) ────────────────────────────
 def _subtree_end(tau, start):
     """Index one past the complete subtree that begins at ``tau[start]``.
@@ -1078,96 +1006,7 @@ def is_complete(tau):
     return len(stack) == 0
 
 
-# ── Expression evaluation (torch, normalised features) ──────────────────────
-def evaluate(tau, x, consts):
-    """``x`` is (N, 2*N_DOF): normalised state-variable columns."""
-    if not tau: return None
-    const_list = list(consts) if consts else []
-    const_idx  = [0]
-    pos        = [0]
-
-    def _next_const(default=1.0):
-        ci = const_idx[0]; const_idx[0] += 1
-        return float(const_list[ci]) if ci < len(const_list) else float(default)
-
-    def parse_node():
-        if pos[0] >= len(tau): return None
-        tok = tau[pos[0]]; pos[0] += 1
-
-        if tok in DIR_LEAF_SET:
-            r = torch.zeros(x.shape[0], dtype=x.dtype, device=x.device)
-            for k, v in dir_leaf_terms(tok):
-                r = r + _next_const(1.0 if k == 0 else 0.0) * x[:, COL_MAP[v]]
-            return None if torch.any(~torch.isfinite(r)) else r
-        if tok in VAR_SET:
-            c = _next_const()
-            r = c * x[:, COL_MAP[tok]]
-            return None if torch.any(~torch.isfinite(r)) else r
-        if tok == 'const':
-            v = _next_const()
-            return torch.full((x.shape[0],), v, dtype=x.dtype, device=x.device)
-        if tok == INTPOWER_OP:
-            c = _next_const()
-            n = _snap_int_power(_next_const(2.0))
-            child = parse_node()
-            if child is None: return None
-            r = c * torch.clamp(torch.pow(child, n), -1e15, 1e15)
-            return None if torch.any(~torch.isfinite(r)) else r
-        if tok in POWER_OPS:
-            c1 = _next_const()
-            c2 = _next_const(0.0)
-            pe = _clip_exp(_next_const(2.0))
-            child = parse_node()
-            if child is None: return None
-            r = (torch.pow(torch.abs(child), float(pe))
-                 * (c1 + c2 * torch.sign(child)))
-            r = torch.clamp(r, -1e15, 1e15)
-            return None if torch.any(~torch.isfinite(r)) else r
-        if tok in TRANSCENDENTAL_OPS:
-            c1 = _next_const()
-            c2 = _next_const(0.0)
-            av = float(np.clip(_next_const(0.0), *BLEND_A_BOUND))
-            bv = float(np.clip(_next_const(1.0), *BLEND_B_BOUND))
-            child = parse_node()
-            if child is None: return None
-            e = torch.clamp(torch.exp(av * child), -1e15, 1e15)
-            r = torch.clamp(e * (c1 * torch.cos(bv * child)
-                                 + c2 * torch.sin(bv * child)), -1e15, 1e15)
-            return None if torch.any(~torch.isfinite(r)) else r
-        if tok in N_ARY_OPS:
-            children = []
-            while pos[0] < len(tau) and tau[pos[0]] != 'end':
-                child = parse_node()
-                if child is None: return None
-                children.append(child)
-            if pos[0] < len(tau): pos[0] += 1
-            if len(children) < 2: return None
-            if tok == 'add':
-                r = children[0]
-                for c in children[1:]: r = r + c
-                return r
-            if tok == 'sub':
-                r = children[0]
-                for c in children[1:]: r = r - c
-                return r
-            if tok == 'mul':
-                r = children[0]
-                for c in children[1:]:
-                    r = r * c
-                    if torch.any(~torch.isfinite(r)): return None
-                return r
-        return None
-
-    try:
-        result = parse_node()
-    except Exception:
-        return None
-    if result is None: return None
-    if torch.any(~torch.isfinite(result)): return None
-    return result
-
-
-# ── Parametric numpy builder (shared by const-opt + compilation) ────────────
+# ── Parametric numpy builder (nonlinear const fit, amplitude slots) ─────────
 def _build_param_code(tau):
     """Return (code_str, n_consts, grid_exp_indices, grid_exp_kinds).
 
@@ -1233,7 +1072,6 @@ def _build_param_code(tau):
             if pos[0] < len(tau): pos[0] += 1
             if not parts: return '0'
             if tok == 'add': return '(' + '+'.join(parts) + ')'
-            if tok == 'sub': return '(' + '-'.join(parts) + ')'
             if tok == 'mul': return '(' + '*'.join(parts) + ')'
         return '0'
 
@@ -1244,13 +1082,9 @@ def _build_param_code(tau):
 # ── Pretty printing ─────────────────────────────────────────────────────────
 def expr_to_str(tau, consts=None):
     if not tau: return '?'
-    disp       = _var_display_map()
-    const_list = list(consts) if consts else []
-    const_idx  = [0]; pos = [0]
-
-    def _next_const(default=1.0):
-        ci = const_idx[0]; const_idx[0] += 1
-        return float(const_list[ci]) if ci < len(const_list) else float(default)
+    disp        = _var_display_map()
+    _next_const = _const_reader(consts)
+    pos         = [0]
 
     def n2s():
         if pos[0] >= len(tau): return '?'
@@ -1307,7 +1141,6 @@ def expr_to_str(tau, consts=None):
             while pos[0] < len(tau) and tau[pos[0]] != 'end': children.append(n2s())
             if pos[0] < len(tau): pos[0] += 1
             if tok == 'add': return '(' + ' + '.join(children) + ')'
-            if tok == 'sub': return '(' + ' - '.join(children) + ')'
             if tok == 'mul': return '(' + ' * '.join(children) + ')'
         return tok
 
@@ -1319,12 +1152,8 @@ def expr_to_str(tau, consts=None):
 def compile_to_numpy(tau, consts):
     """Return ``fn(x1, ..., x{2N})`` evaluating the expression in normalised space."""
     if not tau: return None
-    const_list = list(consts) if consts else []
-    const_idx  = [0]; pos = [0]
-
-    def _next_const(default=1.0):
-        ci = const_idx[0]; const_idx[0] += 1
-        return float(const_list[ci]) if ci < len(const_list) else float(default)
+    _next_const = _const_reader(consts)
+    pos         = [0]
 
     def build():
         if pos[0] >= len(tau): return None
@@ -1369,7 +1198,6 @@ def compile_to_numpy(tau, consts):
             if pos[0] < len(tau): pos[0] += 1
             if not parts: return '0'
             if tok == 'add': return '(' + '+'.join(parts) + ')'
-            if tok == 'sub': return '(' + '-'.join(parts) + ')'
             if tok == 'mul': return '(' + '*'.join(parts) + ')'
         return '0'
 
@@ -1455,21 +1283,24 @@ def _predicted_accel(fn, feats, y_mean_d, y_std_d):
     return y_mean_d + y_std_d * pred_n
 
 
-def energy_reward(exprs, max_traj=None, horizon=None, w_acc=None):
+def energy_reward(exprs, max_traj=None, horizon=None):
     """Global work-energy reward for a full set of per-DOF expressions.
 
     ``exprs`` is a length-``N_DOF`` list whose entry ``d`` is ``(tau, consts)``
-    for DOF ``d`` or ``None`` if that DOF has no expression yet.  DOFs that are
-    ``None`` are omitted from *both* the predicted-power sum and the measured
-    kinetic-energy sum so the balance stays consistent.
+    for DOF ``d`` or ``None`` if that DOF has no expression yet.  Only the DOFs
+    that have one are scored, each on its OWN balance: per trajectory, its
+    running residual ``|cum_power_d(t) - dKE_d(t)|`` (divided by
+    ``std(dKE_d)`` when ``ENERGY_NORMALIZE``) is averaged over time and
+    blended with its acceleration NRMSE by ``W_ACC``, and the DOFs are then
+    averaged.  The first ``max_traj`` trajectories (``None`` = the configured
+    ``MAX_TRAJ``) are combined by :func:`discover_rollout.combine_trials`
+    (``TRIAL_DECAY``) into ``e``.
 
-    Returns ``r = 1 / (1 + mean_t |cum_power(t) - dKE(t)|)`` averaged over the
-    first ``max_traj`` trajectories (``None`` = the configured ``MAX_TRAJ``);
-    0 if nothing is evaluable.
+    Returns ``r = 1 / (1 + e)``; 0 if nothing is evaluable.
     """
     if NORM_STATS is None or not RAW_TRAJECTORIES:
         return 0.0
-    X_mean, X_std, y_mean, y_std = NORM_STATS
+    y_mean, y_std = NORM_STATS[2], NORM_STATS[3]
 
     present = [d for d in range(N_DOF) if exprs[d] is not None]
     if not present:
@@ -1481,14 +1312,14 @@ def energy_reward(exprs, max_traj=None, horizon=None, w_acc=None):
             return 0.0
         fns[d] = f
 
-    w = _resolve_w_acc(w_acc)
+    w = W_ACC
     residual_means = []
     for traj in RAW_TRAJECTORIES[:_resolve_max_traj(max_traj)]:
         t_sl, st_sl = _slice_traj(traj, horizon)
         if t_sl is None:
             continue
         acc_meas = _slice_accs(traj, horizon) if w > 0.0 else None
-        feats = (st_sl - X_mean[:, None]) / X_std[:, None]
+        feats = _feats(st_sl)
         # Compute each DOF's residual independently and normalise by its own
         # KE scale so that a low-velocity DOF is not swamped by a high-velocity
         # DOF when both are included in the same energy balance.
@@ -1504,20 +1335,15 @@ def energy_reward(exprs, max_traj=None, horizon=None, w_acc=None):
             dke_d = 0.5 * (vel_d ** 2 - vel_d[0] ** 2)
             res_d = np.abs(cp_d - dke_d)
             if ENERGY_NORMALIZE:
-                scale = float(np.std(dke_d))
-                if scale < 1e-12:
-                    scale = float(np.mean(np.abs(dke_d))) + 1e-12
-                res_d = res_d / scale
+                res_d = res_d / _ro._scale(dke_d)
             e_res = float(np.mean(res_d))
             # Blend in pointwise acceleration NRMSE.  Both terms are already
             # dimensionless (energy by std(dKE), accel by std(a_meas)), so the
             # weighted sum is meaningful without further rescaling.
             if w > 0.0 and acc_meas is not None:
                 a_meas = acc_meas[d, :]
-                a_sc   = float(np.std(a_meas))
-                if a_sc < 1e-12:
-                    a_sc = float(np.mean(np.abs(a_meas))) + 1e-12
-                a_res = float(np.sqrt(np.mean((acc_d - a_meas) ** 2))) / a_sc
+                a_res = (float(np.sqrt(np.mean((acc_d - a_meas) ** 2)))
+                         / _ro._scale(a_meas))
                 per_dof.append((1.0 - w) * e_res + w * a_res)
             else:
                 per_dof.append(e_res)
@@ -1597,12 +1423,11 @@ def _accel_fn(d, expr):
     fn = compile_to_numpy(*expr)
     if fn is None:
         return None
-    X_mean, X_std, y_mean, y_std = NORM_STATS
-    xm, xs = X_mean[:, None], X_std[:, None]
+    y_mean, y_std = NORM_STATS[2], NORM_STATS[3]
     ym, ys = float(y_mean[d]), float(y_std[d])
 
     def accel(S):
-        return ym + ys * fn(*((S - xm) / xs))
+        return ym + ys * fn(*_feats(S))
     return accel
 
 
@@ -1695,8 +1520,9 @@ def simulation_reward(exprs, max_traj=None, horizon=None):
     displacement, velocity and acceleration against the measured ones and of
     the time-frequency and frequency-content terms; see
     :mod:`discover_rollout`.  Aggregated like the energy reward: mean
-    over DOFs per trial, then ``r = 1 / (1 + mean over trials)``.  0 if
-    nothing is evaluable.
+    over DOFs per trial, the trials combined by
+    :func:`discover_rollout.combine_trials` (``TRIAL_DECAY``) into ``e``,
+    then ``r = 1 / (1 + e)``.  0 if nothing is evaluable.
 
     A DOF is simulated alone, so its score never depends on the other DOFs'
     current expressions: the same isolation :func:`energy_worker` relies on.
@@ -1709,8 +1535,7 @@ def simulation_reward(exprs, max_traj=None, horizon=None):
     data = _sim_data(max_traj, horizon)
     if data is None:
         return 0.0
-    t, states, accs, stride, substeps = data
-    if SIM_WEIGHTS[2] > 0.0 and accs is None:
+    if SIM_WEIGHTS[2] > 0.0 and data[2] is None:
         return 0.0                  # nothing measured to compare against
 
     per_dof = []
@@ -1765,12 +1590,13 @@ def coupled_simulation_rewards(exprs, score, max_traj=None, horizon=None):
     Every DOF with an expression in ``exprs`` (a length-N list of
     ``(tau, consts)`` or None) is integrated as one coupled system, each
     equation driven by the others' SIMULATED states; a DOF without one is read
-    off the record.  Each scored DOF gets ``r = 1 / (1 + mean over trials)``
-    of its own channel's residual, weighted as in :func:`simulation_reward`,
-    except that a trial where the set blew up scores every DOF in it 0
-    (:func:`discover_rollout.rollout_set_residuals`).  A scored
-    DOF whose expression does not compile gets 0 and the rest are integrated
-    without it.
+    off the record.  Each scored DOF gets ``r = 1 / (1 + e)``, ``e`` its own
+    channel's residual per trial, weighted as in :func:`simulation_reward`,
+    with the trials combined by :func:`discover_rollout.combine_trials`
+    (``TRIAL_DECAY``) -- except that a trial where the set blew up scores
+    every DOF in it 0 (:func:`discover_rollout.rollout_set_residuals`).  A
+    scored DOF whose expression does not compile gets 0 and the rest are
+    integrated without it.
     """
     out = {int(d): 0.0 for d in score}
     if NORM_STATS is None or not RAW_TRAJECTORIES:
@@ -1853,7 +1679,7 @@ MAX_EXP_SLOTS   = 40
 MAX_CD_PASSES   = 3
 
 
-def _energy_contexts(target_dof, other_exprs, max_traj, horizon):
+def _energy_contexts(target_dof, max_traj, horizon):
     """Precompute the per-trajectory energy context shared by both the fast
     (linear/VARPRO) and the slow (nonlinear) constant fitters.
 
@@ -1865,46 +1691,36 @@ def _energy_contexts(target_dof, other_exprs, max_traj, horizon):
     contained in ``a_target``).  The other DOFs are therefore *not* mixed into
     the balance: doing so would let their prediction errors contaminate this
     DOF's constants and would let a high-KE DOF swamp a low-KE one.
-    ``other_exprs`` is accepted for API compatibility but no longer used.
 
     Returns ``(contexts, ym_t, ys_t)`` where each context is
-    ``(t_sl, cols, vel_t, cum_other, dke, scale, acc_t, acc_scale)`` with
-    ``cum_other == 0``.  ``acc_t`` is the MEASURED acceleration of the target
-    DOF (or ``None`` if unavailable) and is used only when ``W_ACC > 0``.
+    ``(t_sl, cols, vel_t, dke, scale, acc_t, acc_scale)``.  ``acc_t`` is the
+    MEASURED acceleration of the target DOF (or ``None`` if unavailable) and
+    is used only when ``W_ACC > 0``.
     """
     if NORM_STATS is None or not RAW_TRAJECTORIES:
         return None, 0.0, 0.0
-    X_mean, X_std, y_mean, y_std = NORM_STATS
+    y_mean, y_std = NORM_STATS[2], NORM_STATS[3]
 
     contexts = []
     for traj in RAW_TRAJECTORIES[:_resolve_max_traj(max_traj)]:
         t_sl, st_sl = _slice_traj(traj, horizon)
         if t_sl is None:
             continue
-        n     = st_sl.shape[1]
-        feats = (st_sl - X_mean[:, None]) / X_std[:, None]
+        feats = _feats(st_sl)
         vel_t = st_sl[2 * target_dof + 1, :]
         # Per-DOF balance: no contribution from the other DOFs.
-        cum_other = np.zeros(n)
-        dke       = 0.5 * (vel_t ** 2 - vel_t[0] ** 2)
+        dke   = 0.5 * (vel_t ** 2 - vel_t[0] ** 2)
         # Normalise by this DOF's own KE so a low-velocity DOF is weighted the
         # same as a high-velocity one.
-        scale = 1.0
-        if ENERGY_NORMALIZE:
-            scale = float(np.std(dke))
-            if scale < 1e-12:
-                scale = float(np.mean(np.abs(dke))) + 1e-12
+        scale = _ro._scale(dke) if ENERGY_NORMALIZE else 1.0
         cols = [feats[k, :] for k in range(N_VARS)]
         accs_sl = _slice_accs(traj, horizon)
         if accs_sl is not None:
             acc_t = accs_sl[target_dof, :]
-            acc_scale = float(np.std(acc_t))
-            if acc_scale < 1e-12:
-                acc_scale = float(np.mean(np.abs(acc_t))) + 1e-12
+            acc_scale = _ro._scale(acc_t)
         else:
             acc_t, acc_scale = None, 1.0
-        contexts.append((t_sl, cols, vel_t, cum_other, dke, scale,
-                         acc_t, acc_scale))
+        contexts.append((t_sl, cols, vel_t, dke, scale, acc_t, acc_scale))
 
     ym_t, ys_t = float(y_mean[target_dof]), float(y_std[target_dof])
     return contexts, ym_t, ys_t
@@ -1986,18 +1802,16 @@ def _expand_monomials(node):
                 for c, sl in zip(node['cols'], node['coeffs'])]
     if op == 'const':
         return [{'factors': [], 'amp': {node['val']}, 'exps': set()}]
-    if op == INTPOWER_OP:
+    if op == INTPOWER_OP or op in POWER_OPS or op == 'blend':
         ch = node['child']
         if ch.get('op') != 'var':
-            return None          # power of a non-variable subtree -> nonlinear
+            return None          # op of a non-variable subtree -> nonlinear
+    if op == INTPOWER_OP:
         # ONE monomial, the plain u^n: a single amplitude, so unlike ``power``
         # there is no other-parity twin for the fit to hand a nonzero value.
         return [{'factors': [(INTPOWER_OP, ch['col'], node['exp'])],
                  'amp': {node['coeff']}, 'exps': {node['exp']}}]
     if op in POWER_OPS:
-        ch = node['child']
-        if ch.get('op') != 'var':
-            return None          # power of a non-variable subtree -> nonlinear
         # TWO monomials sharing ONE exponent slot: the even part |u|^p with
         # amplitude c1, and the odd part sgn(u)|u|^p with amplitude c2.  Both
         # are existing factor kinds, so ``_eval_monomial`` needs no change --
@@ -2008,9 +1822,6 @@ def _expand_monomials(node):
                 {'factors': [('sgnpower', col, e)],
                  'amp': {node['c2']}, 'exps': {e}}]
     if op == 'blend':
-        ch = node['child']
-        if ch.get('op') != 'var':
-            return None          # blend of a non-variable subtree -> nonlinear
         # Two monomials sharing BOTH nonlinear slots: e^(a u) cos(b u) with
         # amplitude c1 and e^(a u) sin(b u) with amplitude c2.  Given (a, b) the
         # term is linear in the amplitudes, so the closed form still applies --
@@ -2082,12 +1893,11 @@ def _eval_monomial(mono, cols, exp_val, n):
     return np.where(np.isfinite(phi), phi, 0.0)
 
 
-def _fit_consts_linear(tau, contexts, ym_t, ys_t, n_consts):
-    """Closed-form (0 exponents) / VARPRO (1-2 exponents) constant fit.
-
-    Returns a consts list of length ``n_consts`` on success, or ``None`` to
-    signal the caller should fall back to the nonlinear optimiser.
-    """
+def _linear_plan(tau):
+    """``(monos, matched, exp_slots, slot_kind)`` for the closed-form fit of
+    ``tau``: its monomials, the amplitude slot each one owns alone, the sorted
+    exponent-like slots and the factor kind of each; or None when ``tau`` is
+    not linear in its amplitudes given those slots."""
     try:
         root, _nc = _parse_tree(tau)
         monos = _expand_monomials(root)
@@ -2100,18 +1910,14 @@ def _fit_consts_linear(tau, contexts, ym_t, ys_t, n_consts):
     # to 1 reproduces independent amplitudes); otherwise it isn't separable.
     amp_sets = [m['amp'] for m in monos]
     matched = []
-    for j in range(len(monos)):
-        others = set()
-        for k in range(len(monos)):
-            if k != j:
-                others |= amp_sets[k]
-        excl = amp_sets[j] - others
+    for j, amp in enumerate(amp_sets):
+        excl = amp.difference(*amp_sets[:j], *amp_sets[j + 1:])
         if not excl:
             return None
         matched.append(min(excl))
 
     exp_slots = sorted(set().union(*[m['exps'] for m in monos]))
-    # which power op owns each exponent slot (drives the grid type below)
+    # which power op owns each exponent slot (drives the grid type)
     slot_kind = {}
     for m in monos:
         for f in m['factors']:
@@ -2122,109 +1928,100 @@ def _fit_consts_linear(tau, contexts, ym_t, ys_t, n_consts):
                 slot_kind[f[3]] = 'blend_b'
             else:
                 slot_kind[f[2]] = f[0]
-    M = len(monos)
+    return monos, matched, exp_slots, slot_kind
 
-    # ── Fit-row subsampling ─────────────────────────────────────────────────
-    # Quadrature accuracy requires INTEGRATING on the fine time grid, but the
-    # least-squares fit of ~M coefficients does not need every integrated row.
-    # All cumtrapz below run on the full grid; only the rows handed to lstsq
-    # are strided down to <= MAX_FIT_ROWS.
-    #
-    # BLEND: the fit objective must match the SCORING objective, or the search
-    # ranks candidates by a criterion their constants were never optimised for.
-    # Both objectives are linear in the coefficients given the exponents:
-    #
-    #   energy :  (dKE - int(v*ym)) / s_e  ~=  sum_j c_j * ys*int(v*phi_j)/s_e
-    #   accel  :  (a_meas - ym)     / s_a  ~=  sum_j c_j * ys*phi_j       /s_a
-    #
-    # so the blend is one stacked least-squares problem with the energy rows
-    # scaled by sqrt(1-w) and the acceleration rows by sqrt(w).  Both targets
-    # are pre-normalised to unit-ish variance (by std(dKE) and std(a_meas)
-    # respectively), which is what makes w meaningful as a weight rather than
-    # an arbitrary units conversion.  The acceleration block needs no cumtrapz,
-    # so w=1 is strictly cheaper than w=0.
-    w = _resolve_w_acc(None)
+
+# ── Fit rows ────────────────────────────────────────────────────────────────
+# Quadrature accuracy requires INTEGRATING on the fine time grid, but the
+# least-squares fit of ~M coefficients does not need every integrated row.
+# All cumtrapz run on the full grid; only the rows handed to lstsq are strided
+# down to <= MAX_FIT_ROWS.
+#
+# BLEND: the fit objective must match the SCORING objective, or the search
+# ranks candidates by a criterion their constants were never optimised for.
+# Both objectives are linear in the coefficients given the exponents:
+#
+#   energy :  (dKE - int(v*ym)) / s_e  ~=  sum_j c_j * ys*int(v*phi_j)/s_e
+#   accel  :  (a_meas - ym)     / s_a  ~=  sum_j c_j * ys*phi_j       /s_a
+#
+# so the blend is one stacked least-squares problem with the energy rows
+# scaled by sqrt(1-w) and the acceleration rows by sqrt(w).  Both targets are
+# pre-normalised to unit-ish variance (by std(dKE) and std(a_meas)
+# respectively), which is what makes w meaningful as a weight rather than an
+# arbitrary units conversion.  The acceleration block needs no cumtrapz, so
+# w=1 is strictly cheaper than w=0.
+def _fit_setup(contexts):
+    """``(use_e, use_a, sq_e, sq_a, stride)``: which row blocks the fit
+    stacks, the sqrt weight of each and the row stride."""
+    w = W_ACC
     use_e = w < 1.0
-    use_a = w > 0.0 and all(c[6] is not None for c in contexts)
+    use_a = w > 0.0 and all(c[5] is not None for c in contexts)
     if not use_a:
         w, use_e, use_a = 0.0, True, False
-    sq_e, sq_a = np.sqrt(1.0 - w), np.sqrt(w)
-
     n_pts = sum(len(c[2]) for c in contexts)
-    stride = max(1, int(np.ceil(n_pts / MAX_FIT_ROWS)))
+    return (use_e, use_a, np.sqrt(1.0 - w), np.sqrt(w),
+            max(1, int(np.ceil(n_pts / MAX_FIT_ROWS))))
 
-    ctx_b = []
-    for (t_sl, cols, vel_t, cum_other, dke, scale, acc_t, acc_scale) in contexts:
-        parts = []
-        if use_e:
-            off = _cumtrapz(vel_t * ym_t, t_sl)
-            parts.append(sq_e * ((dke - cum_other - off) / scale)[::stride])
-        if use_a:
-            parts.append(sq_a * ((acc_t - ym_t) / acc_scale)[::stride])
-        ctx_b.append(np.concatenate(parts))
-    b_full  = np.concatenate(ctx_b)
-    total_n = len(b_full)
 
-    # ── Integrated-column cache ─────────────────────────────────────────────
-    # A monomial's column depends only on the exponent slots IT contains
-    # (usually one), so cache per (context, monomial, relevant slot values):
-    # an 18x18 grid then costs 18 integrations per single-slot monomial
-    # instead of 324.
-    col_cache = {}
+def _target_rows(ctx, ym, setup):
+    """One context's least-squares target: energy block, then acceleration."""
+    t_sl, _cols, vel_t, dke, scale, acc_t, acc_scale = ctx
+    use_e, use_a, sq_e, sq_a, stride = setup
+    parts = []
+    if use_e:
+        parts.append(sq_e * ((dke - _cumtrapz(vel_t * ym, t_sl))
+                             / scale)[::stride])
+    if use_a:
+        parts.append(sq_a * ((acc_t - ym) / acc_scale)[::stride])
+    return np.concatenate(parts)
 
-    def _column(ci, j, exp_val):
-        m = monos[j]
-        key = (ci, j, tuple(sorted((s, round(float(exp_val[s]), 6))
-                                   for s in m['exps'])))
-        col = col_cache.get(key)
-        if col is None:
-            (t_sl, cols, vel_t, cum_other, dke, scale, _at, _as) = contexts[ci]
-            phi = _eval_monomial(m, cols, exp_val, len(vel_t))
-            # The column must be stacked EXACTLY as b_full was: energy block
-            # then acceleration block, each carrying the same sqrt weight that
-            # was applied to its half of the target.  Weighting only the target
-            # (and not the design matrix) does not weight the problem at all —
-            # it just rescales the residual — so both must be done together.
-            parts = []
-            if use_e:
-                parts.append(sq_e * (ys_t * _cumtrapz(vel_t * phi, t_sl)
-                                     / scale)[::stride])
-            if use_a:
-                # a_phys = ym + ys*pred, so the acceleration column is simply
-                # ys*phi / std(a_meas) — no integration, which is why w=1 is
-                # cheaper per candidate than w=0.
-                parts.append(sq_a * (ys_t * phi / _as)[::stride])
-            col = np.concatenate(parts)
-            col_cache[key] = col
-        return col
 
-    def _solve(exp_val):
-        A = np.vstack([
-            np.column_stack([_column(ci, j, exp_val) for j in range(M)])
-            for ci in range(len(contexts))])
+def _basis_rows(ctx, phi, ys, setup):
+    """Basis ``phi``'s design column in one context.
+
+    It must be stacked EXACTLY as :func:`_target_rows`: energy block then
+    acceleration block, each carrying the sqrt weight applied to its half of
+    the target.  Weighting only the target (and not the design matrix) does not
+    weight the problem at all -- it just rescales the residual.  a_phys =
+    ym + ys*pred, so the acceleration column is simply ys*phi / std(a_meas):
+    no integration, which is why w=1 is cheaper per candidate than w=0.
+    """
+    t_sl, _cols, vel_t, _dke, scale, _acc_t, acc_scale = ctx
+    use_e, use_a, sq_e, sq_a, stride = setup
+    parts = []
+    if use_e:
+        parts.append(sq_e * (ys * _cumtrapz(vel_t * phi, t_sl)
+                             / scale)[::stride])
+    if use_a:
+        parts.append(sq_a * (ys * phi / acc_scale)[::stride])
+    return np.concatenate(parts)
+
+
+def _varpro(design, b, exp_slots, slot_kind, limits=None):
+    """Variable projection: given the exponent-like slot values ``ev`` the fit
+    is the linear least-squares ``design(ev) @ coef ~= b``.  The slots are
+    searched on their grids -- exhaustively up to ``MAX_GRID_COMBOS``
+    combinations, by coordinate descent beyond that, up to ``MAX_EXP_SLOTS``
+    slots -- and then polished.  ``slot_kind[s]`` picks slot ``s``'s grid and
+    bound, which ``limits[s] = (lo, hi)`` narrows.  Returns ``(coef, ev)``, or
+    ``(None, None)``.
+    """
+    limits = limits or {}
+
+    def _solve(ev):
+        A = design(ev)
         if not np.all(np.isfinite(A)):
             return None, None, np.inf
-        coef, *_ = np.linalg.lstsq(A, b_full, rcond=None)
-        res = A @ coef - b_full
+        coef, *_ = np.linalg.lstsq(A, b, rcond=None)
+        res = A @ coef - b
         return coef, res, float(res @ res)
-
-    def _finish(coef, exp_val):
-        if coef is None or not np.all(np.isfinite(coef)):
-            return None
-        consts = [1.0] * n_consts
-        for j in range(M):
-            consts[matched[j]] = float(coef[j])
-        for s, v in exp_val.items():
-            consts[s] = float(v)
-        return consts
 
     # ── no exponents: a single exact least-squares solve ────────────────────
     if not exp_slots:
-        coef, _res, _cost = _solve({})
-        return _finish(coef, {})
+        return _solve({})[0], {}
 
     if len(exp_slots) > MAX_EXP_SLOTS:
-        return None
+        return None, None
 
     # ── exponent search, then polish continuous slots (VARPRO) ──────────────
     # Each slot is searched on its own kind's grid (``exp_slot_grid``):
@@ -2232,18 +2029,22 @@ def _fit_consts_linear(tau, contexts, ym_t, ys_t, n_consts):
     # combination, and it is never polished -- see below), ``power`` on
     # POWER_EXP_GRID (its factor kinds are the internal 'abspower'/'sgnpower'
     # names), ``blend`` on its (a, b) grids.  The NONLINEAR fallback in
-    # ``optimise_consts_energy`` reads the same grids, so the two paths agree --
-    # unlike the old intpower pair, whose closed-form grid ran 1..INTPOWER_MAX
-    # while its nonlinear grid also searched the negative exponents.  Negative
-    # exponents are reachable from neither path by design: u^-n and |u|^-p are
-    # singular at the origin.
+    # ``optimise_consts_energy`` reads the same grids, so the two paths agree.
+    # Negative exponents are reachable from neither path by design: u^-n and
+    # |u|^-p are singular at the origin.
     def _slot_grid(s):
-        return exp_slot_grid(slot_kind.get(s))
+        lo, hi = limits.get(s, (-np.inf, np.inf))
+        return [v for v in exp_slot_grid(slot_kind.get(s)) if lo <= v <= hi]
+
+    def _bound(s):
+        lo, hi = exp_slot_bound(slot_kind.get(s))
+        a, z = limits.get(s, (lo, hi))
+        return max(lo, a), min(hi, z)
 
     grids = [_slot_grid(s) for s in exp_slots]
-    n_combos = 1
-    for g in grids:
-        n_combos *= len(g)
+    if not all(grids):
+        return None, None
+    n_combos = math.prod(len(g) for g in grids)
 
     if n_combos <= MAX_GRID_COMBOS:
         # Exhaustive over the product grid: globally optimal on the grid.
@@ -2255,7 +2056,7 @@ def _fit_consts_linear(tau, contexts, ym_t, ys_t, n_consts):
                 best_cost, best_ev = cost, dict(ev)
     else:
         # ── Cyclic coordinate descent over exponent slots ───────────────────
-        # The product grid explodes (4 intpower slots = 18^4 = 104976 combos),
+        # The product grid explodes (5 power slots = 5^5 = 3125 combos),
         # but the fit is LINEAR given the exponents, so sweeping one slot at a
         # time costs sum(len(grid)) per pass instead of prod(len(grid)).  This
         # matters more than it looks: the expanded-cube truth structure
@@ -2263,10 +2064,9 @@ def _fit_consts_linear(tau, contexts, ym_t, ys_t, n_consts):
         # old `len(exp_slots) > 2 -> return None` rule it was pushed onto the
         # multi-start nonlinear optimiser and systematically under-fit — the
         # exact same structure scored 0.925 fitted that way and 0.999 fitted
-        # exactly.  Structurally-wrong 2-slot candidates got the exact path and
-        # therefore beat the truth on reward.  Coordinate descent is not
-        # guaranteed globally optimal on the grid, but it is enormously better
-        # than handing the whole problem to a nonlinear solver.
+        # exactly.  Coordinate descent is not guaranteed globally optimal on
+        # the grid, but it is enormously better than handing the whole problem
+        # to a nonlinear solver.
         best_ev = {}
         for s in exp_slots:
             g = _slot_grid(s)
@@ -2286,7 +2086,7 @@ def _fit_consts_linear(tau, contexts, ym_t, ys_t, n_consts):
             if not improved:
                 break
     if best_ev is None:
-        return None
+        return None, None
 
     # Every ``power`` exponent gets a least-squares polish after the grid search,
     # so a fitted exponent is NOT restricted to grid points -- it can land on
@@ -2301,53 +2101,98 @@ def _fit_consts_linear(tau, contexts, ym_t, ys_t, n_consts):
     # between ``intpower`` and ``power``.
     cont_slots = [s for s in exp_slots if slot_kind.get(s) != INTPOWER_OP]
     if cont_slots:
-        def _resid(p):
-            ev = dict(best_ev)
-            for i, s in enumerate(cont_slots):
-                lo, hi = exp_slot_bound(slot_kind.get(s))
-                ev[s] = float(np.clip(p[i], lo, hi))
-            _c, r, _cost = _solve(ev)
-            return r if r is not None else np.full(total_n, 1e6)
-
         # PER-KIND bounds.  A shared [MIN_EXP, MAX_EXP] silently clamps a
         # blend's decay rate to be non-negative, which forbids every decaying
         # oscillation -- the damped-oscillator truth came back with a = 0.000
         # pinned against the lower bound.
-        bnds = [exp_slot_bound(slot_kind.get(s)) for s in cont_slots]
+        bnds = [_bound(s) for s in cont_slots]
+
+        def _resid(p):
+            ev = dict(best_ev)
+            for i, s in enumerate(cont_slots):
+                ev[s] = float(np.clip(p[i], *bnds[i]))
+            _c, r, _cost = _solve(ev)
+            return r if r is not None else np.full(len(b), 1e6)
+
         try:
-            # diff_step MUST exceed the column cache's key granularity.  The
-            # cache rounds exponent values to 6 decimals, so least_squares'
-            # default step of ~1.5e-8 lands on the SAME key, the perturbed solve
-            # reuses the cached column, the residual comes back bitwise
-            # identical, the numerical gradient is exactly zero, and the polish
-            # terminates at its starting point.  This was latent for as long as
-            # the polish only ran on the disabled abspower/sgnpower slots.
+            # diff_step MUST exceed the column caches' key granularity.  They
+            # round exponent values to 6 decimals, so least_squares' default
+            # step of ~1.5e-8 lands on the SAME key, the perturbed solve reuses
+            # the cached column, the residual comes back bitwise identical, the
+            # numerical gradient is exactly zero, and the polish terminates at
+            # its starting point.
             rr = least_squares(_resid,
                                np.array([best_ev[s] for s in cont_slots]),
-                               bounds=([b[0] for b in bnds],
-                                       [b[1] for b in bnds]),
+                               bounds=([b_[0] for b_ in bnds],
+                                       [b_[1] for b_ in bnds]),
                                diff_step=1e-3, max_nfev=40)
             for i, s in enumerate(cont_slots):
-                lo, hi = bnds[i]
-                best_ev[s] = float(np.clip(rr.x[i], lo, hi))
+                best_ev[s] = float(np.clip(rr.x[i], *bnds[i]))
         except Exception:
             pass
 
-    coef, _res, _cost = _solve(best_ev)
-    return _finish(coef, best_ev)
+    return _solve(best_ev)[0], best_ev
 
 
-def optimise_consts_energy(tau, target_dof, other_exprs=None,
-                           max_traj=None, horizon=None,
-                           n_inits=3, max_nfev=150):
+def _fit_consts_linear(tau, contexts, ym_t, ys_t, n_consts):
+    """Closed-form / VARPRO (:func:`_varpro`) constant fit of ``tau`` to one
+    DOF's ``contexts``.
+
+    Returns a consts list of length ``n_consts`` on success, or ``None`` to
+    signal the caller should fall back to the nonlinear optimiser.
+    """
+    plan = _linear_plan(tau)
+    if plan is None:
+        return None
+    monos, matched, exp_slots, slot_kind = plan
+    setup = _fit_setup(contexts)
+    b_full = np.concatenate([_target_rows(c, ym_t, setup) for c in contexts])
+
+    # ── Integrated-column cache ─────────────────────────────────────────────
+    # A monomial's column depends only on the exponent slots IT contains
+    # (usually one), so cache per (context, monomial, relevant slot values):
+    # a two-slot 5x5 POWER_EXP_GRID search then costs 5 integrations per
+    # single-slot monomial instead of 25.
+    col_cache = {}
+
+    def _column(ci, j, exp_val):
+        m = monos[j]
+        key = (ci, j, tuple(sorted((s, round(float(exp_val[s]), 6))
+                                   for s in m['exps'])))
+        if key not in col_cache:
+            ctx = contexts[ci]
+            col_cache[key] = _basis_rows(
+                ctx, _eval_monomial(m, ctx[1], exp_val, len(ctx[2])),
+                ys_t, setup)
+        return col_cache[key]
+
+    def _design(exp_val):
+        return np.vstack([
+            np.column_stack([_column(ci, j, exp_val)
+                             for j in range(len(monos))])
+            for ci in range(len(contexts))])
+
+    coef, ev = _varpro(_design, b_full, exp_slots, slot_kind)
+    if coef is None or not np.all(np.isfinite(coef)):
+        return None
+    consts = [1.0] * n_consts
+    for j, s in enumerate(matched):
+        consts[s] = float(coef[j])
+    for s, v in ev.items():
+        consts[s] = float(v)
+    return consts
+
+
+def optimise_consts_energy(tau, target_dof, max_traj=None, horizon=None,
+                           max_nfev=150):
     """Fit ``tau``'s constants to minimise the target DOF's **own** running
     energy residual ``| integral(vel_t * a_target) - 1/2 (vel_t^2 - vel_t0^2) |``.
 
     The per-DOF work-energy relation is an exact kinematic identity, so each DOF
-    is fit independently.  ``other_exprs`` is accepted for API compatibility but
-    is no longer used (the other DOFs are not mixed into this DOF's balance, so
-    their errors cannot contaminate its constants).  ``max_traj=None`` uses the
-    configured ``MAX_TRAJ`` — the same trajectories the reward scores on.
+    is fit independently: the other DOFs are not mixed into this DOF's
+    balance, so their errors cannot contaminate its constants.
+    ``max_traj=None`` uses the configured ``MAX_TRAJ`` — the same trajectories
+    the reward scores on.
 
     Fast path: for expressions that are linear in their coefficients given the
     exponents, the fit is a closed-form least-squares / variable projection;
@@ -2364,9 +2209,7 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
     if NORM_STATS is None or not RAW_TRAJECTORIES:
         return [1.0] * n_consts
 
-    _X_mean, _X_std, y_mean, y_std = NORM_STATS
-
-    contexts, ym_t, ys_t = _energy_contexts(target_dof, other_exprs, max_traj, horizon)
+    contexts, ym_t, ys_t = _energy_contexts(target_dof, max_traj, horizon)
     if not contexts:
         return [1.0] * n_consts
 
@@ -2376,9 +2219,7 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
         return fast
 
     # Fallback: general nonlinear least-squares (multi-start).
-    code, n_c, grid_exp_indices, grid_exp_kinds = _build_param_code(tau)
-    if n_c != n_consts:
-        n_consts = n_c
+    code, _n_c, grid_exp_indices, grid_exp_kinds = _build_param_code(tau)
     sig = ','.join(VARIABLES)
     try:
         fn_param = eval(f'lambda c,{sig}: {code}',
@@ -2386,24 +2227,17 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
     except Exception:
         return [1.0] * n_consts
 
-    _total_rows = sum(len(ctx[2]) for ctx in contexts)
-    _stride = max(1, int(np.ceil(_total_rows / MAX_FIT_ROWS)))
-
-    # Same blend as the fast path.  If the fallback minimised the pure energy
-    # residual while the reward scored a blend, constants would be optimised
-    # for a different objective than the one they are judged by — the exact
-    # fit/score mismatch that makes candidates look worse than they are.
-    _w     = _resolve_w_acc(None)
-    _use_a = _w > 0.0 and all(c[6] is not None for c in contexts)
-    if not _use_a:
-        _w = 0.0
-    _sq_e, _sq_a = np.sqrt(1.0 - _w), np.sqrt(_w)
+    # Same rows and blend as the fast path.  If the fallback minimised the
+    # pure energy residual while the reward scored a blend, constants would be
+    # optimised for a different objective than the one they are judged by —
+    # the exact fit/score mismatch that makes candidates look worse than they
+    # are.
+    _use_e, _use_a, _sq_e, _sq_a, _stride = _fit_setup(contexts)
 
     def residuals(c):
         parts = []
-        for (t_sl, cols, vel_t, cum_other, dke, scale,
-             acc_t, acc_scale) in contexts:
-            n_bad = len(vel_t[::_stride]) * (2 if _use_a else 1)
+        for (t_sl, cols, vel_t, dke, scale, acc_t, acc_scale) in contexts:
+            n_bad = len(vel_t[::_stride]) * (_use_e + _use_a)
             try:
                 with np.errstate(invalid='ignore', over='ignore'):
                     pred_n = fn_param(c, *cols)
@@ -2417,8 +2251,10 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
                 parts.append(np.ones(n_bad) * 1e6)
                 continue
             acc  = ym_t + ys_t * pred_n
-            if _w < 1.0:
-                cum = _cumtrapz(vel_t * acc, t_sl) + cum_other
+            if _use_e:
+                # ``+ 0.0`` turns a -0.0 into +0.0, as adding the old
+                # all-zero ``cum_other`` did: the residuals stay bitwise equal
+                cum = _cumtrapz(vel_t * acc, t_sl) + 0.0
                 parts.append(_sq_e * ((cum - dke) / scale)[::_stride])
             if _use_a:
                 parts.append(_sq_a * ((acc - acc_t) / acc_scale)[::_stride])
@@ -2436,10 +2272,9 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
     else:
         opt_method = 'lm'; opt_bounds = (-np.inf, np.inf)
 
-    rng     = np.random.default_rng()
     # scale of the energy target sets the coefficient scale
     e_scale = 1.0
-    for (_t, _cols, vel_t, _co, dke, _s, _at, _as) in contexts:
+    for (_t, _cols, vel_t, dke, _s, _at, _as) in contexts:
         e_scale = max(e_scale, float(np.std(dke)) + 1e-9)
 
     def _make_smart(cs, pv, direction='unit'):
@@ -2485,31 +2320,20 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
                 init.extend([cs] * CONST_SLOTS[t])
         return np.array(init, dtype=float)
 
-    inits = [
-        _make_smart( e_scale, 1.0), _make_smart( e_scale, 2.0),
-        _make_smart( e_scale, 3.0), _make_smart(-e_scale, 1.0),
-        _make_smart(-e_scale, 2.0), _make_smart(-e_scale, 3.0),
-        _make_smart( e_scale * 0.1, 3.0), _make_smart(-e_scale * 0.1, 3.0),
-    ]
+    # Three starts (the first alone per pinned grid point below), seeding the
+    # other two canonical directions first when there is a directional leaf.
     if any(t in DIR_LEAF_SET for t in tau):
-        # Seed the other two canonical directions before the random restarts.
-        inits = ([_make_smart( e_scale, 3.0, 'diff'),
-                  _make_smart(-e_scale, 3.0, 'diff'),
-                  _make_smart( e_scale, 3.0, 'sum'),
-                  _make_smart(-e_scale, 3.0, 'sum')] + inits)
-    inits += [
-        np.ones(n_consts), np.zeros(n_consts),
-        rng.uniform(-e_scale * 2, e_scale * 2, n_consts),
-        rng.uniform(-1, 1, n_consts),
-    ]
+        inits = [_make_smart( e_scale, 3.0, 'diff'),
+                 _make_smart(-e_scale, 3.0, 'diff'),
+                 _make_smart( e_scale, 3.0, 'sum')]
+    else:
+        inits = [_make_smart(e_scale, 1.0), _make_smart(e_scale, 2.0),
+                 _make_smart(e_scale, 3.0)]
     for init in inits:
-        if len(init) != n_consts:
-            continue
         # per-kind, like the bounds: an init outside its slot's bound makes
         # least_squares reject the start as infeasible
         for pi, kd in zip(grid_exp_indices, grid_exp_kinds):
             init[pi] = float(np.clip(init[pi], *exp_slot_bound(kd)))
-    inits = [i for i in inits if len(i) == n_consts][:n_inits]
 
     # Grid the exponent slots instead of optimising through them: pin each to a
     # grid point of its kind with a hairline bound and fit everything else.
@@ -2529,10 +2353,8 @@ def optimise_consts_energy(tau, target_dof, other_exprs=None,
         if combo is None:
             lb_c, ub_c, method_c = opt_bounds[0], opt_bounds[1], opt_method
         else:
-            lb_c = np.array(opt_bounds[0], dtype=float).copy()
-            ub_c = np.array(opt_bounds[1], dtype=float).copy()
-            if lb_c.ndim == 0:
-                lb_c = np.full(n_consts, -np.inf); ub_c = np.full(n_consts, np.inf)
+            lb_c = np.array(opt_bounds[0], dtype=float)
+            ub_c = np.array(opt_bounds[1], dtype=float)
             for pi, n in zip(grid_exp_indices, combo):
                 lb_c[pi], ub_c[pi] = n - 1e-6, n + 1e-6
             method_c = 'trf'
@@ -2597,12 +2419,14 @@ def init_energy_worker(n_dof, var_names, norm_stats, raw_trajs,
                        energy_normalize=True, max_traj=5, w_acc=None,
                        directional_leaves=False, transcendental=False,
                        reward='energy', sim_window=None,
-                       sim_weights=(1.0, 0.0, 0.0, 0.0), trial_decay=1.0):
-    # BOTH grammar flags MUST match the parent's: a worker with a different
+                       sim_weights=(1.0, 0.0, 0.0, 0.0), trial_decay=1.0,
+                       relative_leaves=False):
+    # Every grammar flag MUST match the parent's: a worker with a different
     # token table computes a different ``count_total_consts`` for the same tau
     # and silently mis-fits every candidate it is handed.  The reward settings
     # likewise, or the pool scores by a different reward than the parent logs.
-    configure_grammar(n_dof, var_names, directional_leaves, transcendental)
+    configure_grammar(n_dof, var_names, directional_leaves, transcendental,
+                      relative_leaves)
     set_problem_data(norm_stats, raw_trajs, energy_normalize, max_traj, w_acc)
     set_reward(reward, sim_window, sim_weights, trial_decay)
 
@@ -2623,7 +2447,7 @@ def energy_worker(args):
     ``integral(v_d * a_d) = 1/2 (v_d^2 - v_d(0)^2)`` is an exact per-DOF
     kinematic identity: coupling forces are already inside ``a_d``, so DOF d's
     balance is complete without any knowledge of the other DOFs.  The constant
-    fit already exploited this (``_energy_contexts`` sets ``cum_other = 0``).
+    fit already exploited this (``_energy_contexts`` fits each DOF alone).
     Averaging the partner's residual into the score therefore adds no
     within-epoch information — it is a monotone shift shared by every candidate
     of this DOF, so rankings are unchanged — while making scores incomparable
@@ -2637,7 +2461,7 @@ def energy_worker(args):
     ``sim_coupling`` sends to be simulated with other DOFs' equations.
     """
     target_dof, cand_tau, _elite_exprs, horizon = args
-    consts = optimise_consts_energy(cand_tau, target_dof, None, horizon=horizon)
+    consts = optimise_consts_energy(cand_tau, target_dof, horizon=horizon)
     exprs  = [None] * N_DOF
     exprs[target_dof] = (cand_tau, consts)
     r = candidate_reward(exprs, horizon=horizon)
@@ -2681,7 +2505,7 @@ def coupled_worker(args):
     """
     members, tops, horizon, weights = args
     weights = {m: float(w) for m, w in weights.items() if w > 0.0}
-    fitted = [(d, tau, optimise_consts_energy(tau, d, None, horizon=horizon))
+    fitted = [(d, tau, optimise_consts_energy(tau, d, horizon=horizon))
               for d, tau in members]
     alone = {}
 
@@ -2775,17 +2599,10 @@ def _amplitude_slots(tau):
     coefficient, a ``const``, an amplitude -- False if it shapes one (an
     ``intpower`` or ``power`` exponent, a ``blend`` rate), which simulation
     tuning leaves alone so the structure it was found with stays put."""
-    mask = []
-    for t in tau:
-        if t == INTPOWER_OP:
-            mask += [True, False]
-        elif t in POWER_OPS:
-            mask += [True, True, False]
-        elif t in TRANSCENDENTAL_OPS:
-            mask += [True, True, False, False]
-        else:
-            mask += [True] * CONST_SLOTS.get(t, 0)
-    return np.array(mask, dtype=bool)
+    _code, n_c, grid_exp_indices, _kinds = _build_param_code(tau)
+    mask = np.ones(n_c, dtype=bool)
+    mask[grid_exp_indices] = False
+    return mask
 
 
 def refine_worker(args):
@@ -2810,8 +2627,9 @@ def refine_worker(args):
     d, tau, consts, weights, tops, peers, horizon, max_evals = args
     c0 = np.asarray(consts, dtype=float)
     r0, md0 = score_member(d, tau, list(c0), weights, tops, peers, horizon)
-    free = np.flatnonzero(_amplitude_slots(tau))
-    if (free.size == 0 or len(c0) != len(_amplitude_slots(tau))
+    amp = _amplitude_slots(tau)
+    free = np.flatnonzero(amp)
+    if (free.size == 0 or len(c0) != len(amp)
             or max_evals <= 0 or r0 <= 1e-6):
         return (d, r0, tau, list(c0), md0, 0)
     base = c0[free]
@@ -2903,14 +2721,17 @@ def denormalize_expr(tau, consts, dof, digits=4):
         expr_str = expr_to_sympy_str(tau, consts)
         sym_expr = parse_expr(expr_str, local_dict=_parse_local_dict())
 
-        phys = []
+        disp = _var_display_map()
         subs = {}
-        for d in range(N_DOF):
-            q  = sp.Symbol(VAR_NAMES[d])
-            qd = sp.Symbol(VAR_NAMES[d] + 'dot')
-            phys.extend([q, qd])
-        for k in range(N_VARS):
-            subs[SYMS[f'x{k + 1}']] = (phys[k] - float(X_mean[k])) / float(X_std[k])
+        for k, v in enumerate(VARIABLES):
+            if k < 2 * N_DOF:
+                subs[SYMS[v]] = ((sp.Symbol(disp[v]) - float(X_mean[k]))
+                                 / float(X_std[k]))
+            else:                                   # a relative leaf
+                a, b = PAIRS[(k - 2 * N_DOF) // 2]
+                subs[SYMS[v]] = ((sp.Symbol(disp[VARIABLES[2 * a + k % 2]])
+                                  - sp.Symbol(disp[VARIABLES[2 * b + k % 2]]))
+                                 / float(PAIR_STD[k - 2 * N_DOF]))
         sym_expr = sym_expr.subs(subs)
         sym_expr = sp.expand(float(y_mean[dof]) + float(y_std[dof]) * sym_expr)
         accel_name = VAR_NAMES[dof] + 'ddot'

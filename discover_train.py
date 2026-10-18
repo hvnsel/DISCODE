@@ -43,7 +43,11 @@ are still z-scored within a single DOF's batch.
 Buffer entries are ``(reward, tau, consts, context)``.  ``tau`` is the
 flat assembled sum.  The context records the slice order, this slice's slot,
 and the slices that preceded it — everything the sample could see — so the
-entry stays reproducible in isolation and comparable across epochs.
+entry stays reproducible in isolation and comparable across epochs.  Under
+``coupling='reciprocal' | 'newton3'`` ``tau`` is the whole equation, partners
+included, and the context also holds the sampled tau (``'own'``), the DOFs
+each of its terms reaches and the rewards of its row
+(:mod:`discover_coupling`).
 """
 
 from __future__ import annotations
@@ -58,6 +62,7 @@ import torch
 import torch.nn.functional as F
 
 import discover_core as dc
+import discover_coupling as dcp
 import discover_policy as dp
 from discover_data import generate_dataset, select_trials
 
@@ -71,8 +76,8 @@ class DOFState:
     the hall of fame, and the critic.
 
     The critic predicts *this* DOF's reward and is cheap, so it stays here even
-    under a shared policy.  (Its baseline is deliberately computed and not used
-    for the advantage — see :func:`discover_policy.jgrpo_terms`.)  ``max_len``
+    under a shared policy.  (It is trained but deliberately not used for the
+    advantage — see :func:`discover_policy.jgrpo_terms`.)  ``max_len``
     is the critic's token window; an assembled tau longer than that is
     truncated on the way in.
     """
@@ -171,15 +176,14 @@ class PolicyState:
         return out
 
     # ── policy update ───────────────────────────────────────────────────────
-    def update(self, states, C, critic_max_len, eps, beta, lam_t, trainable=None):
+    def update(self, states, C, eps, beta, lam_t, trainable):
         """``trainable`` is the set of DOFs that promoted something this epoch.
 
         A DOF that produced no valid candidate sits the epoch out — under a
         shared policy that also stops a stale buffer from pushing the trunk on
         its own.
         """
-        eligible = [i for i, st in enumerate(states)
-                    if st.buffer and (trainable is None or i in trainable)]
+        eligible = sorted(trainable)
 
         # One shared policy: one backward pass per GRPO step, but the advantage
         # stays per-DOF (never pooled — reward scales differ wildly between
@@ -189,12 +193,10 @@ class PolicyState:
             total_loss = None
             for d in eligible:
                 st = states[d]
-                critic = st.critic if len(st.buffer) >= 32 else None
                 jg, ent, ok = dp.jgrpo_terms(
                     self.policy, self.policy_old, self.policy_ref,
                     st.buffer, R_alpha=min(e[0] for e in st.buffer),
-                    dof=d, n_dof=self.n_dof, eps=eps, beta=beta,
-                    critic=critic, critic_max_len=critic_max_len)
+                    dof=d, n_dof=self.n_dof, eps=eps, beta=beta)
                 if not ok:
                     # A degenerate spread (or nothing above R_alpha) zeroes out
                     # THIS DOF only.  Returning early here would throw away the
@@ -215,7 +217,6 @@ def _train_critic(st, max_len, device):
         return None
     st.critic.train()
     n_cs = min(5, max(1, len(st.buffer) // 32))
-    c_loss = None
     for _ in range(n_cs):
         cb = min(64, len(st.buffer))
         ci = np.random.choice(len(st.buffer), cb, replace=False)
@@ -230,7 +231,7 @@ def _train_critic(st, max_len, device):
         c_loss = F.mse_loss(st.critic(cx), cy)
         st.critic_opt.zero_grad(); c_loss.backward(); st.critic_opt.step()
     st.critic.eval()
-    return c_loss.item() if c_loss is not None else None
+    return c_loss.item()
 
 
 # ── Coupled scoring (reward='simulation', sim_coupling) ─────────────────────
@@ -243,7 +244,7 @@ def _scored_with(entry, dof, n_dof, indent=10):
     physical units -- printed even when it is that DOF's current best -- or,
     scored alone, that the other DOF was not simulated: wherever the equation
     uses that DOF's displacement or velocity, it got the measured data."""
-    sw = entry[3].get('scored_with') if isinstance(entry[3], dict) else None
+    sw = entry[3].get('scored_with')
     if not sw:
         return []
     pad, lines = ' ' * indent, []
@@ -304,8 +305,7 @@ def refresh_partners(states, blend, horizon, max_per_dof=4, max_passes=3):
                 if not st.buffer:
                     break
                 lead = st.buffer[0]
-                sw = (lead[3].get('scored_with')
-                      if isinstance(lead[3], dict) else None) or {}
+                sw = lead[3].get('scored_with') or {}
                 if 'top' not in sw.get('modes', {}):
                     break
                 tops = {j: (o.best_entry[1], o.best_entry[2])
@@ -362,12 +362,12 @@ def _trial_lines(entry, dof, horizon, cache, indent=10):
             f"{pad}({how})"]
 
 
-def _together_lines(states, horizon, cache):
-    """Each DOF's best equation simulated TOGETHER with the other DOFs' best
-    equations -- every DOF driven by the others' simulated motion, as the plot
-    scripts run them -- next to its training score.  ``cache`` holds the last
-    pair scored, so an epoch whose bests did not change costs nothing."""
-    bests = [st.best_entry for st in states]
+def _together_lines(bests, horizon, cache):
+    """Each DOF's best equation (``bests``, one entry per DOF) simulated
+    TOGETHER with the other DOFs' best equations -- every DOF driven by the
+    others' simulated motion, as the plot scripts run them -- next to its
+    training score.  ``cache`` holds the last pair scored, so an epoch whose
+    bests did not change costs nothing."""
     if len(bests) < 2 or any(b is None for b in bests):
         return []
     key = tuple((tuple(b[1]), tuple(np.round(b[2], 12))) for b in bests)
@@ -498,6 +498,12 @@ def DISCOVER_TRAIN(
                                # many equations get their amplitudes tuned on
                                # the simulation itself (0 = off)
     sim_refine_evals = 60,     # simulation: simulations per tuned equation
+    coupling         = 'free', # 'free' | 'reciprocal' | 'newton3' (2+ DOFs):
+                               # complete every sampled row with its coupling
+                               # terms' partners, fit and score it as one
+                               # system (discover_coupling)
+    masses           = None,   # coupling levels: the DOFs' masses (only the
+                               # ratios matter); None fits m_d/m_0
     seed_list        = False,  # True: before epoch 1, put each DOF's best
                                # sparse fits over the monomials up to cubic
                                # and the single-variable powers
@@ -591,6 +597,17 @@ def DISCOVER_TRAIN(
     score.  They are not the grammar's ceiling: ``power`` exponents off the
     grid, products of powers and directional leaves are left to the search.
 
+    ``coupling`` imposes a coupling law on every sampled system: each row
+    (one equation per DOF) is completed with every coupling term's partners
+    in the equations it reaches, its constants are fitted jointly (a term and
+    its partners share theirs, with the mass ratios ``masses`` or fitted) and
+    the DOFs are scored together.  ``'reciprocal'``: the effect of DOF j on
+    equation i equals that of i on j.  ``'newton3'``: also, couplings only
+    through differences, so coupling forces cancel.  Which applies is prior
+    knowledge about the system (``notes_coupling_constraints.md``).  The best
+    output is then the best row; beam search, ``sim_coupling``, ``seed_list``
+    and ``sim_refine`` are off.
+
     ``sim_coupling_mode`` says how the fractions apply.  ``'split'`` scores
     each equation ONE way, drawn with those fractions, and its reward is
     whatever that way scored.  Promotion and the GRPO advantage compare raw
@@ -630,13 +647,31 @@ def DISCOVER_TRAIN(
     N = system.n_dof
     f_top, f_peer = check_coupling(sim_coupling, reward, N, sim_coupling_mode)
     coupled = f_top + f_peer > 0.0
+    blend = ({'alone': 1.0 - f_top - f_peer, 'top': f_top, 'peer': f_peer}
+             if coupled and sim_coupling_mode == 'blend' else None)
     if int(sim_refine) < 0 or int(sim_refine_evals) < 1:
         raise ValueError("sim_refine must be >= 0 and sim_refine_evals >= 1")
     if sim_refine and reward != 'simulation':
         raise ValueError("sim_refine needs reward='simulation'")
+    if coupling not in dcp.LEVELS:
+        raise ValueError(f"coupling must be one of {dcp.LEVELS}, "
+                         f"got {coupling!r}")
+    system_level = coupling != 'free'
+    if system_level:
+        if N < 2 or seed_list or sim_refine:
+            raise ValueError("coupling needs two DOFs or more, and no "
+                             "seed_list or sim_refine")
+        if masses is not None and (len(masses) != N or min(masses) <= 0):
+            raise ValueError(f"masses needs one positive mass per DOF, "
+                             f"got {masses!r}")
+        if coupled:
+            print("[config] sim_coupling ignored: under coupling every "
+                  "candidate is a whole system")
+        f_top, f_peer, coupled, blend = 0.0, 0.0, False, None
+    relative_leaves = coupling == 'newton3'
 
     dc.configure_grammar(N, system.var_names, directional_leaves,
-                         transcendental)
+                         transcendental, relative_leaves)
     print(f"[vocab]  {N}-DOF tokens: {dc.ALL_TOKENS}")
     if directional_leaves:
         print(f"[vocab]  dleaf spans {[dc.VARIABLES[c] for c in dc.LEAF_CHANNELS['dleaf']]}"
@@ -645,6 +680,10 @@ def DISCOVER_TRAIN(
     if transcendental:
         print(f"[vocab]  blend(u) = e^(a u)(c1 cos(b u) + c2 sin(b u)): "
               f"a grid {dc.BLEND_A_GRID}, b grid {dc.BLEND_B_GRID}")
+    if relative_leaves:
+        disp = dc._var_display_map()
+        print("[vocab]  relative leaves: " + ", ".join(
+            f"{v} = {disp[v]}" for v in dc.VARIABLES[2 * N:]))
     print(f"[config] System='{system.name}'  N_DOF={N}  reward={reward}")
     picked = dc.TRIAL_IDS != list(range(system.n_trials))
     print(f"[config] {len(system.time)} pts  {system.t_end:.4g} s  "
@@ -664,11 +703,14 @@ def DISCOVER_TRAIN(
               f"DOFs' equations from the same sample, "
               f"{1.0 - f_top - f_peer:.0%} alone")
     elif coupled:
-        ways = [(m_, w) for m_, w in (('alone', 1.0 - f_top - f_peer),
-                                      ('top', f_top), ('peer', f_peer)) if w > 0]
+        ways = [(m_, w) for m_, w in blend.items() if w > 0]
         print("[config] coupling (blend): every equation scored "
               + ", ".join(_MODE_LABEL[m_] for m_, _w in ways) + "; reward = "
               + " + ".join(f"{w:.2f} {_MODE_LABEL[m_]}" for m_, w in ways))
+    if system_level:
+        print(f"[config] coupling={coupling}: every row completed with its "
+              f"partners, fitted and scored as one system; masses "
+              + ("fitted (m_d/m_0)" if masses is None else str(list(masses))))
     if sim_refine:
         print(f"[config] tuning: per DOF per epoch, the best {sim_refine} "
               f"equations' amplitudes tuned on the simulation "
@@ -686,8 +728,9 @@ def DISCOVER_TRAIN(
         pool, saved_env = dc.make_pool(
             (N, system.var_names, norm_stats, raw_trajs, energy_normalize,
              max_traj, w_acc, directional_leaves, transcendental, reward,
-             sim_window, sim_weights, trial_decay), N_WORKERS)
+             sim_window, sim_weights, trial_decay, relative_leaves), N_WORKERS)
         print(f"Scoring pool : {N_WORKERS} single-threaded workers\n")
+    mapper = pool.map if pool is not None else map
 
     states = [DOFState(max_len, device) for _ in range(N)]
     ps = PolicyState(N, lr, n_epochs, device,
@@ -726,9 +769,7 @@ def DISCOVER_TRAIN(
         if coupled and f_top > 0.0:
             # scored as this run scores its candidates: with the other DOFs'
             # top equations, here their best seeds
-            w0 = ({'alone': 1.0 - f_top - f_peer, 'top': f_top,
-                   'peer': f_peer} if sim_coupling_mode == 'blend'
-                  else {'top': 1.0})
+            w0 = blend if blend is not None else {'top': 1.0}
             for i, st in enumerate(states):
                 tops = {j: (o.best_entry[1], o.best_entry[2])
                         for j, o in enumerate(states)
@@ -748,8 +789,7 @@ def DISCOVER_TRAIN(
                     again.append((float(r), e[1], e[2], ctx))
                 st.buffer = sorted(again, key=lambda z: z[0], reverse=True)
                 st.best_r, st.best_entry = st.buffer[0][0], st.buffer[0]
-            refresh_partners(states, w0 if sim_coupling_mode == 'blend'
-                             else None, h0)
+            refresh_partners(states, blend, h0)
             how += ", with the other DOFs' best seeds as partners"
         print(f"[seed] sparse fits over every monomial up to degree "
               f"{SEED_DEGREE} and the single-variable powers, {how} "
@@ -771,6 +811,7 @@ def DISCOVER_TRAIN(
         print()
 
     together_cache, trial_cache = {}, {}
+    best_row = None    # coupling levels: (mean reward, its entry per DOF)
     for ep in range(n_epochs):
         t0_ep   = time.time()
         horizon = dc.get_traj_horizon(ep, n_epochs, system.t_end)
@@ -786,7 +827,8 @@ def DISCOVER_TRAIN(
         t1 = time.time()
         all_exprs = ps.sample(batch_size,
                               best_r=[st.best_r for st in states],
-                              do_beam=(ep > 0 and ep % beam_interval == 0),
+                              do_beam=(not system_level and ep > 0
+                                       and ep % beam_interval == 0),
                               beam_width=beam_width)
         print(f"  [1-sample]   {batch_size} exprs/DOF  ({time.time()-t1:.2f}s)")
         sys.stdout.flush()
@@ -803,15 +845,19 @@ def DISCOVER_TRAIN(
         # would inflate the pickling cost per candidate; every task carries
         # the (dof, index) slots its results belong to instead.
         t1 = time.time()
-        mode, tops, top_sets, blend = {}, {}, [set() for _ in range(N)], None
+        mode, tops, top_sets = {}, {}, [set() for _ in range(N)]
         iso_tasks, iso_slots, cpl_tasks, cpl_slots = [], [], [], []
+        if system_level:                      # one task per row, no beam
+            for b in range(batch_size):
+                cpl_tasks.append(([all_exprs[i][b][0] for i in range(N)],
+                                  coupling, masses, horizon))
+                cpl_slots.append([(i, b) for i in range(N)])
+                mode.update({(i, b): 'peer' for i in range(N)})
         if coupled:
             n_rows = min([batch_size] + [len(c) for c in all_exprs])
             tops = {j: (st.best_entry[1], st.best_entry[2])
                     for j, st in enumerate(states) if st.best_entry is not None}
             if sim_coupling_mode == 'blend':
-                blend = {'alone': 1.0 - f_top - f_peer, 'top': f_top,
-                         'peer': f_peer}
                 for b in range(n_rows):
                     cpl_tasks.append(([(i, all_exprs[i][b][0])
                                        for i in range(N)], tops, horizon, blend))
@@ -851,16 +897,25 @@ def DISCOVER_TRAIN(
 
         report_every = max(1, n_tasks // 20)  # ~5% granularity
         t_score0 = time.time()
-        if pool is not None:      # both submitted at once: no idle workers
-            runs = [(pool.map(dc.energy_worker, iso_tasks), iso_slots, False),
-                    (pool.map(dc.coupled_worker, cpl_tasks), cpl_slots, True)]
-        else:
-            runs = [(map(dc.energy_worker, iso_tasks), iso_slots, False),
-                    (map(dc.coupled_worker, cpl_tasks), cpl_slots, True)]
-        results, k = {}, 0
+        # (with a pool, both are submitted at once: no idle workers)
+        runs = [(mapper(dc.energy_worker, iso_tasks), iso_slots, False),
+                (mapper(dcp.system_worker if system_level
+                        else dc.coupled_worker, cpl_tasks), cpl_slots, True)]
+        # Every scored candidate as [reward, tau, consts, {mode: reward},
+        # {mode: {dof: (tau, consts)}}, tuned(, coupling extras)]: the partner
+        # equations each mode simulated it with, empty where a DOF was read
+        # off the record.
+        scored, k = {}, 0
         for iterator, slots, many in runs:
             for slot, res in zip(slots, iterator):
-                results.update(zip(slot, res if many else [res]))
+                for key, r_k in zip(slot, res if many else [res]):
+                    if r_k is None:
+                        continue
+                    if len(r_k) > 5:
+                        scored[key] = [*r_k[1:6], False, *r_k[6:]]
+                    else:
+                        scored[key] = [r_k[1], r_k[2], r_k[3],
+                                       {'alone': r_k[1]}, {'alone': {}}, False]
                 k_prev, k = k, k + len(slot)
                 if k // report_every > k_prev // report_every or k == n_tasks:
                     elapsed = time.time() - t_score0
@@ -869,19 +924,6 @@ def DISCOVER_TRAIN(
                     print(f"    [{stage}]   {k}/{n_tasks} scored "
                           f"({100.0*k/n_tasks:5.1f}%)  "
                           f"{rate:6.1f} eq/s  ETA {eta:6.1f}s", flush=True)
-
-        # Every scored candidate as [reward, tau, consts, {mode: reward},
-        # {mode: {dof: (tau, consts)}}, tuned]: the partner equations each mode
-        # simulated it with, empty where a DOF was read off the record.
-        scored = {}
-        for key, res in results.items():
-            if res is None:
-                continue
-            if len(res) > 5:
-                scored[key] = [res[1], res[2], res[3], res[4], res[5], False]
-            else:
-                scored[key] = [res[1], res[2], res[3], {'alone': res[1]},
-                               {'alone': {}}, False]
         print(f"  [{stage}]   scored  ({time.time()-t1:.2f}s)", flush=True)
 
         if sim_refine:
@@ -902,8 +944,7 @@ def DISCOVER_TRAIN(
                     jobs.append((i, tau, c, w, used.get('top', {}),
                                  used.get('peer', {}), horizon, sim_refine_evals))
                     keys.append((i, k))
-            outs = (pool.map(dc.refine_worker, jobs) if pool is not None
-                    else map(dc.refine_worker, jobs))
+            outs = mapper(dc.refine_worker, jobs)
             before, after, n_runs = {}, {}, 0
             for key, out in zip(keys, outs):
                 v = scored[key]
@@ -926,7 +967,19 @@ def DISCOVER_TRAIN(
                 if reward == 'simulation':
                     ctx['scored_with'] = {'modes': v[3], 'partners': v[4],
                                           'tuned': v[5]}
+                if system_level:
+                    ctx.update(v[6], row_r={j: scored[(j, k)][0]
+                                            for j in range(N)
+                                            if (j, k) in scored})
                 per_dof[i].append((v[0], v[1], v[2], ctx))
+        if system_level:
+            for b in range(batch_size):
+                if all((i, b) in scored for i in range(N)):
+                    m = float(np.mean([scored[(i, b)][0] for i in range(N)]))
+                    if best_row is None or m > best_row[0]:
+                        best_row = (m, [tuple(scored[(i, b)][:3])
+                                        + (all_exprs[i][b][1],)
+                                        for i in range(N)])
         if coupled and sim_coupling_mode == 'blend':
             for i in range(N):
                 got = [v for (d, _k), v in scored.items() if d == i]
@@ -1014,7 +1067,7 @@ def DISCOVER_TRAIN(
             c_loss = _train_critic(st, max_len, device)
             report[i] = (max(e[0] for e in batch_r), n_added, n_tuned, c_loss)
 
-        ps.update(states, C, max_len, eps, beta, lam_t, trainable=set(report))
+        ps.update(states, C, eps, beta, lam_t, trainable=set(report))
 
         for i, st in enumerate(states):
             if i not in report:
@@ -1038,20 +1091,22 @@ def DISCOVER_TRAIN(
             # a best scored with the other DOFs' tops is stale once their best
             # changes: re-score it with the current ones
             t2 = time.time()
-            for i, r_old, r_new in refresh_partners(
-                    states, blend if sim_coupling_mode == 'blend' else None,
-                    horizon):
+            for i, r_old, r_new in refresh_partners(states, blend, horizon):
                 print(f"  [3b-partners] DOF {i}: best re-scored with the other "
                       f"DOFs' current best: {r_old:.4f} -> {r_new:.4f}")
             print(f"  [3b-partners] ({time.time() - t2:.2f}s)", flush=True)
 
         # ── epoch report ────────────────────────────────────────────────────
         print(f"\n  [EPOCH TOTAL]  {time.time() - t0_ep:.1f}s")
-        for i, st in enumerate(states):
-            if st.best_entry is None:
+        bests = ([st.best_entry for st in states] if best_row is None
+                 else best_row[1])
+        if best_row is not None:
+            print(f"   best row: mean {best_row[0]:.4f}, masses m/m0 = "
+                  + ", ".join(f"{m:.4g}" for m in bests[0][3]['masses']))
+        for i, be in enumerate(bests):
+            if be is None:
                 print(f"   DOF {i}: (no survivor yet)"); continue
-            be = st.best_entry
-            print(f"   DOF {i}: best_{dc.reward_label()}={st.best_r:.4f}  "
+            print(f"   DOF {i}: best_{dc.reward_label()}={be[0]:.4f}  "
                   f"{dc.expr_to_str(be[1], be[2])}")
             d = dc.denormalize_expr(be[1], be[2], i)
             if d:
@@ -1062,18 +1117,22 @@ def DISCOVER_TRAIN(
                 for line in _trial_lines(be, i, horizon, trial_cache):
                     print(line)
         if reward == 'simulation':
-            for line in _together_lines(states, horizon, together_cache):
+            for line in _together_lines(bests, horizon, together_cache):
                 print(line)
 
     # ── Final summary ───────────────────────────────────────────────────────
     print(f"\n{'=' * 64}\n=== DISCOVER done :: {system.name} ===")
     best_per_dof = []
+    if best_row is not None:
+        print(f"\nBest row: mean reward {best_row[0]:.6f}, masses m/m0 = "
+              + ", ".join(f"{m:.6g}" for m in best_row[1][0][3]['masses']))
     for i, st in enumerate(states):
-        if not st.buffer:
-            print(f"\nDOF {i}: no expression found"); best_per_dof.append(None); continue
         st.buffer.sort(key=lambda z: z[0], reverse=True)
-        best = st.buffer[0]
+        best = (best_row[1][i] if best_row is not None
+                else st.buffer[0] if st.buffer else None)
         best_per_dof.append(best)
+        if best is None:
+            print(f"\nDOF {i}: no expression found"); continue
         print(f"\nDOF {i}")
         print(f"  Expr (normalised) : {dc.expr_to_str(best[1], best[2])}")
         print(f"  {dc.reward_label() + '_reward':<18}: {best[0]:.6f}")

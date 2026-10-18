@@ -436,9 +436,9 @@ def test_directional_leaves():
     and their value, and the default table must be untouched.
 
     The failure this exists to catch is silent and total.  Each directional
-    leaf owns ``N_DOF`` const slots, and *seven* separate functions walk a tau
+    leaf owns ``N_DOF`` const slots, and *six* separate functions walk a tau
     handing out those slots in pre-order (``count_total_consts``,
-    ``_parse_tree``, ``_build_param_code``, ``evaluate``, ``compile_to_numpy``,
+    ``_parse_tree``, ``_build_param_code``, ``compile_to_numpy``,
     ``expr_to_sympy_str``, ``expr_to_str``).  If any one of them disagrees by a
     single slot, every constant after that point shifts by one and the
     candidate is evaluated as a different expression than the one that was
@@ -483,16 +483,10 @@ def test_directional_leaves():
 
         rng = np.random.default_rng(0)
         X = rng.normal(size=(5, 2 * N_DOF))
-        devs = []
         for name, tau in taus.items():
             consts = list(rng.normal(size=dc.count_total_consts(tau)))
             fn = dc.compile_to_numpy(tau, consts)
             a = np.asarray(fn(*[X[:, k] for k in range(2 * N_DOF)]), float)
-            b = dc.evaluate(tau, torch.tensor(X, dtype=torch.float64),
-                            consts).numpy()
-            devs.append(float(np.abs(a - b).max()))
-        check('compile_to_numpy and evaluate agree numerically',
-              max(devs) < 1e-10, f"max deviation {max(devs):.2e}")
 
         fn = dc.compile_to_numpy(['dleaf'], [1.0, -1.0])
         v = np.asarray(fn(*[X[:, k] for k in range(2 * N_DOF)]), float)
@@ -575,10 +569,7 @@ def test_blend():
             consts = cs + [1.0]
             fn = dc.compile_to_numpy(['blend', 'x1'], consts)
             a = np.asarray(fn(*[X[:, k] for k in range(2 * N_DOF)]), float)
-            b = dc.evaluate(['blend', 'x1'],
-                            torch.tensor(X, dtype=torch.float64), consts).numpy()
-            devs.append(max(float(np.abs(a - ref(X[:, 0])).max()),
-                            float(np.abs(a - b).max())))
+            devs.append(float(np.abs(a - ref(X[:, 0])).max()))
         check('blend reproduces exp, cos, sin and a damped oscillation exactly',
               max(devs) < 1e-12, f"max deviation {max(devs):.2e}")
 
@@ -632,8 +623,6 @@ def test_intpower():
     import contextlib
     import io
 
-    import sympy as sp
-
     from discover_data import build_truth_system, generate_dataset
     from discover_mdof_sim import get_mdof_system
     from discover_sdof_sim import get_sdof_system
@@ -674,10 +663,7 @@ def test_intpower():
             consts = [-0.7, float(n), 1.0]
             a = np.asarray(dc.compile_to_numpy(['intpower', 'x1'], consts)(*cols),
                            float)
-            b = dc.evaluate(['intpower', 'x1'],
-                            torch.tensor(X, dtype=torch.float64), consts).numpy()
-            devs.append(max(float(np.abs(a - (-0.7) * X[:, 0] ** n).max()),
-                            float(np.abs(a - b).max())))
+            devs.append(float(np.abs(a - (-0.7) * X[:, 0] ** n).max()))
         check('intpower is c * u**n exactly, odd powers keeping the sign',
               max(devs) < 1e-12, f"max deviation {max(devs):.2e}")
 
@@ -711,22 +697,6 @@ def test_intpower():
         check('no power op may sit directly under another (nesting is degenerate)',
               all(under_int[dc.tok2idx(t)] == 0 and under_pow[dc.tok2idx(t)] == 0
                   for t in ('intpower', 'power')))
-
-        # sympy round trip: plain integer powers come back as intpower, the
-        # Abs / sign forms as power, and the value is unchanged
-        x1, x2 = dc.SYMS['x1'], dc.SYMS['x2']
-        expr = -0.5 * x1 ** 3 + x1 ** 2 * x2 + 2.0 * sp.Abs(x1) ** 1.5
-        rt = dc.sympy_to_tau(expr)
-        ok = rt is not None
-        if ok:
-            tau, consts = rt
-            ref = sp.lambdify([dc.SYMS[v] for v in dc.VARIABLES], expr,
-                              'numpy')(*cols)
-            got = dc.compile_to_numpy(tau, consts)(*cols)
-            ok = (tau.count('intpower') == 2 and tau.count('power') == 1
-                  and np.allclose(got, ref))
-        check('sympy_to_tau maps x**n to intpower and Abs(x)**p to power',
-              ok, f"{rt[0] if rt else rt}")
 
         # The promise itself, through the real closed-form fitter.
         load(get_sdof_system('duffing'), n_traj=2, n_pts=600, t_end=12.0)
@@ -2154,6 +2124,110 @@ def test_scoring_pool():
         dc.set_reward(*saved[5:])
 
 
+def test_coupling_levels():
+    """``coupling='reciprocal' | 'newton3'`` (:mod:`discover_coupling`).
+
+    A completed system must obey its law -- mass-weighted coupling Jacobians
+    symmetric, and under 'newton3' a relative term's forces cancelling -- the
+    joint fit must recover a true system and its mass ratio, the 'newton3'
+    mask must keep every term local or relative, and the trainer must run a
+    coupled level end to end.
+    """
+    import contextlib
+    import io
+
+    import discover_coupling as dcp
+    import discover_train as dt
+    from discover_data import build_truth_system, generate_dataset
+    from discover_mdof_sim import get_mdof_system
+
+    print("\ncoupling levels")
+    saved = (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+             dc.MAX_TRAJ, dc.W_ACC, dc.REWARD_MODE, dc.SIM_WINDOW,
+             dc.SIM_WEIGHTS)
+    rng = np.random.default_rng(0)
+
+    def force(expr, k, d, S, mu):          # m_d * (term k of DOF d's equation)
+        terms = dc.split_terms(expr[0])
+        o = sum(dc.count_total_consts(t) for t in terms[:k])
+        f = dc.compile_to_numpy(
+            terms[k], expr[1][o:o + dc.count_total_consts(terms[k])])
+        return mu[d] * dc.NORM_STATS[3][d] * f(*dc._feats(S))
+
+    try:
+        cases = (
+            ('coupled_duffing', 'reciprocal', None,
+             [['add', 'x1', 'x2', 'x3', 'intpower', 'x1', 'end'],
+              ['add', 'x3', 'x4', 'intpower', 'x3', 'end']]),
+            ('coupled_duffing', 'reciprocal', [1.0, 2.0],
+             [['add', 'x1', 'x2', 'mul', 'x2', 'x4', 'end', 'power', 'x3',
+               'end'], ['add', 'x3', 'x4', 'end']]),
+            ('cubic_coupled', 'newton3', None,
+             [['add', 'x1', 'x2', 'intpower', 'x5', 'end'],
+              ['add', 'x3', 'x4', 'end']]))
+        for key, level, masses, row in cases:
+            with contextlib.redirect_stdout(io.StringIO()):
+                system = build_truth_system(get_mdof_system(key), n_traj=2,
+                                            n_pts=800, t_end=16.0)
+            dc.configure_grammar(2, system.var_names,
+                                 relative_leaves=level == 'newton3')
+            _X, _y, raw, ns = generate_dataset(system, device=None)
+            dc.set_problem_data(ns, raw, True, None, 0.5)
+            dc.set_reward('energy')
+            res = dcp.system_worker((row, level, masses, None))
+            if not check(f"{key}/{level}: the row is completed and scored",
+                         all(r is not None for r in res)):
+                continue
+            exprs, mu = [r[2:4] for r in res], res[0][6]['masses']
+            acc = [dc._accel_fn(d, exprs[d]) for d in range(2)]
+            S = rng.normal(size=(4, 8)) * np.asarray(ns[1])[:4, None]
+            gap = 0.0
+            for v in (0, 1):
+                def jac(a, b, h=1e-5):
+                    Sp, Sm = S.copy(), S.copy()
+                    Sp[2 * b + v] += h; Sm[2 * b + v] -= h
+                    return (acc[a](Sp) - acc[a](Sm)) / (2 * h)
+                gap = max(gap, float(np.max(np.abs(mu[0] * jac(0, 1)
+                                                   - mu[1] * jac(1, 0)))))
+            check(f"{key}/{level}: m0 da0/dq1 = m1 da1/dq0 (and in qdot)",
+                  gap < 1e-6, f"max gap {gap:.1e}, masses {mu}")
+            if masses is None and level == 'reciprocal':
+                check("the true structure is recovered with its mass ratio",
+                      min(r[1] for r in res) > 0.999
+                      and abs(mu[1] - 1.0) < 0.01,
+                      f"rewards {[round(r[1], 5) for r in res]}, m1/m0 "
+                      f"{mu[1]:.4f}; partner "
+                      + dc.denormalize_expr(*exprs[1], 1))
+            if level == 'newton3':
+                f0, f1 = force(exprs[0], 2, 0, S, mu), force(exprs[1], 2, 1, S, mu)
+                check("newton3: the relative term's forces cancel",
+                      float(np.max(np.abs(f0 + f1))) < 1e-9 * float(np.max(np.abs(f0)) + 1),
+                      f"max |m0 F0 + m1 F1| {float(np.max(np.abs(f0 + f1))):.1e}")
+                zero = lambda pre: [t for t, m in zip(dc.ALL_TOKENS,
+                                                      dc.newton3_mask(0, pre))
+                                    if m == 0]
+                check("newton3 mask: other DOFs' raw leaves never; a "
+                      "relative term stays relative",
+                      zero([]) == ['x3', 'x4']
+                      and zero(['mul', 'x5']) == ['x1', 'x2', 'x3', 'x4']
+                      and zero(['mul', 'x1']) == ['x3', 'x4', 'x5', 'x6'])
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    out = dt.DISCOVER_TRAIN(system, n_epochs=1, batch_size=6,
+                                            use_pool=False, coupling=level,
+                                            max_terms=3, max_term_len=4,
+                                            term_grammar='varpro', seed=0)
+                check("the trainer runs coupling='newton3' end to end",
+                      len(out) == 2 and '[config] coupling=newton3' in buf.getvalue(),
+                      [ln.strip() for ln in buf.getvalue().splitlines()
+                       if 'best row' in ln][-1:])
+    finally:
+        dc.configure_grammar(N_DOF)
+        (dc.NORM_STATS, dc.RAW_TRAJECTORIES, dc.ENERGY_NORMALIZE,
+         dc.MAX_TRAJ, dc.W_ACC) = saved[:5]
+        dc.set_reward(*saved[5:])
+
+
 def main():
     dc.configure_grammar(N_DOF)
     print(f"grammar: {dc.ALL_TOKENS}  (N_TOKENS={dc.N_TOKENS})")
@@ -2185,6 +2259,7 @@ def main():
     test_partner_refresh()
     test_select_trials()
     test_scoring_pool()
+    test_coupling_levels()
 
     print(f"\n{'=' * 60}")
     print(f"{len(_PASS)} passed, {len(_FAIL)} failed")

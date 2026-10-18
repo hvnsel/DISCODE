@@ -23,6 +23,7 @@ committed for the others. See [Policy architecture](#policy-architecture).
 | `discover_data.py` | everything that produces a `SystemData`: `.mat` loading (velocity and acceleration derived from the displacement by default), truth simulation, dataset prep, ceiling + truth-reward diagnostics |
 | `discover_train.py` | `DISCOVER_TRAIN(system_data, ...)` — the one N-DOF training loop |
 | `discover_seed.py` | sparse regression over the monomials up to cubic (the diagnostic's list) and the single-variable powers: the warm start `seed_list=True` gives training |
+| `discover_coupling.py` | `coupling='reciprocal' \| 'newton3'`: completes a sampled row with its coupling terms' partners, fits it as one system and scores it |
 | `discover_analysis.py` | post-hoc: expression parsing, forward simulation, energy residual, comparison plots |
 
 **Drivers** — what you open and run:
@@ -504,6 +505,36 @@ monomial to score (1.6 s against 0.28 s per candidate on a NOhit-sized
 record): its inner weights go to the nonlinear optimiser, where the same
 physics written as monomials fits in closed form. `directional_leaves=False`
 in `DISCOVER_TRAIN` leaves them out of the grammar.
+
+## Reciprocity and Newton's third law (`coupling=...`)
+
+`DISCOVER_TRAIN(coupling='reciprocal' | 'newton3')` makes every sampled system
+obey a coupling law; `'free'` (the default) imposes nothing. Which law holds is
+prior knowledge about the system, and both fail for some systems
+(`notes_coupling_constraints.md`). An LO–NO free response obeys both:
+`'newton3'`.
+
+| level | the policy may write | added after sampling |
+|---|---|---|
+| `'free'` | anything | nothing |
+| `'reciprocal'` | anything | each coupling term's partners |
+| `'newton3'` | terms over its own DOF's leaves, or over one difference `(q_a - q_b)`, `(qdot_a - qdot_b)` | each difference term's mirror |
+
+A term of DOF i couples to DOF j when it depends on q_j (on qdot_j if it holds
+any velocity). Its partner in DOF j's equation is d/dq_j of the term
+integrated over DOF i's own variable, times m_i/m_j, so
+m_i ∂q̈_i/∂q_j = m_j ∂q̈_j/∂q_i. Under `'newton3'` that partner is the mirror,
+−(m_i/m_j) times the term, so the coupling forces cancel. A term and its
+partners share their constants. The row's constants, and the mass ratios m_d/m_0
+unless `masses=[m_0, m_1, ...]` fixes them, are fitted in one closed-form fit;
+then the DOFs are scored together (simulated together under
+`reward='simulation'`). A term the closed form cannot complete is dropped: a
+power of something other than a bare variable, or a coupling product with
+a variable repeated or a `blend`. Each term's tokens are credited with the
+mean of the advantages of the DOFs whose equations it ends up in, so a coupling
+term learns from the equations its partners land in. The best output is the
+best row, not each DOF's best from different rows. Beam search,
+`sim_coupling`, `seed_list` and `sim_refine` are off at these levels.
 
 ## Policy architecture
 
