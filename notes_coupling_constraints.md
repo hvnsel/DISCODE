@@ -1,9 +1,9 @@
 # Plan: reciprocity and Newton's third law as training options
 
-Status: **NOT APPROVED. Nothing implemented.** Written 2026-10-17 against
-`claude/discode-8token-grammar` at `63a251f`, for the user to learn from and
-decide on. Explained, with the proposed code changes, in the artifact
-"DISCOVER Coupling Constraints".
+Status: **Phase 1 implemented** (2026-10-18; see "As built" at the end).
+Written 2026-10-17 against `claude/discode-8token-grammar` at `63a251f`.
+Explained, with the proposed code changes, in the artifact "DISCOVER
+Coupling Constraints".
 
 ## 0. Summary
 
@@ -364,3 +364,30 @@ must-include constraints (NeuroLogic decoding) already exist.
 - Long training runs are the user's; run unit tests and short seeded smoke
   tests only.
 - One phase at a time, reporting at the end of each.
+
+## As built (Phase 1)
+
+- `DISCOVER_TRAIN(coupling='free' | 'reciprocal' | 'newton3', masses=None)`;
+  the completion, joint fit and scoring are `discover_coupling.py`, the leaf
+  mask `dc.newton3_mask`, the per-term credit `dp.jgrpo_terms`.
+- Relative leaves: one token pair per DOF pair a < b, `x{2N+1}...` =
+  (q_a − q_b, q̇_a − q̇_b), each scaled by its own std, not centred. A
+  `'newton3'` term is local or over ONE pair; products of different
+  differences are masked for now.
+- Partners are worked out on the monomials of the closed-form fit (the power
+  rules of 3.2), so no sympy and no nonlinear fallback: a term that the
+  closed form cannot complete is dropped (credit to its own DOF alone). A row
+  with a DOF left empty scores 0 for every DOF.
+- The joint fit reuses the per-DOF VARPRO search (`dc._varpro`): exponents on
+  their grids, limited for coupling factors so the partner's exponents stay
+  in [0, MAX_EXP], and mass ratios as extra slots (grid 0.25–4, polished in
+  [0.01, 100]).
+- Credit per term: the mean of its own DOF's advantage and, for each DOF it
+  reaches, the z-score of that DOF's reward in the same row over the batch's
+  rows, in log-residual units.
+- `'free'` unchanged: the constant-fit fingerprint (114 fits and rewards) is
+  bitwise identical.
+- Not built yet: seeds and `sim_refine` in the coupled levels, beam search
+  there, couplings over several differences, and printing that marks received
+  partners.
+
