@@ -42,6 +42,14 @@ import discover_core as dc
 
 LEVELS = ('free', 'reciprocal', 'newton3')
 
+# Ridge of the joint fit (``dc._varpro``): each term's contribution costs
+# RIDGE times its squared size, relative to the fit's rows.  Two near-identical
+# terms -- the cube of (q1 - q2) and its ``power`` with the exponent tuned to
+# 2.9999 -- otherwise take enormous opposite coefficients that cancel, which
+# no rounded copy of the equation survives; a term of normal size pays ~1e-6
+# of the fit.
+RIDGE = 1e-6
+
 
 def _reach(mono, d, level):
     """The DOFs other than ``d`` whose equations monomial ``mono`` of DOF
@@ -233,7 +241,7 @@ def fit_system(terms, level, masses=None, horizon=None):
             cols.append(np.concatenate(col))
         return np.column_stack(cols) if cols else np.zeros((len(b), 0))
 
-    coef, ev = dc._varpro(design, b, exp_slots, kinds, limits)
+    coef, ev = dc._varpro(design, b, exp_slots, kinds, limits, RIDGE)
     if coef is None or not np.all(np.isfinite(coef)):
         return None
     col_of = {k: i for i, k in enumerate(idx)}
