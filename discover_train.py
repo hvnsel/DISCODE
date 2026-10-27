@@ -44,9 +44,12 @@ Buffer entries are ``(reward, tau, consts, context)``.  ``tau`` is the
 flat assembled sum.  The context records the slice order, this slice's slot,
 and the slices that preceded it — everything the sample could see — so the
 entry stays reproducible in isolation and comparable across epochs.  Under
-``coupling='reciprocal' | 'newton3'`` ``tau`` is the whole equation, partners
-included, and the context also holds the sampled tau (``'own'``), the DOFs
-each of its terms reaches and the rewards of its row
+``coupling='reciprocal' | 'newton3'`` the policy writes one more slice, the
+energy whose derivatives are the coupling forces, with a buffer of its own: a
+DOF's ``tau`` is then its whole equation, its local terms and the forces the
+energy exerts on it, the energy's ``tau`` its kept terms, and the context also
+holds the sampled tau (``'own'``), the mass ratios, the rewards of its row
+and, for the energy, the DOFs each of its terms acts on
 (:mod:`discover_coupling`).
 """
 
@@ -499,9 +502,10 @@ def DISCOVER_TRAIN(
                                # the simulation itself (0 = off)
     sim_refine_evals = 60,     # simulation: simulations per tuned equation
     coupling         = 'free', # 'free' | 'reciprocal' | 'newton3' (2+ DOFs):
-                               # complete every sampled row with its coupling
-                               # terms' partners, fit and score it as one
-                               # system (discover_coupling)
+                               # the coupling written as an energy whose
+                               # derivatives are the coupling forces, every
+                               # row fitted and scored as one system
+                               # (discover_coupling)
     masses           = None,   # coupling levels: the DOFs' masses (only the
                                # ratios matter); None fits m_d/m_0
     seed_list        = False,  # True: before epoch 1, put each DOF's best
@@ -597,16 +601,19 @@ def DISCOVER_TRAIN(
     score.  They are not the grammar's ceiling: ``power`` exponents off the
     grid, products of powers and directional leaves are left to the search.
 
-    ``coupling`` imposes a coupling law on every sampled system: each row
-    (one equation per DOF) is completed with every coupling term's partners
-    in the equations it reaches, its constants are fitted jointly (a term and
-    its partners share theirs, with the mass ratios ``masses`` or fitted) and
-    the DOFs are scored together.  ``'reciprocal'``: the effect of DOF j on
-    equation i equals that of i on j.  ``'newton3'``: also, couplings only
-    through differences, so coupling forces cancel.  Which applies is prior
-    knowledge about the system (``notes_coupling_constraints.md``).  The best
-    output is then the best row; beam search, ``sim_coupling``, ``seed_list``
-    and ``sim_refine`` are off.
+    ``coupling`` imposes a coupling law on every sampled system.  Each DOF's
+    slice holds its local terms (its own q and qd only) and one more slice
+    holds the coupling as an energy -- a potential V and a dissipation
+    function R -- whose derivatives, m_r a_r = -m_0 (dV/dq_r + dR/dqdot_r),
+    are the coupling forces.  A row's constants are fitted jointly (the mass
+    ratios ``masses``, or fitted) and the DOFs are scored together; the energy
+    slice is rewarded with the DOFs' mean.  ``'reciprocal'``: the energy may
+    use any state, so the effect of DOF j on equation i equals that of i on j.
+    ``'newton3'``: the energy uses differences alone, so the coupling forces
+    also cancel.  Which applies is prior knowledge about the system
+    (``notes_coupling_constraints.md``).  The best output is then the best
+    row, its energy printed with it; beam search, ``sim_coupling``,
+    ``seed_list`` and ``sim_refine`` are off.
 
     ``sim_coupling_mode`` says how the fractions apply.  ``'split'`` scores
     each equation ONE way, drawn with those fractions, and its reward is
@@ -668,10 +675,11 @@ def DISCOVER_TRAIN(
             print("[config] sim_coupling ignored: under coupling every "
                   "candidate is a whole system")
         f_top, f_peer, coupled, blend = 0.0, 0.0, False, None
-    relative_leaves = coupling == 'newton3'
+    n_slices = N + system_level             # the DOFs, then the energy
+    label = lambda i: 'energy' if i == N else f'DOF {i}'
 
     dc.configure_grammar(N, system.var_names, directional_leaves,
-                         transcendental, relative_leaves)
+                         transcendental, coupling)
     print(f"[vocab]  {N}-DOF tokens: {dc.ALL_TOKENS}")
     if directional_leaves:
         print(f"[vocab]  dleaf spans {[dc.VARIABLES[c] for c in dc.LEAF_CHANNELS['dleaf']]}"
@@ -680,7 +688,7 @@ def DISCOVER_TRAIN(
     if transcendental:
         print(f"[vocab]  blend(u) = e^(a u)(c1 cos(b u) + c2 sin(b u)): "
               f"a grid {dc.BLEND_A_GRID}, b grid {dc.BLEND_B_GRID}")
-    if relative_leaves:
+    if dc.PAIRS:
         disp = dc._var_display_map()
         print("[vocab]  relative leaves: " + ", ".join(
             f"{v} = {disp[v]}" for v in dc.VARIABLES[2 * N:]))
@@ -708,8 +716,9 @@ def DISCOVER_TRAIN(
               + ", ".join(_MODE_LABEL[m_] for m_, _w in ways) + "; reward = "
               + " + ".join(f"{w:.2f} {_MODE_LABEL[m_]}" for m_, w in ways))
     if system_level:
-        print(f"[config] coupling={coupling}: every row completed with its "
-              f"partners, fitted and scored as one system; masses "
+        print(f"[config] coupling={coupling}: the coupling written as an "
+              f"energy (V, R) whose derivatives are the coupling forces, every "
+              f"row fitted and scored as one system; masses "
               + ("fitted (m_d/m_0)" if masses is None else str(list(masses))))
     if sim_refine:
         print(f"[config] tuning: per DOF per epoch, the best {sim_refine} "
@@ -728,12 +737,12 @@ def DISCOVER_TRAIN(
         pool, saved_env = dc.make_pool(
             (N, system.var_names, norm_stats, raw_trajs, energy_normalize,
              max_traj, w_acc, directional_leaves, transcendental, reward,
-             sim_window, sim_weights, trial_decay, relative_leaves), N_WORKERS)
+             sim_window, sim_weights, trial_decay, coupling), N_WORKERS)
         print(f"Scoring pool : {N_WORKERS} single-threaded workers\n")
     mapper = pool.map if pool is not None else map
 
-    states = [DOFState(max_len, device) for _ in range(N)]
-    ps = PolicyState(N, lr, n_epochs, device,
+    states = [DOFState(max_len, device) for _ in range(n_slices)]
+    ps = PolicyState(n_slices, lr, n_epochs, device,
                      cross_slice_attention=cross_slice_attention,
                      n_layers=n_layers, d_model=d_model,
                      slice_order=slice_order, sample_order=sample_order,
@@ -811,7 +820,7 @@ def DISCOVER_TRAIN(
         print()
 
     together_cache, trial_cache = {}, {}
-    best_row = None    # coupling levels: (mean reward, its entry per DOF)
+    best_row = None    # coupling levels: (mean reward, its entry per slice)
     for ep in range(n_epochs):
         t0_ep   = time.time()
         horizon = dc.get_traj_horizon(ep, n_epochs, system.t_end)
@@ -849,10 +858,10 @@ def DISCOVER_TRAIN(
         iso_tasks, iso_slots, cpl_tasks, cpl_slots = [], [], [], []
         if system_level:                      # one task per row, no beam
             for b in range(batch_size):
-                cpl_tasks.append(([all_exprs[i][b][0] for i in range(N)],
-                                  coupling, masses, horizon))
-                cpl_slots.append([(i, b) for i in range(N)])
-                mode.update({(i, b): 'peer' for i in range(N)})
+                cpl_tasks.append(([all_exprs[i][b][0] for i in range(n_slices)],
+                                  masses, horizon))
+                cpl_slots.append([(i, b) for i in range(n_slices)])
+                mode.update({(i, b): 'peer' for i in range(n_slices)})
         if coupled:
             n_rows = min([batch_size] + [len(c) for c in all_exprs])
             tops = {j: (st.best_entry[1], st.best_entry[2])
@@ -958,8 +967,8 @@ def DISCOVER_TRAIN(
             for i in sorted(before):
                 print(f"    DOF {i}  best {before[i]:.4f} -> {after[i]:.4f}")
 
-        per_dof = [[] for _ in range(N)]
-        for i in range(N):
+        per_dof = [[] for _ in range(n_slices)]
+        for i in range(n_slices):
             for k, (_tau, ctx) in enumerate(all_exprs[i]):
                 v = scored.get((i, k))
                 if v is None:
@@ -969,7 +978,7 @@ def DISCOVER_TRAIN(
                                           'tuned': v[5]}
                 if system_level:
                     ctx.update(v[6], row_r={j: scored[(j, k)][0]
-                                            for j in range(N)
+                                            for j in range(n_slices)
                                             if (j, k) in scored})
                 per_dof[i].append((v[0], v[1], v[2], ctx))
         if system_level:
@@ -979,7 +988,8 @@ def DISCOVER_TRAIN(
                     if best_row is None or m > best_row[0]:
                         best_row = (m, [tuple(scored[(i, b)][:3])
                                         + (all_exprs[i][b][1],)
-                                        for i in range(N)])
+                                        if (i, b) in scored else None
+                                        for i in range(n_slices)])
         if coupled and sim_coupling_mode == 'blend':
             for i in range(N):
                 got = [v for (d, _k), v in scored.items() if d == i]
@@ -1009,7 +1019,7 @@ def DISCOVER_TRAIN(
         for i, st in enumerate(states):
             batch_r = per_dof[i]
             if not batch_r:
-                print(f"  DOF {i}: no valid candidate this epoch"); continue
+                print(f"  {label(i)}: no valid candidate this epoch"); continue
 
             # Novelty is a SELECTION heuristic, never a reward.  It depends on
             # the buffer contents at scoring time, so baking it into the stored
@@ -1061,7 +1071,7 @@ def DISCOVER_TRAIN(
                 st.hof[:] = st.hof[:HOF_SIZE]
 
             if not st.buffer:
-                print(f"  DOF {i}: buffer empty, skip train"); continue
+                print(f"  {label(i)}: buffer empty, skip train"); continue
 
             st.R_alpha = float(np.percentile([e[0] for e in st.buffer], 10))
             c_loss = _train_critic(st, max_len, device)
@@ -1083,7 +1093,7 @@ def DISCOVER_TRAIN(
             best_raw, n_added, n_tuned, c_loss = report[i]
             c_str = f'  critic_loss={c_loss:.4f}' if c_loss is not None else ''
             t_str = f' ({n_tuned} replaced by tuned twins)' if n_tuned else ''
-            print(f"  DOF {i}: best={best_raw:.4f}  +{n_added} "
+            print(f"  {label(i)}: best={best_raw:.4f}  +{n_added} "
                   f"buf={len(st.buffer)}{t_str}{c_str}")
         print(f"  [3-train]    ({time.time()-t1:.2f}s)", flush=True)
 
@@ -1103,6 +1113,10 @@ def DISCOVER_TRAIN(
         if best_row is not None:
             print(f"   best row: mean {best_row[0]:.4f}, masses m/m0 = "
                   + ", ".join(f"{m:.4g}" for m in bests[0][3]['masses']))
+        if system_level and bests[N] is not None:
+            for line in dcp.energy_lines(bests[N][1], bests[N][2]):
+                print(f"   energy: {line}")
+        bests = bests[:N]
         for i, be in enumerate(bests):
             if be is None:
                 print(f"   DOF {i}: (no survivor yet)"); continue
@@ -1126,7 +1140,7 @@ def DISCOVER_TRAIN(
     if best_row is not None:
         print(f"\nBest row: mean reward {best_row[0]:.6f}, masses m/m0 = "
               + ", ".join(f"{m:.6g}" for m in best_row[1][0][3]['masses']))
-    for i, st in enumerate(states):
+    for i, st in enumerate(states[:N]):
         st.buffer.sort(key=lambda z: z[0], reverse=True)
         best = (best_row[1][i] if best_row is not None
                 else st.buffer[0] if st.buffer else None)
@@ -1148,6 +1162,17 @@ def DISCOVER_TRAIN(
             dh = dc.denormalize_expr(hof[1], hof[2], i)
             print(f"    #{rank}: {dc.reward_label()}={hof[0]:.4f}  "
                   f"{dh if dh else dc.expr_to_str(hof[1], hof[2])}")
+    if system_level:
+        e = best_row[1][N] if best_row is not None else None
+        print("\nEnergy (coupling forces m_r a_r = -m_0 (dV/dq_r + "
+              "dR/dqdot_r), per unit mass of DOF 0)")
+        for line in (dcp.energy_lines(e[1], e[2], dc.PASTE_DIGITS) if e
+                     else ["none"]):
+            print(f"  {line}")
+        print(f"  --- Hall of Fame (top {len(states[N].hof)}) ---")
+        for rank, hof in enumerate(states[N].hof, 1):
+            print(f"    #{rank}: {dc.reward_label()}={hof[0]:.4f}  "
+                  + ";  ".join(dcp.energy_lines(hof[1], hof[2])))
 
     # The best equations integrated together -- what the plot scripts do.
     if reward == 'simulation' and sum(b is not None for b in best_per_dof) > 1:

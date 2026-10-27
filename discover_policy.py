@@ -195,17 +195,18 @@ def term_valid_mask(term_prefix, position, max_term_len, term_grammar='free',
     below an implicit root ``add`` (``depth_offset=1``), it may be a bare
     variable, it must not itself be ``add``-rooted, and it has a per-term
     length floor of 1.  ``'varpro'`` additionally restricts a power op's child
-    to a bare variable — the constant-fitter's closed-form domain.  With the
-    relative leaves on (``coupling='newton3'``), a term of DOF ``dof`` is also
-    kept local or relative (:func:`discover_core.newton3_mask`).
+    to a bare variable — the constant-fitter's closed-form domain.  Under a
+    coupling level a term of slice ``dof`` is also kept to that slice's
+    leaves (:func:`discover_core.coupling_mask`): a DOF's own, or the energy
+    slice's.
     """
     mask = dc.get_valid_tokens(
         term_prefix, position, max_term_len,
         depth_offset=1, min_len=1, allow_leaf_at_zero=True,
         forbid_at_root=('add',),
         power_child_vars_only=(term_grammar == 'varpro'))
-    if dof is not None and dc.PAIRS:
-        mask = mask * dc.newton3_mask(dof, term_prefix)
+    if dof is not None and dc.COUPLING != 'free':
+        mask = mask * dc.coupling_mask(dof)
     return torch.as_tensor(mask, dtype=torch.float32)
 
 
@@ -661,11 +662,11 @@ def jgrpo_terms(policy, policy_old, policy_ref, S_alpha, R_alpha, dof, n_dof,
         return zero, zero, False
     group_adv = (batch_rewards - adv_mean) / (adv_std + 1e-6)
 
-    # Per-term credit (``coupling`` levels): a term whose partners sit in other
-    # DOFs' equations is credited with the mean of their advantages and this
-    # DOF's, each the z-score over these entries' rows in that DOF's own
-    # log-residual units.  A DOF that scored nothing in a row, or whose
-    # rewards here do not spread, adds nothing.
+    # Per-term credit (``coupling`` levels): an energy term, whose forces sit
+    # in the DOFs' equations, is credited with the mean of their advantages
+    # and this slice's, each the z-score over these entries' rows in that
+    # DOF's own log-residual units.  A DOF that scored nothing in a row, or
+    # whose rewards here do not spread, adds nothing.
     others = {}
     for j in range(n_dof):
         got = [(bi, e[3]['row_r'][j]) for bi, e in enumerate(valid)

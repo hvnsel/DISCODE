@@ -2127,14 +2127,18 @@ def test_scoring_pool():
 def test_coupling_levels():
     """``coupling='reciprocal' | 'newton3'`` (:mod:`discover_coupling`).
 
-    A completed system must obey its law -- mass-weighted coupling Jacobians
-    symmetric, and under 'newton3' a relative term's forces cancelling -- the
-    joint fit must recover a true system and its mass ratio, the 'newton3'
-    mask must keep every term local or relative, and the trainer must run a
-    coupled level end to end.
+    The coupling forces of a fitted system must be the derivatives of its
+    energy, m_r a_r = -m_0 (dV/dq_r + dR/dqdot_r), whatever the energy's
+    factors; the mass-weighted coupling Jacobians must be symmetric at 2 and 3
+    DOFs (the stiffness at rest) and, under 'newton3', the coupling forces
+    must cancel; the joint fit
+    must recover true systems and their mass ratios; the slice masks and the
+    drop rules must hold; and the trainer must run a coupled level end to end.
     """
     import contextlib
     import io
+
+    import sympy as sp
 
     import discover_coupling as dcp
     import discover_train as dt
@@ -2147,83 +2151,158 @@ def test_coupling_levels():
              dc.SIM_WEIGHTS)
     rng = np.random.default_rng(0)
 
-    def force(expr, k, d, S, mu):          # m_d * (term k of DOF d's equation)
+    def coupling(expr, n_local, d, S, mu):   # m_d * DOF d's coupling accel
         terms = dc.split_terms(expr[0])
-        o = sum(dc.count_total_consts(t) for t in terms[:k])
-        f = dc.compile_to_numpy(
-            terms[k], expr[1][o:o + dc.count_total_consts(terms[k])])
+        if len(terms) == n_local:
+            return np.zeros(S.shape[1])
+        o = sum(dc.count_total_consts(t) for t in terms[:n_local])
+        f = dc.compile_to_numpy(dc.assemble_terms(terms[n_local:]), expr[1][o:])
         return mu[d] * dc.NORM_STATS[3][d] * f(*dc._feats(S))
 
+    def energy_fn(terms, consts):            # an energy part on the leaves
+        if not terms:
+            return lambda *z: 0.0
+        e = sp.sympify(dc.expr_to_sympy_str(dc.assemble_terms(terms), consts,
+                                            extra=1),
+                       locals=dc._parse_local_dict())
+        return sp.lambdify([dc.SYMS[v] for v in dc.VARIABLES], e, 'numpy')
+
     try:
-        cases = (
+        cases = (   # key, level, masses, row (local slices, then the energy)
             ('coupled_duffing', 'reciprocal', None,
-             [['add', 'x1', 'x2', 'x3', 'intpower', 'x1', 'end'],
-              ['add', 'x3', 'x4', 'intpower', 'x3', 'end']]),
-            ('coupled_duffing', 'reciprocal', [1.0, 2.0],
-             [['add', 'x1', 'x2', 'mul', 'x2', 'x4', 'end', 'power', 'x3',
-               'end'], ['add', 'x3', 'x4', 'end']]),
+             [['add', 'x1', 'x2', 'intpower', 'x1', 'end'],
+              ['add', 'x3', 'x4', 'intpower', 'x3', 'end'],
+              ['mul', 'x1', 'x3', 'end']]),
             ('cubic_coupled', 'newton3', None,
-             [['add', 'x1', 'x2', 'intpower', 'x5', 'end'],
-              ['add', 'x3', 'x4', 'end']]))
+             [['add', 'x1', 'x2', 'end'], ['add', 'x3', 'x4', 'end'],
+              ['intpower', 'x5']]),
+            ('duffing_chain3', 'newton3', None,
+             [['add', 'x1', 'x2', 'intpower', 'x1', 'end'],
+              ['add', 'x3', 'x4', 'end'],
+              ['add', 'x5', 'x6', 'intpower', 'x5', 'end'],
+              ['add', 'intpower', 'x7', 'intpower', 'x11', 'end']]),
+            # every factor kind, a modulated R among them; masses given
+            ('coupled_duffing', 'reciprocal', [1.0, 2.0],
+             [['add', 'x1', 'x2', 'end'], ['add', 'x3', 'x4', 'end'],
+              ['add', 'mul', 'power', 'x1', 'x3', 'end', 'mul', 'blend', 'x1',
+               'x3', 'end', 'mul', 'intpower', 'x1', 'intpower', 'x4', 'end',
+               'power', 'x4', 'end']]),
+            ('duffing_chain3', 'newton3', None,
+             [['add', 'x1', 'x2', 'end'], ['add', 'x3', 'x4', 'end'],
+              ['add', 'x5', 'x6', 'end'],
+              ['add', 'mul', 'x7', 'x11', 'end', 'mul', 'power', 'x9',
+               'intpower', 'x12', 'end', 'blend', 'x7', 'power', 'x8',
+               'end']]))
         for key, level, masses, row in cases:
             with contextlib.redirect_stdout(io.StringIO()):
                 system = build_truth_system(get_mdof_system(key), n_traj=2,
                                             n_pts=800, t_end=16.0)
-            dc.configure_grammar(2, system.var_names,
-                                 relative_leaves=level == 'newton3')
+            N = system.n_dof
+            dc.configure_grammar(N, system.var_names, transcendental=True,
+                                 coupling=level)
             _X, _y, raw, ns = generate_dataset(system, device=None)
             dc.set_problem_data(ns, raw, True, None, 0.5)
             dc.set_reward('energy')
-            res = dcp.system_worker((row, level, masses, None))
-            if not check(f"{key}/{level}: the row is completed and scored",
+            name = f"{key}/{level}" + (" (every factor kind)"
+                                       if len(row[N]) > 6 else "")
+            res = dcp.system_worker((row, masses, None))
+            if not check(f"{name}: the row is completed and scored",
                          all(r is not None for r in res)):
                 continue
-            exprs, mu = [r[2:4] for r in res], res[0][6]['masses']
-            acc = [dc._accel_fn(d, exprs[d]) for d in range(2)]
-            S = rng.normal(size=(4, 8)) * np.asarray(ns[1])[:4, None]
+            exprs, mu = [r[2:4] for r in res[:N]], res[0][6]['masses']
+            n_loc = [len(dc.split_terms(t)) for t in row[:N]]
+            S = rng.normal(size=(2 * N, 40)) * np.asarray(ns[1])[:2 * N, None]
+
+            # forces = -dV/dq - dR/dqdot of the printed energy, by differences
+            parts = {0: ([], []), 1: ([], [])}
+            o = 0
+            for t in dc.split_terms(res[N][2]):
+                n = dc.count_total_consts(t)
+                vel = int(any(x in dc.VAR_SET and dc.COL_MAP[x] % 2 for x in t))
+                parts[vel][0].append(t)
+                parts[vel][1].extend(res[N][3][o:o + n])
+                o += n
+            V, R = energy_fn(*parts[0]), energy_fn(*parts[1])
+
+            def grad(fn, col, h=1e-6):
+                Sp, Sm = S.copy(), S.copy()
+                Sp[col] += h; Sm[col] -= h
+                return (np.asarray(fn(*dc._feats(Sp)))
+                        - np.asarray(fn(*dc._feats(Sm)))) / (2 * h)
+            forces = [coupling(exprs[r], n_loc[r], r, S, mu) for r in range(N)]
+            want = [-(grad(V, 2 * r) + grad(R, 2 * r + 1)) for r in range(N)]
+            err = max(float(np.max(np.abs(f - w)) / (np.max(np.abs(w)) + 1e-12))
+                      for f, w in zip(forces, want))
+            check(f"{name}: m_r a_r = -dV/dq_r - dR/dqdot_r", err < 1e-6,
+                  f"largest relative error {err:.1e}; "
+                  + "; ".join(dcp.energy_lines(*res[N][2:4])))
+
+            # the damping Jacobian is symmetric anywhere; the stiffness one
+            # at rest (a modulated R's stiffness is not, away from it)
+            acc = [dc._accel_fn(d, exprs[d]) for d in range(N)]
+            rest = S.copy()
+            rest[1::2] = 0.0
             gap = 0.0
-            for v in (0, 1):
-                def jac(a, b, h=1e-5):
-                    Sp, Sm = S.copy(), S.copy()
-                    Sp[2 * b + v] += h; Sm[2 * b + v] -= h
-                    return (acc[a](Sp) - acc[a](Sm)) / (2 * h)
-                gap = max(gap, float(np.max(np.abs(mu[0] * jac(0, 1)
-                                                   - mu[1] * jac(1, 0)))))
-            check(f"{key}/{level}: m0 da0/dq1 = m1 da1/dq0 (and in qdot)",
-                  gap < 1e-6, f"max gap {gap:.1e}, masses {mu}")
-            if masses is None and level == 'reciprocal':
-                check("the true structure is recovered with its mass ratio",
-                      min(r[1] for r in res) > 0.999
-                      and abs(mu[1] - 1.0) < 0.01,
-                      f"rewards {[round(r[1], 5) for r in res]}, m1/m0 "
-                      f"{mu[1]:.4f}; partner "
-                      + dc.denormalize_expr(*exprs[1], 1))
+            for v, X in ((0, rest), (1, S)):
+                for a in range(N):
+                    for b in range(a + 1, N):
+                        def jac(i, j, h=1e-5):
+                            Xp, Xm = X.copy(), X.copy()
+                            Xp[2 * j + v] += h; Xm[2 * j + v] -= h
+                            return (acc[i](Xp) - acc[i](Xm)) / (2 * h)
+                        gap = max(gap, float(np.max(np.abs(
+                            mu[a] * jac(a, b) - mu[b] * jac(b, a)))))
+            check(f"{name}: m_i da_i/dq_j = m_j da_j/dq_i at rest, and in "
+                  f"qdot anywhere", gap < 1e-6,
+                  f"max gap {gap:.1e}, masses {mu}")
             if level == 'newton3':
-                f0, f1 = force(exprs[0], 2, 0, S, mu), force(exprs[1], 2, 1, S, mu)
-                check("newton3: the relative term's forces cancel",
-                      float(np.max(np.abs(f0 + f1))) < 1e-9 * float(np.max(np.abs(f0)) + 1),
-                      f"max |m0 F0 + m1 F1| {float(np.max(np.abs(f0 + f1))):.1e}")
+                tot = sum(forces)
+                check(f"{name}: the coupling forces cancel",
+                      float(np.max(np.abs(tot)))
+                      < 1e-9 * (float(np.max(np.abs(forces[0]))) + 1),
+                      f"max |sum m_r F_r| {float(np.max(np.abs(tot))):.1e}")
+            if len(row[N]) <= 6:
+                check(f"{name}: the true system is recovered with its masses",
+                      min(r[1] for r in res) > 0.999
+                      and max(abs(m - 1.0) for m in mu) < 0.01,
+                      f"rewards {[round(r[1], 5) for r in res]}, masses {mu}; "
+                      + "; ".join(dcp.energy_lines(*res[N][2:4])))
+            else:
+                check(f"{name}: the given masses are used",
+                      masses is None or mu == [1.0, 2.0], mu)
+            if key == 'cubic_coupled':
                 eq = dc.denormalize_expr(*exprs[1], 1)
                 check("newton3 prints a coupling as powers of the difference, "
                       "never expanded", '(x-y)' in eq and 'x**2*y' not in eq, eq)
-                zero = lambda pre: [t for t, m in zip(dc.ALL_TOKENS,
-                                                      dc.newton3_mask(0, pre))
-                                    if m == 0]
-                check("newton3 mask: other DOFs' raw leaves never; a "
-                      "relative term stays relative",
-                      zero([]) == ['x3', 'x4']
-                      and zero(['mul', 'x5']) == ['x1', 'x2', 'x3', 'x4']
-                      and zero(['mul', 'x1']) == ['x3', 'x4', 'x5', 'x6'])
+                zero = lambda s_: [t for t, m in zip(dc.ALL_TOKENS,
+                                                     dc.coupling_mask(s_))
+                                   if m == 0]
+                check("slice masks: a DOF's own leaves; the energy's relative "
+                      "ones", zero(0) == ['x3', 'x4', 'x5', 'x6']
+                      and zero(1) == ['x1', 'x2', 'x5', 'x6']
+                      and zero(2) == ['x1', 'x2', 'x3', 'x4'])
+                lim = dcp.energy_term(['mul', 'intpower', 'x5', 'intpower',
+                                       'x6', 'end'])[2]
+                check("a modulated R: its qd exponent >= 2, its q one <= 3; "
+                      "a bare or blend qd factor drops it",
+                      lim == {1: (-np.inf, 3), 4: (2.0, np.inf)}
+                      and dcp.energy_term(['mul', 'x5', 'x6', 'end']) is None
+                      and dcp.energy_term(['mul', 'blend', 'x6', 'x5', 'end'])
+                      is None
+                      and dcp.energy_term(['mul', 'x6', 'x6', 'x5', 'end'])
+                      is not None, lim)
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
                     out = dt.DISCOVER_TRAIN(system, n_epochs=1, batch_size=6,
                                             use_pool=False, coupling=level,
                                             max_terms=3, max_term_len=4,
                                             term_grammar='varpro', seed=0)
+                text = buf.getvalue()
                 check("the trainer runs coupling='newton3' end to end",
-                      len(out) == 2 and '[config] coupling=newton3' in buf.getvalue(),
-                      [ln.strip() for ln in buf.getvalue().splitlines()
-                       if 'best row' in ln][-1:])
+                      len(out) == 2 and '[config] coupling=newton3' in text
+                      and 'Energy (coupling forces' in text,
+                      [ln.strip() for ln in text.splitlines()
+                       if 'best row' in ln or 'energy:' in ln][-3:])
         # A curve a bit stiffer than cubic, the exponent capped at 3: without
         # the ridge a cube plus a power tuned to 2.999998 fake it with
         # coefficients of +-3e4 that cancel; the joint fit must not.

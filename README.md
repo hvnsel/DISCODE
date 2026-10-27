@@ -23,7 +23,7 @@ committed for the others. See [Policy architecture](#policy-architecture).
 | `discover_data.py` | everything that produces a `SystemData`: `.mat` loading (velocity and acceleration derived from the displacement by default), truth simulation, dataset prep, ceiling + truth-reward diagnostics |
 | `discover_train.py` | `DISCOVER_TRAIN(system_data, ...)` — the one N-DOF training loop |
 | `discover_seed.py` | sparse regression over the monomials up to cubic (the diagnostic's list) and the single-variable powers: the warm start `seed_list=True` gives training |
-| `discover_coupling.py` | `coupling='reciprocal' \| 'newton3'`: completes a sampled row with its coupling terms' partners, fits it as one system and scores it |
+| `discover_coupling.py` | `coupling='reciprocal' \| 'newton3'`: the coupling written as an energy (V, R) whose derivatives are the coupling forces; fits a sampled row as one system, writes each DOF's equation out and scores it |
 | `discover_analysis.py` | post-hoc: expression parsing, forward simulation, energy residual, comparison plots |
 
 **Drivers** — what you open and run:
@@ -514,30 +514,50 @@ prior knowledge about the system, and both fail for some systems
 (`notes_coupling_constraints.md`). An LO–NO free response obeys both:
 `'newton3'`.
 
-| level | the policy may write | added after sampling |
-|---|---|---|
-| `'free'` | anything | nothing |
-| `'reciprocal'` | anything | each coupling term's partners |
-| `'newton3'` | terms over its own DOF's leaves, or over one difference `(q_a - q_b)`, `(qdot_a - qdot_b)` | each difference term's mirror |
+At these levels the coupling is not written as forces. Each DOF's slice holds
+its local terms, over its own q and q̇ only, and the policy writes one more
+slice, the **energy**: its terms without a velocity are a potential V, those
+with one a dissipation function R, and the coupling forces are their
+derivatives,
 
-A term of DOF i couples to DOF j when it depends on q_j (on qdot_j if it holds
-any velocity). Its partner in DOF j's equation is d/dq_j of the term
-integrated over DOF i's own variable, times m_i/m_j, so
-m_i ∂q̈_i/∂q_j = m_j ∂q̈_j/∂q_i. Under `'newton3'` that partner is the mirror,
-−(m_i/m_j) times the term, so the coupling forces cancel. A term and its
-partners share their constants. The row's constants, and the mass ratios m_d/m_0
-unless `masses=[m_0, m_1, ...]` fixes them, are fitted in one closed-form fit,
-with a small ridge so two near-identical terms can't take huge opposite
-coefficients that cancel; then the DOFs are scored together (simulated together under
-`reward='simulation'`). A term the closed form cannot complete is dropped: a
-power of something other than a bare variable, or a coupling product with
-a variable repeated or a `blend`. Each term's tokens are credited with the
-mean of the advantages of the DOFs whose equations it ends up in, so a coupling
-term learns from the equations its partners land in. The best output is the
-best row, not each DOF's best from different rows. A coupling prints as
-powers of the difference, `(q1-q2)**3`, never expanded into monomials of q1
-and q2. Beam search,
-`sim_coupling`, `seed_list` and `sim_refine` are off at these levels.
+    m_r q̈_r = −m_0 (∂V/∂q_r + ∂R/∂q̇_r)        (V, R per unit mass of DOF 0)
+
+so for any number of DOFs m_i ∂q̈_i/∂q_j = m_j ∂q̈_j/∂q_i, the symmetry of
+∂²V/∂q_i∂q_j (and of R's second derivatives in the velocities): Maxwell–Betti
+in its tangent form.
+
+| level | a DOF's slice | the energy slice |
+|---|---|---|
+| `'free'` | anything | none |
+| `'reciprocal'` | its own q, q̇ | any state |
+| `'newton3'` | its own q, q̇ | differences only, `(q_a - q_b)`, `(qdot_a - qdot_b)` |
+
+Under `'newton3'` the energy does not change when every DOF shifts together,
+so the coupling forces sum to zero. The energy uses the whole grammar — sums,
+products of displacements and velocities, `intpower`, `power` (both parities),
+`blend` — with exponents reaching one above the force caps, since a
+derivative lowers one by one, and limited per monomial so that every force
+stays in the grammar. An R monomial with a displacement factor (a damper
+whose strength depends on the stretch) must not push at rest, or its
+stiffness would be lopsided there: its velocity factor needs an exponent of
+at least 2, and a term whose velocity factor is bare or a `blend` there is
+dropped. So the stiffness is symmetric at rest and the damping everywhere.
+
+The row's constants — the local terms', the energy's, and the mass ratios
+m_d/m_0 unless `masses=[m_0, m_1, ...]` fixes them — are fitted in one
+closed-form fit, with a small ridge so two near-identical terms can't take
+huge opposite coefficients that cancel. Each DOF's equation is then written
+out, its local terms followed by the energy's derivatives, and the DOFs are
+scored together (simulated together under `reward='simulation'`). A term the
+closed form cannot complete is dropped. The energy slice has its own buffer,
+rewarded with its row's mean, and each energy term's tokens are credited with
+the mean of the advantages of the DOFs it acts on. The best output is the
+best row, not each DOF's best from different rows, printed with its V and R.
+A coupling prints as powers of the difference, `(q1-q2)**3`, never expanded
+into monomials of q1 and q2. An energy term can need one token more than the
+force it gives: the damper −c(q1−q2)²(q̇1−q̇2) is R = (c/2)(q1−q2)²(q̇1−q̇2)²,
+`mul intpower x5 intpower x6 end`, six tokens. Beam search, `sim_coupling`,
+`seed_list` and `sim_refine` are off at these levels.
 
 ## Policy architecture
 

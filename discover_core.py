@@ -262,6 +262,14 @@ BLEND_B_BOUND = (0.0, 3.0)                      # polish bound for b
 MASS_GRID  = (0.25, 0.5, 1.0, 2.0, 4.0)
 MASS_BOUND = (0.01, 100.0)
 
+# The exponents of an ENERGY term (discover_coupling), one above the force
+# caps: a coupling force is an energy's derivative, so a differentiated
+# factor's exponent drops by one, and a factor that is not differentiated
+# keeps its force-grid exponent.  The grids are both.
+ENERGY_INTPOWER_GRID = tuple(float(n) for n in range(1, INTPOWER_MAX + 2))
+ENERGY_POWER_GRID    = tuple(sorted(set(POWER_EXP_GRID)
+                                    | {p + 1.0 for p in POWER_EXP_GRID}))
+
 # MIN_EXP is 0.0, not 0.5, deliberately: sgnpower's exponent is a CHARACTER
 # dial.  sgn(u)*|u|^p is u at p = 1 and sgn(u) at p = 0, continuously in
 # between, so the range [0, 1] interpolates viscous damping into Coulomb
@@ -310,6 +318,8 @@ ARITY      = {}
 SYMS       = {}                       # sympy symbols x1..x{2N}
 PAIRS      = []                       # DOF pairs behind the relative leaves
 PAIR_STD   = None                     # their normalising stds (q, qd per pair)
+COUPLING   = 'free'                   # 'free' | 'reciprocal' | 'newton3'
+                                      # (discover_coupling)
 VAR_NAMES  = ['x', 'y']               # per-DOF display names (positions)
 
 # ── Problem-data state (set by set_problem_data) ────────────────────────────
@@ -379,7 +389,7 @@ _SPEC_DATA   = {}          # (max_traj, horizon, dof) -> spec_setup, per process
 
 # ── Grammar configuration ───────────────────────────────────────────────────
 def configure_grammar(n_dof: int, var_names=None, directional_leaves=False,
-                      transcendental=False, relative_leaves=False):
+                      transcendental=False, coupling='free'):
     """Initialise the global token table for an ``n_dof`` system (2*n_dof vars).
 
     Leaf tokens are the bare state variables (each with an implicit leading
@@ -399,19 +409,21 @@ def configure_grammar(n_dof: int, var_names=None, directional_leaves=False,
     the four monomials its expansion needs.  Bare variables are kept, so the
     default table is unchanged when this is off.
 
-    ``relative_leaves`` (``coupling='newton3'``) appends, for every pair of
-    DOFs a < b, two more variables after the states: q_a - q_b and
-    qd_a - qd_b, each normalised by its own std (``PAIR_STD``).  They are
-    variables in every respect (``x{2N+1}``, ``x{2N+2}``, ...), evaluated from
-    the states by :func:`_feats`; odd columns are still velocities.
+    ``coupling='newton3'`` appends, for every pair of DOFs a < b, two more
+    variables after the states: q_a - q_b and qd_a - qd_b, each normalised by
+    its own std (``PAIR_STD``).  They are variables in every respect
+    (``x{2N+1}``, ``x{2N+2}``, ...), evaluated from the states by
+    :func:`_feats`; odd columns are still velocities.  Under either coupling
+    level the policy also writes an energy slice (:func:`coupling_mask`).
     """
-    global N_DOF, N_VARS, VARIABLES, VAR_SET, COL_MAP, PAIRS
+    global N_DOF, N_VARS, VARIABLES, VAR_SET, COL_MAP, PAIRS, COUPLING
     global ALL_TOKENS, N_TOKENS, MASK_TOKEN, VOCAB_SIZE, ARITY, SYMS, VAR_NAMES
     global DIR_LEAF_SET, LEAF_CHANNELS, CONST_SLOTS, TRANSCENDENTAL_OPS
 
     N_DOF  = int(n_dof)
+    COUPLING = coupling
     PAIRS  = ([(a, b) for a in range(N_DOF) for b in range(a + 1, N_DOF)]
-              if relative_leaves else [])
+              if coupling == 'newton3' else [])
     N_VARS = 2 * N_DOF + 2 * len(PAIRS)
     VARIABLES = [f'x{i + 1}' for i in range(N_VARS)]
     VAR_SET   = set(VARIABLES)
@@ -596,15 +608,15 @@ def _feats(S):
 
 
 # ── Numeric power helpers ───────────────────────────────────────────────────
-def _snap_int_power(p):
+def _snap_int_power(p, hi=INTPOWER_MAX):
     """``intpower``'s exponent as the integer it evaluates at: rounded and
-    clipped to [1, INTPOWER_MAX].  Every walker snaps through here, so a slot
-    value that drifted in an optimiser can never evaluate as a fractional
-    power."""
+    clipped to [1, hi] (an energy term's cap is one higher).  Every walker
+    snaps through here, so a slot value that drifted in an optimiser can never
+    evaluate as a fractional power."""
     p = float(p)
     if not np.isfinite(p):
         return 1
-    return int(round(float(np.clip(p, 1, INTPOWER_MAX))))
+    return int(round(float(np.clip(p, 1, hi))))
 
 
 def _intpower_np(a, n):
@@ -613,8 +625,8 @@ def _intpower_np(a, n):
     return a ** _snap_int_power(n)
 
 
-def _clip_exp(p):
-    return float(np.clip(float(p), MIN_EXP, MAX_EXP))
+def _clip_exp(p, hi=MAX_EXP):
+    return float(np.clip(float(p), MIN_EXP, hi))
 
 
 def exp_slot_grid(kind):
@@ -622,6 +634,8 @@ def exp_slot_grid(kind):
     if kind == 'blend_a': return list(BLEND_A_GRID)
     if kind == 'blend_b': return list(BLEND_B_GRID)
     if kind == INTPOWER_OP: return list(INTPOWER_GRID)
+    if kind == 'eintpower': return list(ENERGY_INTPOWER_GRID)
+    if kind == 'epower': return list(ENERGY_POWER_GRID)
     if kind == 'mass': return list(MASS_GRID)
     return list(POWER_EXP_GRID)
 
@@ -631,10 +645,13 @@ def exp_slot_bound(kind):
     allowed NEGATIVE (that is what decay means), where a power's exponent must
     not go below zero at all -- |u|^p is singular at the origin.  An
     ``intpower`` exponent is never polished; its bound only has to contain the
-    integer grid."""
+    integer grid.  An energy term's kinds ('eintpower', 'epower') reach one
+    higher."""
     if kind == 'blend_a': return BLEND_A_BOUND
     if kind == 'blend_b': return BLEND_B_BOUND
     if kind == INTPOWER_OP: return (1.0, float(INTPOWER_MAX))
+    if kind == 'eintpower': return (1.0, float(INTPOWER_MAX + 1))
+    if kind == 'epower': return (MIN_EXP, MAX_EXP + 1.0)
     if kind == 'mass': return MASS_BOUND
     return (MIN_EXP, MAX_EXP)
 
@@ -669,7 +686,9 @@ def _const_reader(consts):
 
 
 # ── tau -> sympy conversion ─────────────────────────────────────────────────
-def expr_to_sympy_str(tau: list, consts: list) -> str:
+def expr_to_sympy_str(tau: list, consts: list, extra=0) -> str:
+    """``tau`` as a sympy string; ``extra`` raises the exponent caps (an
+    energy term's are one higher)."""
     _next_const = _const_reader(consts)
     pos         = [0]
 
@@ -688,13 +707,13 @@ def expr_to_sympy_str(tau: list, consts: list) -> str:
             return f"({v})"
         if tok == INTPOWER_OP:
             c = _next_const()
-            n = _snap_int_power(_next_const(2.0))
+            n = _snap_int_power(_next_const(2.0), INTPOWER_MAX + extra)
             child = node_to_str()
             return f"(({c})*(({child})**({n})))"
         if tok in POWER_OPS:
             c1 = _next_const()
             c2 = _next_const(0.0)
-            pe = _clip_exp(_next_const(2.0))
+            pe = _clip_exp(_next_const(2.0), MAX_EXP + extra)
             child = node_to_str()
             return (f"(((Abs({child}))**({pe}))*(({c1}) + ({c2})*sign({child})))")
         if tok in TRANSCENDENTAL_OPS:
@@ -880,18 +899,15 @@ def get_valid_tokens(tau, position, max_len, max_consts=20,
     return mask
 
 
-def newton3_mask(dof, term_prefix):
-    """``'newton3'`` leaf mask over ``ALL_TOKENS`` for one term of DOF
-    ``dof``'s slice: the term is LOCAL (its own q and qd only) or RELATIVE
-    (the two leaves of one pair that contains ``dof``), never both, and never
-    uses another DOF's own variables or a directional leaf."""
-    own = set(VARIABLES[2 * dof:2 * dof + 2])
-    pairs = [set(VARIABLES[2 * (N_DOF + k):2 * (N_DOF + k) + 2])
-             for k, p in enumerate(PAIRS) if dof in p]
-    used = [t for t in term_prefix if t in VAR_SET]
-    ok = (own if used and used[0] in own
-          else next(p for p in pairs if used[0] in p) if used
-          else own.union(*pairs))
+def coupling_mask(slice_idx):
+    """Leaf mask over ``ALL_TOKENS`` for one slice under a coupling level
+    (:mod:`discover_coupling`).  Slice d < N_DOF holds DOF d's LOCAL terms:
+    its own q and qd only.  Slice N_DOF holds the ENERGY terms whose
+    derivatives are the coupling forces: under 'newton3' the relative leaves
+    only, under 'reciprocal' any state.  Never a directional leaf."""
+    ok = set(VARIABLES[2 * slice_idx:2 * slice_idx + 2] if slice_idx < N_DOF
+             else VARIABLES[2 * N_DOF:] if COUPLING == 'newton3'
+             else VARIABLES)
     return np.array([0.0 if (t in VAR_SET or t in DIR_LEAF_SET)
                      and t not in ok else 1.0 for t in ALL_TOKENS],
                     dtype=np.float32)
@@ -2105,7 +2121,8 @@ def _varpro(design, b, exp_slots, slot_kind, limits=None, ridge=0.0):
     # the polish is exactly what moves an integer exponent off the integer --
     # duffing's cube polishes from 3 to 2.9998 -- which is the whole difference
     # between ``intpower`` and ``power``.
-    cont_slots = [s for s in exp_slots if slot_kind.get(s) != INTPOWER_OP]
+    cont_slots = [s for s in exp_slots
+                  if slot_kind.get(s) not in (INTPOWER_OP, 'eintpower')]
     if cont_slots:
         # PER-KIND bounds.  A shared [MIN_EXP, MAX_EXP] silently clamps a
         # blend's decay rate to be non-negative, which forbids every decaying
@@ -2427,13 +2444,13 @@ def init_energy_worker(n_dof, var_names, norm_stats, raw_trajs,
                        directional_leaves=False, transcendental=False,
                        reward='energy', sim_window=None,
                        sim_weights=(1.0, 0.0, 0.0, 0.0), trial_decay=1.0,
-                       relative_leaves=False):
+                       coupling='free'):
     # Every grammar flag MUST match the parent's: a worker with a different
     # token table computes a different ``count_total_consts`` for the same tau
     # and silently mis-fits every candidate it is handed.  The reward settings
     # likewise, or the pool scores by a different reward than the parent logs.
     configure_grammar(n_dof, var_names, directional_leaves, transcendental,
-                      relative_leaves)
+                      coupling)
     set_problem_data(norm_stats, raw_trajs, energy_normalize, max_traj, w_acc)
     set_reward(reward, sim_window, sim_weights, trial_decay)
 
@@ -2716,16 +2733,18 @@ MAX_GRPO_BATCH = 32
 
 # ── Denormalisation to physical units ───────────────────────────────────────
 PASTE_DIGITS = 12          # significant figures in the paste-ready block
-def denormalize_expr(tau, consts, dof, digits=4):
+def denormalize_expr(tau, consts, dof, digits=4, name=None):
     """Return ``"<accel name> = <physical expression>"`` for DOF ``dof``, its
     constants to ``digits`` significant figures.  Four read well; an equation
     meant to be pasted and simulated wants :data:`PASTE_DIGITS`, since a
     sensitive one drifts visibly within a fraction of a second on constants
-    rounded to four."""
+    rounded to four.  With a ``name`` (``dof`` unused) ``tau`` is an energy
+    term sum (:mod:`discover_coupling`), printed as ``"<name> = ..."`` in the
+    physical states as it stands, its exponent caps one higher."""
     if NORM_STATS is None: return None
     X_mean, X_std, y_mean, y_std = NORM_STATS
     try:
-        expr_str = expr_to_sympy_str(tau, consts)
+        expr_str = expr_to_sympy_str(tau, consts, extra=int(name is not None))
         sym_expr = parse_expr(expr_str, local_dict=_parse_local_dict())
 
         disp = _var_display_map()
@@ -2738,6 +2757,8 @@ def denormalize_expr(tau, consts, dof, digits=4):
                 subs[SYMS[v]] = (sp.Symbol(disp[v])
                                  / float(PAIR_STD[k - 2 * N_DOF]))
         sym_expr = sym_expr.subs(subs)
+        if name is not None:
+            return f"{name} = {sp.N(sp.expand(sym_expr), digits)}"
         sym_expr = sp.expand(float(y_mean[dof]) + float(y_std[dof]) * sym_expr)
         accel_name = VAR_NAMES[dof] + 'ddot'
         return f"{accel_name} = {sp.N(sym_expr, digits)}"

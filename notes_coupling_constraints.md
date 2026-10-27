@@ -1,9 +1,11 @@
 # Plan: reciprocity and Newton's third law as training options
 
-Status: **Phase 1 implemented** (2026-10-18; see "As built" at the end).
-Written 2026-10-17 against `claude/discode-8token-grammar` at `63a251f`.
-Explained, with the proposed code changes, in the artifact "DISCOVER
-Coupling Constraints".
+Status: **built as energies** (2026-10-27, `claude/discode-energy-coupling`;
+see "As built" at the end). Sections 0, 2, 3 and 6 describe the Phase 1
+mechanism, partner terms added after sampling (2026-10-18), which the energy
+construction replaced. Written 2026-10-17 against
+`claude/discode-8token-grammar` at `63a251f`. Explained, with the proposed
+code changes, in the artifact "DISCOVER Coupling Constraints".
 
 ## 0. Summary
 
@@ -365,34 +367,50 @@ must-include constraints (NeuroLogic decoding) already exist.
   tests only.
 - One phase at a time, reporting at the end of each.
 
-## As built (Phase 1)
+## As built (energies)
 
-- `DISCOVER_TRAIN(coupling='free' | 'reciprocal' | 'newton3', masses=None)`;
-  the completion, joint fit and scoring are `discover_coupling.py`, the leaf
-  mask `dc.newton3_mask`, the per-term credit `dp.jgrpo_terms`.
-- Relative leaves: one token pair per DOF pair a < b, `x{2N+1}...` =
-  (q_a − q_b, q̇_a − q̇_b), each scaled by its own std, not centred. A
-  `'newton3'` term is local or over ONE pair; products of different
-  differences are masked for now.
-- Partners are worked out on the monomials of the closed-form fit (the power
-  rules of 3.2), so no sympy and no nonlinear fallback: a term that the
-  closed form cannot complete is dropped (credit to its own DOF alone). A row
-  with a DOF left empty scores 0 for every DOF.
-- The joint fit reuses the per-DOF VARPRO search (`dc._varpro`): exponents on
-  their grids, limited for coupling factors so the partner's exponents stay
-  in [0, MAX_EXP], and mass ratios as extra slots (grid 0.25–4, polished in
-  [0.01, 100]).
-- The joint fit carries a ridge (`discover_coupling.RIDGE`, 1e-6 of each
-  term's squared contribution): without it a cube of (q1 − q2) and a `power`
-  of it with the exponent tuned to 2.9999 took coefficients of ±1e12 that
-  cancel, and no rounded print of the equation survived. Couplings print as
-  powers of (q1 − q2), never expanded.
-- Credit per term: the mean of its own DOF's advantage and, for each DOF it
-  reaches, the z-score of that DOF's reward in the same row over the batch's
-  rows, in log-residual units.
-- `'free'` unchanged: the constant-fit fingerprint (114 fits and rewards) is
-  bitwise identical.
-- Not built yet: seeds and `sim_refine` in the coupled levels, beam search
-  there, couplings over several differences, and printing that marks received
-  partners.
-
+- One construction for any number of DOFs, replacing the partner rule. The
+  policy writes N + 1 slices: one per DOF, its LOCAL terms over its own q and
+  q̇ only (`dc.coupling_mask`), and an ENERGY slice. Energy terms without a
+  velocity form a potential V, those with one a dissipation function R, and
+  the coupling forces are m_r q̈_r = −m_0 (∂V/∂q_r + ∂R/∂q̇_r), V and R per
+  unit mass of DOF 0. Reciprocity is the symmetry of their second
+  derivatives. `'reciprocal'` lets the energy use any state; `'newton3'` the
+  relative leaves only (q_a − q_b, q̇_a − q̇_b, one pair per a < b, each
+  scaled by its own std), so a common shift leaves it unchanged and the
+  coupling forces sum to zero. Products of different differences are
+  allowed.
+- The energy keeps the grammar's expressivity: sums, products of
+  displacements and velocities, `intpower`, `power`, `blend`. Its exponents
+  reach one above the force caps (`intpower` 1–4; `power` on 0, 1, 1.5, 2,
+  2.5, 3, 4) and are limited per monomial so every force stays in the
+  grammar: a lone differentiated factor ≥ 1; with two or more, each in
+  [1, 3]; an R monomial's q factors ≤ 3. An R monomial with a q factor must
+  not push at rest, or its stiffness is asymmetric there: its q̇ factor has
+  exponent ≥ 2, and a term with a bare or `blend` q̇ factor in such a
+  monomial is dropped. The stiffness is then symmetric at rest (Maxwell–Betti
+  is that tangent statement) and the damping everywhere.
+- `discover_coupling.fit_system` is one VARPRO (`dc._varpro`) over the local
+  monomials, the energy monomials (each column the forces it exerts on every
+  DOF, differentiated in closed form), the exponents and the mass ratios
+  (grid 0.25–4, polished in [0.01, 100]; fixed by `masses`), with the ridge
+  (`RIDGE`, 1e-6) kept. Each DOF's equation is written out as its local terms
+  plus the energy's derivatives as ordinary grammar terms, so scoring,
+  printing and the paste block are unchanged; the fit's columns and the
+  written-out terms come from the same factor code (`_factor`), so they
+  agree exactly.
+- The energy slice has its own buffer and critic. Its reward is its row's
+  mean DOF reward; each energy term's tokens are credited with the mean of
+  that advantage and the z-scored rewards, in the same row, of the DOFs it
+  acts on. The best row prints V and R.
+- Checked: forces against finite differences of the printed V and R (~1e-10
+  relative) for every factor kind; mass-weighted Jacobian symmetry at 2 and 3
+  DOFs (stiffness at rest, damping anywhere) to ~1e-9; under `'newton3'`
+  coupling forces summing to ~1e-15; the truth recovered with mass ratios
+  within 1e-3 on coupled_duffing (V = −1.5 xy), cubic_coupled
+  (V = 0.3 (x − y)⁴) and the three-mass chain (V = 1.5 (q1 − q2)² +
+  1.5 (q2 − q3)²); `'free'` bitwise unchanged (the 114-fit fingerprint).
+- An energy term can need one token more than the force it gives: the damper
+  −c(q1 − q2)²(q̇1 − q̇2) is R = (c/2)(q1 − q2)²(q̇1 − q̇2)², six tokens.
+- Not built: seeds, beam search and `sim_refine` at these levels;
+  directional leaves in the energy.

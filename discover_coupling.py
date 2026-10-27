@@ -3,35 +3,43 @@ discover_coupling.py
 ====================
 
 Reciprocity and Newton's third law as training options:
-``DISCOVER_TRAIN(coupling='reciprocal' | 'newton3')``.  The plan and the
-reasoning are in ``notes_coupling_constraints.md``.
+``DISCOVER_TRAIN(coupling='reciprocal' | 'newton3')``.  The reasoning is in
+``notes_coupling_constraints.md``.
 
-The policy still writes one equation per DOF.  For each sampled row
-:func:`system_worker` keeps the terms the closed-form fit can complete, adds
-every coupling term's PARTNERS to the equations it reaches, fits all the
-constants of the system at once (a term and its partners share theirs) and
-scores the DOFs together.
+Under a coupling level the policy writes one slice per DOF and one more.  A
+DOF's slice holds its LOCAL terms, in its own q and qd only; the last slice
+holds the coupling as an ENERGY (:func:`discover_core.coupling_mask`).  An
+energy term with no velocity in it is part of a potential V, one with a
+velocity part of a dissipation function R, and the coupling force on DOF r is
 
-Partner rule.  A term t of DOF d reaches DOF r when it depends on r's
-variable: r's position, or r's velocity if t contains any velocity.  Its
-partner in r's equation is d/dq_r of the integral of t over d's own variable,
-times the mass ratio m_d/m_r, which makes m_d*da_d/dq_r = m_r*da_r/dq_d.
+    m_r a_r = -m_0 (dV/dq_r + dR/dqdot_r)        (V, R per unit mass of DOF 0)
 
-* ``'reciprocal'``: terms over the raw leaves.  A monomial's partner is worked
-  out one variable at a time with d/dx |x|^e sgn(x)^o = e |x|^(e-1) sgn(x)^(1-o)
-  and its inverse for the integral, so a partner is again a product of powers
-  of single variables.  A coupling monomial whose partner would leave the
-  grammar (a ``blend`` factor, a variable repeated in the product) drops its
-  term, and the exponents of coupling factors are searched only where the
-  partner's exponents stay in [0, MAX_EXP].
-* ``'newton3'``: every term is local (its own DOF's raw leaves) or relative
-  (the leaves of one difference q_a - q_b, see ``dc.configure_grammar``), and a
-  relative term's partner is its mirror, -m_d/m_r times itself: the forces
-  cancel.
+Every coupling force is then a derivative of one function, for any number of
+DOFs, so the mass-weighted coupling Jacobians are symmetric: m_i da_i/dq_j =
+m_j da_j/dq_i is the symmetry of d2V/dq_i dq_j, and the same for R in the
+velocities.  Under 'newton3' the energy depends on the differences q_a - q_b
+alone (the relative leaves of ``dc.configure_grammar``), so a common shift of
+every DOF leaves it unchanged and the coupling forces sum to zero.
 
-Everything is in the normalised units the rest of DISCOVER uses, so a partner
-also carries the ratio of the two equations' output scales y_std and, under
-``'reciprocal'``, of the two variables' scales X_std.
+For each sampled row :func:`system_worker` keeps the terms the closed-form fit
+can complete, fits every constant of the system at once -- the local terms',
+the energy's and the mass ratios m_r/m_0 -- writes each DOF's equation out
+(its local terms, then the forces the energy exerts on it) and scores the
+DOFs together.
+
+An energy term's exponents reach one above the force caps, since a
+differentiated factor's exponent drops by one, and are limited per monomial
+so that every force stays in the grammar: a monomial's only differentiated
+factor (a q factor of V, a qd factor of R) has exponent >= 1; with two or
+more, each is in [1, 3]; an R monomial's q factors are not differentiated and
+keep exponents <= 3.  An R monomial with a q factor must not push at rest, or
+the force it modulates would have an asymmetric stiffness there, so its only
+qd factor has exponent >= 2, and a term with such a monomial whose qd factor
+is a bare variable, or that has a ``blend`` qd factor, is dropped.
+
+Everything is in the normalised units the rest of DISCOVER uses: the energy
+is written in the normalised leaves z, and a force carries dz/dq of each leaf
+it is differentiated in and the ratio of the equations' output scales.
 """
 
 from __future__ import annotations
@@ -50,177 +58,227 @@ LEVELS = ('free', 'reciprocal', 'newton3')
 # of the fit.
 RIDGE = 1e-6
 
+_POWER = (dc.INTPOWER_OP, 'abspower', 'sgnpower')    # factors with an exponent
+_EKIND = {dc.INTPOWER_OP: 'eintpower', 'abspower': 'epower',
+          'sgnpower': 'epower'}                      # their energy slot kinds
 
-def _reach(mono, d, level):
-    """The DOFs other than ``d`` whose equations monomial ``mono`` of DOF
-    ``d`` reaches, or None when its partner cannot be written."""
-    cols = [f[1] for f in mono['factors']]
-    if level == 'newton3':
-        pairs = [dc.PAIRS[(c - 2 * dc.N_DOF) // 2] for c in cols
-                 if c >= 2 * dc.N_DOF]
-        return {b if a == d else a for a, b in pairs}
-    vel = any(c % 2 for c in cols)
-    reach = {c // 2 for c in cols if c % 2 == vel and c // 2 != d}
-    if reach and (len(set(cols)) < len(cols)
-                  or any(f[0].startswith('blend') for f in mono['factors'])):
+
+def _dz(c, r):
+    """dz_c/dx_r: how normalised leaf ``c`` moves with DOF ``r``'s own state
+    of the same kind (q for a q leaf, qd for a qd leaf)."""
+    N = dc.N_DOF
+    if c < 2 * N:
+        return 1.0 / float(dc.NORM_STATS[1][c]) if c // 2 == r else 0.0
+    a, b = dc.PAIRS[(c - 2 * N) // 2]
+    s = 1.0 / float(dc.PAIR_STD[c - 2 * N])
+    return s if r == a else -s if r == b else 0.0
+
+
+def _dofs(c):
+    """The DOFs normalised leaf ``c`` depends on."""
+    N = dc.N_DOF
+    return {c // 2} if c < 2 * N else set(dc.PAIRS[(c - 2 * N) // 2])
+
+
+def energy_term(term):
+    """``(plan, vel, limits, dofs)`` for one energy term: its closed-form plan
+    (``dc._linear_plan``), whether it is an R term, the exponent limits of its
+    slots and the DOFs it acts on; or None when it is dropped (see the module
+    docstring) or exerts no force."""
+    plan = dc._linear_plan(term)
+    if plan is None:
         return None
-    return reach
+    vel = int(any(f[1] % 2 for m in plan[0] for f in m['factors']))
+    limits, dofs = {}, set()
+    for m in plan[0]:
+        diff = [f for f in m['factors'] if f[1] % 2 == vel]
+        mod = len(diff) < len(m['factors'])
+        if mod and ((len(diff) == 1 and diff[0][0] == 'var')
+                    or any(f[0] not in _POWER + ('var',) for f in diff)):
+            return None
+        for f in m['factors']:
+            d = f[1] % 2 == vel
+            if d:
+                dofs |= _dofs(f[1])
+            if f[0] not in _POWER:
+                continue
+            cap = dc.INTPOWER_MAX if f[0] == dc.INTPOWER_OP else dc.MAX_EXP
+            lo, hi = ((2.0 if mod else 1.0, np.inf) if d and len(diff) == 1
+                      else (1.0, cap) if d else (-np.inf, cap))
+            a, z = limits.get(f[2], (-np.inf, np.inf))
+            limits[f[2]] = (max(a, lo), min(z, hi))
+    return (plan, vel, limits, dofs) if dofs else None
 
 
-def _pw(f, ev, d):
-    """``(exponent, odd)`` of a power-family factor of DOF ``d``."""
+def _factor(f, ev, deriv):
+    """Monomial factor ``f`` -- or, with ``deriv``, its derivative in its own
+    leaf -- as ``(tokens, consts, scale)``: a grammar factor (no tokens for a
+    constant) times ``scale``.  Exponents are read with the energy caps."""
+    v = dc.VARIABLES[f[1]]
     if f[0] == 'var':
-        return 1.0, True
+        return ([], [], 1.0) if deriv else ([v], [1.0], 1.0)
     if f[0] == dc.INTPOWER_OP:
-        n = dc._snap_int_power(ev[(d, f[2])])
-        return float(n), n % 2 == 1
-    return dc._clip_exp(ev[(d, f[2])]), f[0] == 'sgnpower'
+        n = dc._snap_int_power(ev[f[2]], dc.INTPOWER_MAX + 1)
+        if not deriv:
+            return [dc.INTPOWER_OP, v], [1.0, float(n), 1.0], 1.0
+        if n == 1:
+            return [], [], 1.0
+        return [dc.INTPOWER_OP, v], [1.0, float(n - 1), 1.0], float(n)
+    if f[0] in _POWER:
+        # d/du |u|^p = p sgn(u)|u|^(p-1), d/du sgn(u)|u|^p = p |u|^(p-1):
+        # the derivative flips the parity
+        p = dc._clip_exp(ev[f[2]], dc.MAX_EXP + 1.0)
+        odd = (f[0] == 'sgnpower') != deriv
+        return (['power', v],
+                ([0.0, 1.0] if odd else [1.0, 0.0]) + [p - 1.0 if deriv else p,
+                                                       1.0],
+                p if deriv else 1.0)
+    # blendcos / blendsin: e^(a u) cos(b u), e^(a u) sin(b u); derivatives
+    # e^(a u) (a cos(b u) - b sin(b u)), e^(a u) (b cos(b u) + a sin(b u))
+    a = float(np.clip(ev[f[2]], *dc.BLEND_A_BOUND))
+    b = float(np.clip(ev[f[3]], *dc.BLEND_B_BOUND))
+    amps = ({'blendcos': (a, -b), 'blendsin': (b, a)} if deriv
+            else {'blendcos': (1.0, 0.0), 'blendsin': (0.0, 1.0)})[f[0]]
+    return [dc.BLEND_OP, v], [*amps, a, b, 1.0], 1.0
 
 
-def _partner(mono, d, r, ev):
-    """``(coef, {col: (exponent, odd)})``: the 'reciprocal' partner, in DOF
-    ``r``'s equation, of monomial ``mono`` of DOF ``d``."""
-    vel = any(f[1] % 2 for f in mono['factors'])
-    own, oc = 2 * d + vel, 2 * r + vel
-    pw = {f[1]: _pw(f, ev, d) for f in mono['factors']}
-    e, odd = pw[oc]
-    pw[oc] = (e - 1.0, not odd)          # the derivative ...
-    f, odd = pw.get(own, (0.0, False))
-    pw[own] = (f + 1.0, not odd)         # ... of the integral over x_own
-    return e / (f + 1.0), {c: p for c, p in pw.items() if p != (0.0, False)}
+def _pieces(m, vel, ev, r):
+    """The force energy monomial ``m`` (unit coefficient) exerts on DOF
+    ``r``, times m_r/m_0, in physical units: ``[(factors, scale), ...]``, a
+    sum of products of grammar factors, one per factor it is differentiated
+    in that moves with DOF ``r``."""
+    out = []
+    for i, f in enumerate(m['factors']):
+        k = -_dz(f[1], r) if f[1] % 2 == vel else 0.0
+        if k:
+            parts = [_factor(h, ev, j == i) for j, h in enumerate(m['factors'])]
+            out.append(([p[:2] for p in parts], k * parts[i][2]))
+    return out
 
 
-def _value(pw, cols):
-    v = 1.0
-    for c, (e, odd) in pw.items():
-        t = np.abs(cols[c]) ** e
-        v = v * (np.sign(cols[c]) * t if odd else t)
-    return np.where(np.isfinite(v), v, 0.0)
+def _value(tokens, consts, cols):
+    """A grammar factor from :func:`_factor` on the normalised leaves
+    ``cols``, as ``dc.compile_to_numpy`` evaluates it."""
+    z, c = cols[dc.COL_MAP[tokens[-1]]], consts
+    if len(tokens) == 1:
+        return c[0] * z
+    if tokens[0] == dc.INTPOWER_OP:
+        return c[0] * dc._intpower_np(z, c[1])
+    if tokens[0] == 'power':
+        return np.abs(z) ** dc._clip_exp(c[2]) * (c[0] + c[1] * np.sign(z))
+    return np.exp(c[2] * z) * (c[0] * np.cos(c[3] * z) + c[1] * np.sin(c[3] * z))
 
 
-def _power_term(a, pw):
-    """``a * prod |x_c|^e sgn(x_c)^o`` as grammar tokens: the bare variable
-    for x_c itself, else a ``power`` (consts: even amplitude, odd amplitude,
-    exponent, leaf)."""
-    tau, consts = [], []
-    for c, (e, odd) in sorted(pw.items()):
-        amp = a if not tau else 1.0
-        if (e, odd) == (1.0, True):
-            tau += [dc.VARIABLES[c]]
-            consts += [amp]
-        else:
-            tau += ['power', dc.VARIABLES[c]]
-            consts += [0.0, amp, e, 1.0] if odd else [amp, 0.0, e, 1.0]
-    return (['mul'] + tau + ['end'] if len(pw) > 1 else tau), consts
+def _force(m, vel, ev, r, cols):
+    """:func:`_pieces` evaluated on ``cols``, or None where ``m`` exerts no
+    force on ``r``."""
+    pieces = _pieces(m, vel, ev, r)
+    if not pieces:
+        return None
+    out = np.zeros(len(cols[0]))
+    for parts, scale in pieces:
+        g = np.full(len(cols[0]), scale)
+        for t, c in parts:
+            if t:
+                g = g * _value(t, c, cols)
+        out = out + g
+    return np.where(np.isfinite(out), out, 0.0)
 
 
-def complete(taus, level):
-    """Split each DOF's sampled tau into the terms the joint fit can complete.
-
-    Returns ``(kept, term_dofs)``: per DOF its kept terms, and per sampled
-    term the DOFs whose equations it ends up in (its own alone if dropped).
-    """
-    kept, term_dofs = [], []
-    for d, tau in enumerate(taus):
-        keep, dofs = [], []
-        for term in dc.split_terms(tau):
-            plan = dc._linear_plan(term)
-            reach = (None if plan is None
-                     else [_reach(m, d, level) for m in plan[0]])
-            if reach is not None and None not in reach:
-                keep.append(term)
-                dofs.append(sorted({d}.union(*reach)))
-            else:
-                dofs.append([d])
-        kept.append(keep)
-        term_dofs.append(dofs)
-    return kept, term_dofs
+def _product(parts, scale):
+    """``scale`` times the product of grammar factors ``parts`` as one term
+    ``(tau, consts)``; the scale goes into the first factor's amplitudes."""
+    parts = [(t, list(c)) for t, c in parts if t]
+    if not parts:
+        return ['const'], [scale]
+    t0, c0 = parts[0]
+    for a in ((0, 1) if t0[0] in ('power', dc.BLEND_OP) else (0,)):
+        c0[a] *= scale
+    tau = [tok for t, _c in parts for tok in t]
+    return ((['mul'] + tau + ['end'] if len(parts) > 1 else tau),
+            [x for _t, c in parts for x in c])
 
 
-def fit_system(terms, level, masses=None, horizon=None):
-    """Fit a system's constants jointly, partners included.
+def complete(taus):
+    """The terms of a sampled row the joint fit can complete.
 
-    ``terms[d]`` are DOF d's kept terms.  Each DOF's rows are its own
-    work-energy and acceleration rows, exactly as in the per-DOF fit; a
-    monomial's column carries its own basis in its DOF's rows and its
-    partner's in every DOF it reaches, and the exponents and mass ratios are
-    searched as in the per-DOF fit (``dc._varpro``).  ``masses=None`` fits
-    the mass ratios m_d/m_0.  Returns ``(exprs, mu)`` -- each DOF's full
-    equation ``(tau, consts)``, its own terms then the partners it receives,
-    and the mass ratios -- or None.
+    ``taus`` are the row's N_DOF local taus, then its energy tau.  Returns
+    ``(kept, dofs)``: per slice its kept terms, and per sampled energy term
+    the DOFs it acts on (none if dropped)."""
+    N = dc.N_DOF
+    kept = [[t for t in dc.split_terms(tau) if dc._linear_plan(t) is not None]
+            for tau in taus[:N]]
+    terms = dc.split_terms(taus[N])
+    plans = [energy_term(t) for t in terms]
+    kept.append([t for t, e in zip(terms, plans) if e is not None])
+    return kept, [sorted(e[3]) if e else [] for e in plans]
+
+
+def fit_system(kept, masses=None, horizon=None):
+    """Fit a sampled row's constants jointly.
+
+    ``kept`` holds per slice its kept terms (N_DOF local slices, then the
+    energy).  Each DOF's rows are its own work-energy and acceleration rows,
+    exactly as in the per-DOF fit.  A local monomial's column is its basis in
+    its own DOF's rows; an energy monomial's column holds, in the rows of
+    each DOF r it acts on, the force it exerts on r per unit coefficient
+    (:func:`_pieces`, over m_r/m_0).  The exponents and the mass ratios
+    m_r/m_0 (``masses=None``; else fixed by ``masses``) are searched as in
+    the per-DOF fit (``dc._varpro``).  Returns ``(exprs, energy, mu)`` --
+    each DOF's equation ``(tau, consts)``, its local terms then the energy's
+    forces on it; the energy ``(tau, consts)``; the mass ratios -- or None.
     """
     N = dc.N_DOF
-    taus = [dc.assemble_terms(t) for t in terms]
-    plans = [dc._linear_plan(t) if t else ([], [], [], {}) for t in taus]
-    if any(p is None for p in plans):
-        return None
     data = [dc._energy_contexts(d, None, horizon) for d in range(N)]
     if not data[0][0]:
         return None
     setup = dc._fit_setup(data[0][0])
-    X_std = dc.NORM_STATS[1]
+    plans = [[dc._linear_plan(t) for t in kept[d]] for d in range(N)]
+    eplans = [energy_term(t) for t in kept[N]]
+    if None in sum(plans, []) + eplans:
+        return None
+    plan = lambda sl, k: plans[sl][k] if sl < N else eplans[k][0]
 
-    idx = [(d, j) for d in range(N) for j in range(len(plans[d][0]))]
-    offs = [np.cumsum([0] + [dc.count_total_consts(t) for t in terms[d]])
-            for d in range(N)]
-    term_of = {(d, j): int(np.searchsorted(offs[d], plans[d][1][j], 'right'))
-               - 1 for d, j in idx}
-    reach = {(d, j): _reach(plans[d][0][j], d, level) for d, j in idx}
-    if level == 'newton3':        # a relative term reaches as a whole
-        for d, j in idx:
-            reach[(d, j)] = set().union(*(reach[x] for x in idx
-                                          if term_of[x] == term_of[(d, j)]
-                                          and x[0] == d))
-    exp_slots = [(d, s) for d in range(N) for s in plans[d][2]]
-    kinds = {(d, s): k for d in range(N) for s, k in plans[d][3].items()}
-    limits = {}
-    if level == 'reciprocal':
-        for (d, j), R in reach.items():
-            m = plans[d][0][j]
-            vel = any(f[1] % 2 for f in m['factors'])
-            for f in m['factors']:
-                if R and len(f) == 3:
-                    if f[1] == 2 * d + vel:        # integrated: e + 1 <= MAX
-                        limits[(d, f[2])] = (-np.inf, dc.MAX_EXP - 1.0)
-                    elif f[1] % 2 == vel and f[1] // 2 in R:
-                        limits[(d, f[2])] = (1.0, np.inf)   # differentiated
+    idx = [(sl, k, j) for sl in range(N + 1)
+           for k in range(len(kept[sl])) for j in range(len(plan(sl, k)[0]))]
+    exp_slots, kinds, limits, acts = [], {}, {}, set()
+    for sl in range(N + 1):
+        for k in range(len(kept[sl])):
+            for s in plan(sl, k)[2]:
+                kind = plan(sl, k)[3][s]
+                exp_slots.append((sl, k, s))
+                kinds[(sl, k, s)] = _EKIND.get(kind, kind) if sl == N else kind
+    for k, (_p, _vel, lim, dofs) in enumerate(eplans):
+        limits.update({(N, k, s): v for s, v in lim.items()})
+        acts |= dofs
     if masses is None:
-        fit_mu = sorted({x for (d, j), R in reach.items() if R
-                         for x in R | {d}} - {0})
-        exp_slots += [(-1, d) for d in fit_mu]
-        kinds.update({(-1, d): 'mass' for d in fit_mu})
-        mu_of = lambda ev: [ev.get((-1, d), 1.0) for d in range(N)]
+        exp_slots += [(-1, r) for r in sorted(acts - {0})]
+        kinds.update({(-1, r): 'mass' for r in acts - {0}})
+        mu_of = lambda ev: [ev.get((-1, r), 1.0) for r in range(N)]
     else:
         fixed = [float(m) / float(masses[0]) for m in masses]
         mu_of = lambda ev: fixed
     exp_slots = sorted(exp_slots)
 
-    def kappa(d, j, r, ev):
-        mu = mu_of(ev)
-        k = mu[d] / mu[r] * data[d][2] / data[r][2]
-        if level == 'newton3':
-            return -k
-        vel = any(f[1] % 2 for f in plans[d][0][j]['factors'])
-        return k * X_std[2 * d + vel] / X_std[2 * r + vel]
-
-    def basis(d, j, r, cols, ev):
-        m = plans[d][0][j]
-        if r == d or level == 'newton3':
-            return dc._eval_monomial(m, cols, {s: ev[(d, s)] for s in m['exps']},
-                                     len(cols[0]))
-        coef, pw = _partner(m, d, r, ev)
-        return coef * _value(pw, cols)
-
     cache = {}
 
-    def rows(r, ci, d, j, ev):
-        m = plans[d][0][j]
-        key = (r, ci, d, j, tuple(sorted((s, round(float(ev[(d, s)]), 6))
-                                         for s in m['exps'])))
+    def rows(sl, k, j, r, ci, ev):
+        """Monomial ``j`` of term ``k`` of slice ``sl`` in DOF ``r``'s
+        context ``ci`` (an energy's times m_r/m_0), or None where it is not
+        in ``r``'s equation."""
+        if sl < N and sl != r:
+            return None
+        m = plan(sl, k)[0][j]
+        evk = {s: ev[(sl, k, s)] for s in m['exps']}
+        key = (sl, k, j, r, ci,
+               tuple(sorted((s, round(float(v), 6)) for s, v in evk.items())))
         if key not in cache:
             ctx = data[r][0][ci]
-            cache[key] = dc._basis_rows(ctx, basis(d, j, r, ctx[1], ev),
-                                        data[r][2], setup)
+            phi = (dc._eval_monomial(m, ctx[1], evk, len(ctx[2])) if sl < N
+                   else _force(m, eplans[k][1], evk, r, ctx[1]))
+            cache[key] = (None if phi is None else
+                          dc._basis_rows(ctx, phi, data[r][2] if sl < N
+                                         else 1.0, setup))
         return cache[key]
 
     blocks = [(r, ci, dc._target_rows(c, data[r][1], setup))
@@ -228,87 +286,98 @@ def fit_system(terms, level, masses=None, horizon=None):
     b = np.concatenate([t for _r, _ci, t in blocks])
 
     def design(ev):
+        mu = mu_of(ev)
         cols = []
-        for d, j in idx:
+        for sl, k, j in idx:
             col = []
             for r, ci, t in blocks:
-                if r == d:
-                    col.append(rows(r, ci, d, j, ev))
-                elif r in reach[(d, j)]:
-                    col.append(kappa(d, j, r, ev) * rows(r, ci, d, j, ev))
-                else:
-                    col.append(np.zeros(len(t)))
+                x = rows(sl, k, j, r, ci, ev)
+                col.append(np.zeros(len(t)) if x is None
+                           else x if sl < N else x / mu[r])
             cols.append(np.concatenate(col))
         return np.column_stack(cols) if cols else np.zeros((len(b), 0))
 
     coef, ev = dc._varpro(design, b, exp_slots, kinds, limits, RIDGE)
     if coef is None or not np.all(np.isfinite(coef)):
         return None
-    col_of = {k: i for i, k in enumerate(idx)}
+    at = {key: i for i, key in enumerate(idx)}
+    mu = mu_of(ev)
 
-    consts = []
-    for d, (monos, matched, slots, _k) in enumerate(plans):
-        c = [1.0] * dc.count_total_consts(taus[d])
+    def consts(sl, k):
+        monos, matched, slots, _kd = plan(sl, k)
+        c = [1.0] * dc.count_total_consts(kept[sl][k])
         for j in range(len(monos)):
-            c[matched[j]] = float(coef[col_of[(d, j)]])
+            c[matched[j]] = float(coef[at[(sl, k, j)]])
         for s in slots:
-            c[s] = float(ev[(d, s)])
-        consts.append(c)
-
-    recv = [[] for _ in range(N)]
-    for d in range(N):
-        monos, matched, o = plans[d][0], plans[d][1], offs[d]
-        for k, term in enumerate(terms[d]):
-            js = [j for j in range(len(monos)) if term_of[(d, j)] == k]
-            if level == 'newton3':
-                for r in sorted(reach[(d, js[0])]):
-                    cs = list(consts[d][o[k]:o[k + 1]])
-                    for j in js:
-                        cs[matched[j] - o[k]] *= kappa(d, j, r, ev)
-                    recv[r].append((term, cs))
-                continue
-            for j in js:
-                for r in sorted(reach[(d, j)]):
-                    a, pw = _partner(monos[j], d, r, ev)
-                    recv[r].append(_power_term(
-                        kappa(d, j, r, ev) * consts[d][matched[j]] * a, pw))
+            c[s] = float(ev[(sl, k, s)])
+        return c
 
     exprs = []
     for r in range(N):
-        tl = list(terms[r]) + [t for t, _c in recv[r]]
-        if not tl:
+        terms = [(t, consts(r, k)) for k, t in enumerate(kept[r])]
+        for k, ((monos, _mt, slots, _kd), vel, _l, _d) in enumerate(eplans):
+            evk = {s: ev[(N, k, s)] for s in slots}
+            for j, m in enumerate(monos):
+                a = float(coef[at[(N, k, j)]]) / (mu[r] * data[r][2])
+                terms += [_product(parts, scale * a)
+                          for parts, scale in _pieces(m, vel, evk, r)]
+        if not terms:
             return None
-        exprs.append((dc.assemble_terms(tl),
-                      consts[r] + [x for _t, c in recv[r] for x in c]))
-    return exprs, mu_of(ev)
+        exprs.append((dc.assemble_terms([t for t, _c in terms]),
+                      [x for _t, c in terms for x in c]))
+    energy = (dc.assemble_terms(kept[N]),
+              [x for k in range(len(kept[N])) for x in consts(N, k)])
+    return exprs, energy, mu
+
+
+def energy_lines(tau, consts, digits=4):
+    """The energy ``(tau, consts)`` as ``V = ...`` and ``R = ...`` in the
+    physical states, per unit mass of DOF 0."""
+    groups, o = {'V': ([], []), 'R': ([], [])}, 0
+    for t in dc.split_terms(tau):
+        n = dc.count_total_consts(t)
+        g = groups['R' if any(x in dc.VAR_SET and dc.COL_MAP[x] % 2
+                              for x in t) else 'V']
+        g[0].append(t)
+        g[1].extend(consts[o:o + n])
+        o += n
+    return [dc.denormalize_expr(dc.assemble_terms(ts), cs, None, digits, name)
+            for name, (ts, cs) in groups.items() if ts]
 
 
 def system_worker(args):
     """Fit and score one sampled row as a system (``coupling`` != 'free').
 
-    args = (taus, level, masses, horizon): one sampled tau per DOF.  Returns,
-    aligned with the DOFs, ``(dof, reward, tau, consts, {'peer': reward},
-    {'peer': {other dof: (tau, consts)}}, extras)`` with the full equations
-    (own terms then partners) and ``extras = {'own': the sampled tau,
-    'term_dofs': per sampled term the DOFs it reaches, 'masses': m_d/m_0}``,
-    or None for a DOF scoring 0.  Under the simulation reward the DOFs are
-    integrated together; under the energy reward each is scored on its own
-    balance, partners included.
+    args = (taus, masses, horizon): the row's N_DOF local taus, then its
+    energy tau.  Returns, aligned with those slices, ``(slice, reward, tau,
+    consts, {'peer': reward}, {'peer': {dof: (tau, consts)}}, extras)``, or
+    None for a slice scoring 0.  A DOF's tau is its whole equation and its
+    reward its own; the energy's tau is its kept terms and its reward the
+    DOFs' mean.  ``extras = {'own': the sampled tau, 'masses': m_d/m_0}``,
+    for the energy also ``'term_dofs'``: per sampled term the DOFs it acts
+    on.  Under the simulation reward the DOFs are integrated together; under
+    the energy reward each is scored on its own balance.
     """
-    taus, level, masses, horizon = args
+    taus, masses, horizon = args
     N = dc.N_DOF
-    kept, term_dofs = complete(taus, level)
-    fit = fit_system(kept, level, masses, horizon)
+    kept, dofs = complete(taus)
+    fit = fit_system(kept, masses, horizon)
     if fit is None:
-        return [None] * N
-    exprs, mu = fit
+        return [None] * (N + 1)
+    exprs, energy, mu = fit
     if dc.REWARD_MODE == 'simulation':
         rs = dc.coupled_simulation_rewards(exprs, range(N), horizon=horizon)
     else:
         rs = {d: dc.energy_reward([e if k == d else None
                                    for k, e in enumerate(exprs)],
                                   horizon=horizon) for d in range(N)}
-    return [(d, rs[d], *exprs[d], {'peer': rs[d]},
-             {'peer': {j: exprs[j] for j in range(N) if j != d}},
-             {'own': list(taus[d]), 'term_dofs': term_dofs[d], 'masses': mu})
-            if rs[d] > 1e-6 else None for d in range(N)]
+    rs[N] = float(np.mean([rs[d] for d in range(N)]))
+    out = []
+    for s, (tau, consts) in enumerate(exprs + [energy]):
+        extras = {'own': list(taus[s]), 'masses': mu}
+        if s == N:
+            extras['term_dofs'] = dofs
+        out.append((s, rs[s], tau, consts, {'peer': rs[s]},
+                    {'peer': {j: exprs[j] for j in range(N) if j != s}},
+                    extras) if tau and rs[s] > 1e-6 else None)
+    return out
